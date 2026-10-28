@@ -147,6 +147,17 @@ npm test
 Compiles with `tsc` and runs the full suite (66 tests) via Node's built-in test runner. No
 external test framework dependency.
 
+## Community and feedback
+
+SCQ v0.6.1 is open for **external technical review**, not yet a production-ready billing SDK or an adopted industry standard.
+
+- [GitHub Issues](../../issues) — reproducible bugs, specification inconsistencies, documentation corrections, or conformance gaps.
+- [GitHub Discussions](../../discussions) *(once enabled)* — integration questions, architectural tradeoffs, evidence requests, and feedback on possible future extensions.
+- [Contribution guidelines](CONTRIBUTING.md) — how to document observations and distinguish live API evidence from simulator results.
+- [Security policy](SECURITY.md) — how to report security-sensitive concerns privately.
+
+Please avoid posting customer data, secrets, or real billing account information. A live-provider claim needs suitably redacted supporting evidence.
+
 ## License
 
 Apache License 2.0 — see [`LICENSE`](LICENSE).

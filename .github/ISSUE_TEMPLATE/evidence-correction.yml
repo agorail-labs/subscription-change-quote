@@ -1,0 +1,58 @@
+name: Provider evidence or documentation correction
+description: Suggest a narrowly scoped correction to provider-specific evidence or an SCQ claim.
+title: "[Evidence] "
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Provider-shaped simulations are not live API validation. Do not post private credentials, customer details, or full production payloads.
+  - type: dropdown
+    id: provider
+    attributes:
+      label: Provider or scope
+      options:
+        - Stripe
+        - Paddle
+        - Zuora
+        - Chargebee
+        - SCQ protocol (provider-neutral)
+        - Other / cross-provider
+    validations:
+      required: true
+  - type: dropdown
+    id: confidence
+    attributes:
+      label: Evidence classification
+      options:
+        - LIVE_API_VALIDATED
+        - DOCUMENTATION_BACKED_SIMULATION
+        - INFERRED
+        - UNVERIFIED
+    validations:
+      required: true
+  - type: textarea
+    id: claim
+    attributes:
+      label: Existing claim and precise location
+      description: Quote a short excerpt or link to the relevant file/line.
+    validations:
+      required: true
+  - type: textarea
+    id: correction
+    attributes:
+      label: Proposed correction and supporting evidence
+      description: Link public provider documentation or provide a safely redacted, reproducible synthetic observation.
+    validations:
+      required: true
+  - type: textarea
+    id: limits
+    attributes:
+      label: Scope and limitations
+      description: Which versions, endpoints or configurations are covered? What remains unknown?
+  - type: checkboxes
+    id: privacy
+    attributes:
+      label: Privacy check
+      options:
+        - label: I have removed all secrets, customer/account identifiers, and unredacted provider payloads.
+          required: true

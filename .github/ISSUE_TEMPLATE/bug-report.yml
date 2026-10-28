@@ -1,0 +1,49 @@
+name: Bug or conformance discrepancy
+description: Report a reproducible reference implementation defect, spec inconsistency, or test gap.
+title: "[Bug] "
+body:
+  - type: markdown
+    attributes:
+      value: |
+        SCQ v0.6.1 is an experimental protocol with simulator-backed reference adapters. Do not include credentials, customer details, or live billing account data.
+  - type: dropdown
+    id: area
+    attributes:
+      label: Affected area
+      options:
+        - Reference core / types
+        - Simulator-backed adapter
+        - Conformance test
+        - Specification / documentation
+        - Developer quickstart / packaging
+    validations:
+      required: true
+  - type: textarea
+    id: observed
+    attributes:
+      label: Observed behavior
+      description: What does the current implementation or document actually do or say?
+      placeholder: Include a small synthetic reproduction or a precise section reference.
+    validations:
+      required: true
+  - type: textarea
+    id: expected
+    attributes:
+      label: Expected behavior
+      description: Reference the relevant spec rule or expected test behavior.
+    validations:
+      required: true
+  - type: textarea
+    id: reproduce
+    attributes:
+      label: Reproduction steps
+      description: Provide Node version, test command, and a minimal simulated example if applicable.
+    validations:
+      required: false
+  - type: checkboxes
+    id: privacy
+    attributes:
+      label: Privacy check
+      options:
+        - label: This report contains no secrets, account identifiers, customer data, or unredacted production payloads.
+          required: true
