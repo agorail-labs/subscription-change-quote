@@ -128,13 +128,24 @@ function multiChangePairSupport(a: ChangeAction, b: ChangeAction): MultiChangeCo
 // ---------------------------------------------------------------------------
 
 const PROV_IMMEDIATE_QUOTE =
-  "simulator upcoming-invoice preview: sum of the proration line items this change generates (preview.incurred_amount) — the obligation incurred at the effective time, before any customer-balance application";
+  "simulator upcoming-invoice preview of the final folded item set: sum of the proration line items the folded change set generates (preview.incurred_amount) — the obligation incurred at the effective time, before any customer-balance application";
 const PROV_RECURRING_QUOTE =
-  "simulator upcoming-invoice preview: next_period_recurring_amount (sum over post-change items of unitAmount x quantity)";
+  "simulator upcoming-invoice preview of the final folded item set: next_period_recurring_amount (sum over post-change items of unitAmount x quantity)";
 const PROV_IMMEDIATE_WITHHELD =
   "UNESTABLISHED: the simulator preview withheld its incurred-amount figure (preview.incurred_amount absent), so no incurred obligation could be established — the dimension is UNKNOWN, not zero, and amount_due is never substituted for it";
-const PROV_IMMEDIATE_COMMITTED =
-  "post-commit actual: incurred_amount of the invoice the mutation generated, read back from the simulator after the mutation (a provider read, not a preview)";
+/**
+ * PR #10 correction M3: the committed immediate's provenance NAMES
+ * the bound invoice — the invoice THIS mutation generated, bound by
+ * its id at verification time. The subscription's `latest_invoice`
+ * is never the source: a later mutation may have replaced it.
+ */
+function provImmediateCommitted(invoiceId: string): string {
+  return (
+    `post-commit actual: incurred_amount of invoice ${invoiceId} — the invoice THIS mutation generated, ` +
+    `bound by id and read back from the simulator after the mutation (a provider read, not a preview); ` +
+    `the subscription's latest_invoice was not used`
+  );
+}
 const PROV_RECURRING_COMMITTED =
   "post-commit actual: sum over the re-read post-commit subscription's items (unitAmount x quantity)";
 
@@ -145,6 +156,60 @@ function immediateParts(net: number): NonNullable<CommercialEffect["immediate"]>
     credit: net < 0 ? -net : undefined,
     net,
   };
+}
+
+/**
+ * v0.6.2 (PR #10 correction M2): adapter-level determinacy gate for
+ * commits. The frozen v0.6.1 acceptance envelope coerces absent
+ * figures to 0 (§14.6-pinned behavior), so an effect whose incurred
+ * figure is UNKNOWN — at quote time, or in the commit-time
+ * revalidation — could pass the gate and proceed to MUTATE: the
+ * adapter would commit a change whose financial effect it does not
+ * know. Fail-closed treatment of UNKNOWN in the shared envelope is
+ * BC-1, PR-9's separately gated activation; the engine is NOT
+ * changed here. Until then, THIS adapter refuses such commits
+ * itself, before any mutating call, with QUOTE_NOT_DETERMINISTIC.
+ *
+ * A dimension passes iff it is DETERMINED with a finite value, or
+ * NOT_APPLICABLE under the §3.10 license — which covers exactly
+ * one case: the immediate dimension of a CANCEL proposal, with the
+ * matching applicability citation in the effect's provenance (the
+ * shape this adapter's own CANCEL quotes carry). Recurring is
+ * never licensed NOT_APPLICABLE. Anything else — UNKNOWN
+ * (including a legacy payload's absent determinacy), an unjustified
+ * NOT_APPLICABLE, or a DETERMINED assertion over a missing /
+ * non-finite value — refuses the commit.
+ */
+function assertEffectDeterminateForCommit(
+  effect: CommercialEffect,
+  proposal: SubscriptionChangeProposal,
+  stage: "quoted" | "revalidated"
+): void {
+  const states = determinacyOf(effect);
+  const dimensions = [
+    { dimension: "immediateFinancialEffect", state: states.immediateFinancialEffect, value: effect.immediate?.net },
+    { dimension: "recurringFinancialEffect", state: states.recurringFinancialEffect, value: effect.recurring?.resultingAmount },
+  ] as const;
+  for (const { dimension, state, value } of dimensions) {
+    if (state === "DETERMINED" && typeof value === "number" && Number.isFinite(value)) continue;
+    if (state === "NOT_APPLICABLE" && dimension === "immediateFinancialEffect") {
+      const citation = effect.provenance?.applicabilityCitations?.immediateFinancialEffect;
+      const licensed =
+        proposal.changes.length === 1 &&
+        proposal.changes[0].action === "CANCEL" &&
+        citation?.action === "CANCEL" &&
+        citation?.dimension === "immediateFinancialEffect";
+      if (licensed) continue;
+    }
+    throw new SCQError(
+      "QUOTE_NOT_DETERMINISTIC",
+      `Refusing to commit: the ${stage} effect's ${dimension} is ${state}` +
+        (state === "DETERMINED" ? " without a finite established value" : "") +
+        `. The v0.6.1 acceptance envelope would coerce the missing figure to 0, so this adapter refuses ` +
+        `before any mutation rather than commit a change whose financial effect is not established.`,
+      { stage, dimension, state }
+    );
+  }
 }
 
 /**
@@ -198,18 +263,7 @@ function snapshotFrom(sub: StripeSubscription): SubscriptionSnapshot {
 }
 
 /**
- * Resolves a single ChangeSpec into a Stripe item-update fragment + its
- * commercial effect fragment. `workingItems` is the CURRENT state of every
- * item as of this point in the batch — i.e. it already reflects any prior
- * change in the same proposal that touched the same item. This matters for
- * a batch like [CHANGE_QUANTITY(item, 120), CHANGE_PLAN(item, "pro")]: the
- * plan-change preview must be computed against quantity 120, not the
- * ORIGINAL quantity 100, or the earlier change in the batch would be lost
- * — Stripe's real subscriptions.update() applies the FINAL items[] array
- * you send it, so previewing must build up that final state the same way.
- */
-/**
- * Builds one change's quote-side effect from its simulator preview.
+ * Builds the quote-side effect from the folded preview.
  * v0.6.2 (PR-3): `immediate` comes from `preview.incurred_amount`
  * ONLY (§3.11) — this replaces the pre-migration mapping of
  * `preview.amount_due` into `immediate.{charge,credit,net}` at all
@@ -237,15 +291,39 @@ function effectFromPreview(
   return effect;
 }
 
-function previewOneChange(
-  sim: StripeSim,
-  subscriptionId: string,
+/**
+ * Folds a single ChangeSpec into the batch's working item set —
+ * NO preview is taken here. `workingItems` is the CURRENT state of
+ * every item as of this point in the batch — i.e. it already
+ * reflects any prior change in the same proposal that touched the
+ * same item, so a later change to an item composes on the earlier
+ * result (a quantity change sets that item's quantity; a second
+ * quantity change to the SAME item supersedes the first one's
+ * value — it does not add a second delta).
+ *
+ * v0.6.2 (PR #10 correction M1): the quote is derived from ONE
+ * preview of the FINAL folded item set (see createChangeQuote).
+ * The pre-fix construction previewed each change separately
+ * against the ORIGINAL subscription and combined the per-change
+ * effects — which double-counted overlapping same-item changes
+ * (each preview measured its delta from the original state) and
+ * took the aggregate recurring from the LAST preview only
+ * (dropping earlier changes to other items from the quote, while
+ * the commit — which always mutated to the folded set — landed
+ * them). The recurring "shape" (currency / cadence) still follows
+ * the batch's last change, as before; the FIGURES now come from
+ * the single folded preview.
+ */
+function foldOneChange(
   sub: StripeSubscription,
   workingItems: Map<string, StripeItemInput>,
-  change: ChangeSpec,
-  prorationDate: number,
-  effectiveAtIso: string
-): { item: StripeItemInput; effect: CommercialEffect; preview: UpcomingInvoicePreview } {
+  change: ChangeSpec
+): {
+  item: StripeItemInput;
+  recurringCurrency: string;
+  recurringCadence?: "MONTHLY" | "ANNUAL";
+  term?: CommercialEffect["term"];
+} {
   const currentFor = (itemId: string): StripeItemInput => {
     const working = workingItems.get(itemId);
     if (working) return working;
@@ -258,22 +336,10 @@ function previewOneChange(
       const current = currentFor(change.itemId);
       const item = sub.items.find((i) => i.id === change.itemId);
       if (!item) throw new SCQError("INVALID_PROPOSAL", `Item ${change.itemId} not found on subscription`);
-      const itemInput: StripeItemInput = { id: current.id, price: current.price, quantity: change.quantity };
-      const preview = sim.previewUpcomingInvoice(subscriptionId, [itemInput], "create_prorations", prorationDate);
       return {
-        item: itemInput,
-        preview,
-        effect: effectFromPreview(
-          preview,
-          {
-            previousAmount: sub.items.reduce((s, i) => s + i.price.unitAmount * i.quantity, 0),
-            resultingAmount: preview.next_period_recurring_amount,
-            currency: item.price.currency,
-            cadence: item.price.interval === "year" ? "ANNUAL" : "MONTHLY",
-          },
-          undefined,
-          effectiveAtIso
-        ),
+        item: { id: current.id, price: current.price, quantity: change.quantity },
+        recurringCurrency: item.price.currency,
+        recurringCadence: item.price.interval === "year" ? "ANNUAL" : "MONTHLY",
       };
     }
     case "CHANGE_PLAN": {
@@ -282,21 +348,9 @@ function previewOneChange(
       if (!item) throw new SCQError("INVALID_PROPOSAL", `Item ${change.itemId} not found on subscription`);
       const price = OFFERING_TO_PRICE[change.offeringRef];
       if (!price) throw new SCQError("UNSUPPORTED_CHANGE", `Unknown offeringRef ${change.offeringRef}`);
-      const itemInput: StripeItemInput = { id: current.id, price, quantity: current.quantity };
-      const preview = sim.previewUpcomingInvoice(subscriptionId, [itemInput], "create_prorations", prorationDate);
       return {
-        item: itemInput,
-        preview,
-        effect: effectFromPreview(
-          preview,
-          {
-            previousAmount: sub.items.reduce((s, i) => s + i.price.unitAmount * i.quantity, 0),
-            resultingAmount: preview.next_period_recurring_amount,
-            currency: item.price.currency,
-          },
-          undefined,
-          effectiveAtIso
-        ),
+        item: { id: current.id, price, quantity: current.quantity },
+        recurringCurrency: item.price.currency,
       };
     }
     case "CHANGE_CADENCE": {
@@ -305,22 +359,11 @@ function previewOneChange(
       const current = currentFor(item.id);
       const targetKey = change.cadence === "ANNUAL" ? "plan:basic:annual" : "plan:basic:monthly";
       const price = OFFERING_TO_PRICE[targetKey];
-      const itemInput: StripeItemInput = { id: current.id, price, quantity: current.quantity };
-      const preview = sim.previewUpcomingInvoice(subscriptionId, [itemInput], "create_prorations", prorationDate);
       return {
-        item: itemInput,
-        preview,
-        effect: effectFromPreview(
-          preview,
-          {
-            previousAmount: sub.items.reduce((s, i) => s + i.price.unitAmount * i.quantity, 0),
-            resultingAmount: preview.next_period_recurring_amount,
-            currency: item.price.currency,
-            cadence: change.cadence,
-          },
-          { createsCommitment: "UNKNOWN", commitmentUntil: "UNKNOWN", autoRenew: !sub.cancel_at_period_end },
-          effectiveAtIso
-        ),
+        item: { id: current.id, price, quantity: current.quantity },
+        recurringCurrency: item.price.currency,
+        recurringCadence: change.cadence,
+        term: { createsCommitment: "UNKNOWN", commitmentUntil: "UNKNOWN", autoRenew: !sub.cancel_at_period_end },
       };
     }
     case "CANCEL":
@@ -329,47 +372,34 @@ function previewOneChange(
 }
 
 /**
- * Combines multiple per-change CommercialEffects into one aggregate.
- *
- * v0.6.2 (PR-3, CORE-1 aggregation rule — replaces the v0.6.1
- * version, which summed with `?? 0` coercion and DROPPED a combined
- * zero into absence): the immediate sum runs over DETERMINED nets
- * only, and a combined zero stays PRESENT as `{ net: 0 }` under
- * DETERMINED — absence no longer means zero. If ANY contributing
- * change's immediate is not DETERMINED, the combined dimension is
- * UNKNOWN and no sum is emitted: an unestablished part makes the
- * whole unestablished, and a partial sum would be a fabricated
- * figure. Recurring keeps the last change's figure, with that
- * figure's determinacy and provenance.
+ * The proposal's FOLDED intent — what the commit actually
+ * dispatches (the final item set in `provider_preview_input`) —
+ * for post-commit state verification. When a batch repeats an
+ * action against the same target (two CHANGE_QUANTITY sets on one
+ * item, two plan swaps on one item, two cadence changes), the
+ * later change SUPERSEDES the earlier one's stated value in the
+ * folded set, so the executed intent for that target is the LAST
+ * stated value. The PR-1 state check verifies every change in the
+ * proposal against the final snapshot; fed the raw proposal, a
+ * correctly landed folded commit would report a false MISMATCH
+ * against a superseded intermediate value (e.g. quantity 120 in a
+ * [100→120, →150] batch whose folded landing is 150). Verification
+ * therefore runs against the folded intent — the same
+ * intended-target-set principle the Chargebee adapter's state
+ * checks use. The verdict is still COMPUTED by
+ * establishVerification from the observation; only the intent it
+ * is computed against is the executed one. The stored quote and
+ * the caller's proposal are not modified.
  */
-function combineEffects(effects: CommercialEffect[]): CommercialEffect {
-  const lastRecurringEffect = effects.reduce((r, e) => (e.recurring ? e : r), effects[0]);
-  const lastTerm = effects.reduce((t, e) => e.term ?? t, undefined as CommercialEffect["term"] | undefined);
-  const lastEffectiveAt = effects[effects.length - 1]?.effectiveAt;
-  const combined: CommercialEffect = {};
-
-  const allImmediateDetermined = effects.every(
-    (e) => determinacyOf(e).immediateFinancialEffect === "DETERMINED" && typeof e.immediate?.net === "number"
-  );
-  if (allImmediateDetermined) {
-    const immediateNet = effects.reduce((sum, e) => sum + (e.immediate?.net ?? 0), 0);
-    combined.immediate = immediateParts(immediateNet);
-  }
-  if (lastRecurringEffect?.recurring !== undefined) combined.recurring = lastRecurringEffect.recurring;
-  if (lastTerm !== undefined) combined.term = lastTerm;
-  if (lastEffectiveAt !== undefined) combined.effectiveAt = lastEffectiveAt;
-
-  combined.determinacy = {
-    immediateFinancialEffect: allImmediateDetermined ? "DETERMINED" : "UNKNOWN",
-    recurringFinancialEffect: lastRecurringEffect ? determinacyOf(lastRecurringEffect).recurringFinancialEffect : "UNKNOWN",
-  };
-  combined.provenance = {
-    immediate: allImmediateDetermined
-      ? "sum of the per-change incurred obligations, each from its own simulator preview's incurred_amount (CORE-1 aggregation over DETERMINED values only)"
-      : PROV_IMMEDIATE_WITHHELD,
-    ...(lastRecurringEffect?.provenance?.recurring ? { recurring: lastRecurringEffect.provenance.recurring } : {}),
-  };
-  return combined;
+function foldedProposal(proposal: SubscriptionChangeProposal): SubscriptionChangeProposal {
+  const keyOf = (change: ChangeSpec): string =>
+    change.action === "CHANGE_QUANTITY" || change.action === "CHANGE_PLAN"
+      ? `${change.action}:${change.itemId}`
+      : change.action;
+  const lastIndexByKey = new Map<string, number>();
+  proposal.changes.forEach((change, i) => lastIndexByKey.set(keyOf(change), i));
+  const keep = new Set(lastIndexByKey.values());
+  return { ...proposal, changes: proposal.changes.filter((_, i) => keep.has(i)) };
 }
 
 export class StripeAdapter implements SubscriptionProvider {
@@ -482,25 +512,44 @@ export class StripeAdapter implements SubscriptionProvider {
     } else {
       // One or more non-CANCEL changes, bundled into a single items[]
       // update — genuinely atomic on Stripe (see multiChangePairSupport).
-      // workingItems folds sequentially so a later change targeting the
-      // SAME item sees the prior change's result, not the original state.
+      //
+      // PR #10 correction M1: fold ALL changes into the final item
+      // set FIRST (workingItems — a later change to an item composes
+      // on the earlier result; the folded set is also exactly what
+      // the commit will send), then derive the quote from ONE
+      // preview of that folded set. The folded preview measures
+      // every item's delta against the ORIGINAL state exactly once,
+      // so overlapping same-item changes cannot double-count and
+      // the aggregate recurring covers every item's change. (The
+      // pre-fix code previewed each change against the original
+      // subscription and combined the per-change effects.)
       const workingItems = new Map<string, StripeItemInput>();
-      const results = proposal.changes.map((change) => {
-        const result = previewOneChange(this.sim, subscriptionId, sub, workingItems, change, nowUnix, now.toISOString());
-        workingItems.set(result.item.id!, result.item);
-        return result;
+      const steps = proposal.changes.map((change) => {
+        const step = foldOneChange(sub, workingItems, change);
+        workingItems.set(step.item.id!, step.item);
+        return step;
       });
+      const foldedItems = Array.from(workingItems.values());
+      const preview = this.sim.previewUpcomingInvoice(subscriptionId, foldedItems, "create_prorations", nowUnix);
       previewInput = {
-        // Use the final folded state per item (workingItems.values()), not
-        // results.map(r => r.item) — if two changes in the batch target
-        // the same item, the latter would otherwise produce a DUPLICATE
-        // entry for that item id in items[].
-        items: Array.from(workingItems.values()),
+        items: foldedItems,
         proration_behavior: "create_prorations",
         proration_date: nowUnix,
       };
-      previews = results.map((r) => r.preview);
-      commercialEffect = combineEffects(results.map((r) => r.effect));
+      previews = [preview];
+      const lastStep = steps[steps.length - 1];
+      const lastTerm = steps.reduce((t, s) => s.term ?? t, undefined as CommercialEffect["term"] | undefined);
+      commercialEffect = effectFromPreview(
+        preview,
+        {
+          previousAmount: sub.items.reduce((s, i) => s + i.price.unitAmount * i.quantity, 0),
+          resultingAmount: preview.next_period_recurring_amount,
+          currency: lastStep.recurringCurrency,
+          ...(lastStep.recurringCadence ? { cadence: lastStep.recurringCadence } : {}),
+        },
+        lastTerm,
+        now.toISOString()
+      );
     }
 
     const expiresAt = new Date(now.getTime() + QUOTE_TTL_MS).toISOString();
@@ -534,22 +583,16 @@ export class StripeAdapter implements SubscriptionProvider {
       providerMetadata: {
         proration_behavior: previewInput.proration_behavior,
         proration_date: previewInput.proration_date,
-        // v0.6.2 (PR-3, §3.11): the previews' invoice-side figures
+        // v0.6.2 (PR-3, §3.11): the preview's invoice-side figures
         // (amount due, applied customer balance, next-period total)
         // are reported HERE, labeled with meaning and source —
-        // never in the effect. A single-change quote gets one
-        // nextInvoiceEstimate; a multi-change quote gets one entry
-        // per change, because the sequential per-change previews do
-        // not compose into a single invoice figure and inventing an
-        // aggregate would fabricate one.
+        // never in the effect. PR #10 correction M1: there is now
+        // exactly ONE preview per quote — of the final folded item
+        // set — so a multi-change quote's nextInvoiceEstimate is
+        // that folded preview's figure, not a per-change list (the
+        // pre-fix per-change `changeInvoiceEstimates` reported
+        // sequential previews that did not compose).
         ...(previews.length === 1 ? { nextInvoiceEstimate: invoiceEstimateMetadata(previews[0]) } : {}),
-        ...(previews.length > 1
-          ? {
-              changeInvoiceEstimates: previews.map(invoiceEstimateMetadata),
-              changeInvoiceEstimatesNote:
-                "one entry per change, in proposal order; sequential per-change previews do not compose into a single next-invoice figure, so no aggregate estimate is asserted",
-            }
-          : {}),
       },
     };
   }
@@ -601,6 +644,15 @@ export class StripeAdapter implements SubscriptionProvider {
     const effectiveMode = validated.effective_guarantee_mode;
     const isCancel = proposal.changes.length === 1 && proposal.changes[0].action === "CANCEL";
 
+    // v0.6.2 (PR #10 correction M2): the QUOTED effect must be
+    // determinate before this commit proceeds in ANY mode. The
+    // frozen v0.6.1 envelope coerces absent figures to 0, so an
+    // UNKNOWN quoted incurred figure could otherwise pass a loose
+    // envelope and mutate (see assertEffectDeterminateForCommit).
+    // This refusal happens before the re-preview and before any
+    // mutating call; a licensed CANCEL NOT_APPLICABLE passes.
+    assertEffectDeterminateForCommit(validated.quoted_effect, proposal, "quoted");
+
     if (effectiveMode === "REVALIDATE" && !isCancel) {
       // Order per spec: re-preview -> evaluate acceptance envelope -> mutate
       // -> fetch resulting state -> receipt. Re-preview is non-mutating and
@@ -640,6 +692,14 @@ export class StripeAdapter implements SubscriptionProvider {
           committedSource: "revalidated_preview",
         },
       };
+      // v0.6.2 (PR #10 correction M2): the REVALIDATED effect must
+      // also be determinate BEFORE the envelope gate runs — the
+      // v0.6.1 envelope would coerce an absent revalidated figure
+      // to 0 and could pass it (a withheld incurred figure reads
+      // as a bounded "credit decrease"), letting the commit mutate
+      // against an effect it does not know. Refuse here, still
+      // before any mutating call.
+      assertEffectDeterminateForCommit(revalidated, proposal, "revalidated");
       const violation = checkAcceptanceEnvelope(validated.quoted_effect, revalidated, proposal.acceptanceEnvelope!);
       if (violation) {
         throw new SCQError(
@@ -773,16 +833,38 @@ export class StripeAdapter implements SubscriptionProvider {
    * assigned to adapters. The establishment token is not treated
    * as proof of the observation's authenticity.)
    *
+   * PR #10 correction M3 — INVOICE IDENTITY BINDING: the financial
+   * actuals come from the invoice THIS mutation generated, bound
+   * by the id the mutation returned (`mutationInvoice.id`) and
+   * read via `retrieveInvoice(thatId)` — NEVER from the
+   * subscription's `latest_invoice`, which a later/concurrent
+   * mutation may already have replaced (the pre-fix read did
+   * exactly that, and could attribute an unrelated invoice's
+   * figures to this commit). The subscription re-read serves the
+   * item-set / state verification only. Divergence is handled
+   * explicitly: if `latest_invoice` no longer points at the bound
+   * invoice, a later mutation intervened — a state MISMATCH
+   * against this commit's intent still reports as the determined
+   * negative verification below, but if the observed state still
+   * matches intent, the commit is COMMITTED_UNVERIFIED: the state
+   * was not produced by this commit alone, so it cannot be
+   * attributed to it, and the recorded figures are this commit's
+   * bound-invoice actuals only.
+   *
    * Outcomes:
    *  - read succeeds + state VERIFIED (computed by
    *    establishVerification from the read-back snapshot against
-   *    the proposal): COMMITTED / COMMITTED_AND_VERIFIED with the
-   *    establishment's computed reconciliation.
+   *    the proposal) + no intervening invoice: COMMITTED /
+   *    COMMITTED_AND_VERIFIED with the establishment's computed
+   *    reconciliation.
    *  - read succeeds + state MISMATCH: the landed state is
    *    ESTABLISHED and contradicts intent — a determined negative
    *    verification (Decision D3): COMMITTED /
    *    COMMITTED_AND_VERIFIED with a VIOLATED reconciliation
    *    naming the mismatch. Never collapsed into UNVERIFIED.
+   *  - read succeeds + state matches intent + an intervening
+   *    invoice superseded `latest_invoice`: COMMITTED_UNVERIFIED
+   *    (attribution unverified; figures are the bound invoice's).
    *  - read succeeds + state UNVERIFIABLE, or the read itself is
    *    unavailable / its incurred figure withheld: landing is
    *    established (the mutation returned) but verification is
@@ -819,12 +901,14 @@ export class StripeAdapter implements SubscriptionProvider {
     };
 
     // Independent post-commit read of persisted simulator state.
+    // M3: the invoice read is BOUND to this mutation's own invoice
+    // id — `mutationInvoice.id`, returned by the mutating call —
+    // never to `readSub.latest_invoice` (see the doc comment).
     let readSub: StripeSubscription | undefined;
     let readIncurred: number | undefined;
     try {
       readSub = this.sim.retrieve(subscriptionId);
-      if (!readSub.latest_invoice) throw new StripeSimError("resource_missing", "No generated invoice recorded for the post-commit read");
-      const readInvoice = this.sim.retrieveInvoice(readSub.latest_invoice);
+      const readInvoice = this.sim.retrieveInvoice(mutationInvoice.id);
       if (typeof readInvoice.incurred_amount === "number" && Number.isFinite(readInvoice.incurred_amount)) {
         readIncurred = readInvoice.incurred_amount;
       }
@@ -875,12 +959,17 @@ export class StripeAdapter implements SubscriptionProvider {
       effectiveAt: quoted.effectiveAt,
       determinacy: { immediateFinancialEffect: "DETERMINED", recurringFinancialEffect: "DETERMINED" },
       provenance: {
-        immediate: PROV_IMMEDIATE_COMMITTED,
+        immediate: provImmediateCommitted(mutationInvoice.id),
         recurring: PROV_RECURRING_COMMITTED,
         committedSource: "provider_actual",
       },
     };
     const snap = snapshotOf(readSub);
+
+    // M3 divergence signal: the subscription's latest_invoice no
+    // longer points at THIS mutation's invoice — a later mutation
+    // intervened between this commit's mutation and its read.
+    const interveningInvoiceId = readSub.latest_invoice !== mutationInvoice.id ? readSub.latest_invoice : undefined;
 
     // The verification itself — state match and reconciliation —
     // is COMPUTED by the PR-1 establishment procedure from this
@@ -890,20 +979,18 @@ export class StripeAdapter implements SubscriptionProvider {
       committedEffect,
       resultingSnapshot: snap,
       source:
-        "stripe-adapter post-commit read: simulator retrieve(subscription) + retrieveInvoice(latest_invoice) after the mutation (synthetic simulator observation)",
+        `stripe-adapter post-commit read: simulator retrieve(subscription) + retrieveInvoice(${mutationInvoice.id}) — ` +
+        `the invoice THIS mutation generated, bound by id; latest_invoice is never used for financial actuals ` +
+        `(synthetic simulator observation)`,
       observedAt: new Date().toISOString(),
     };
-    const evidence = establishVerification(validated, observation);
+    // M1: verify against the FOLDED intent — the item set the
+    // mutation was actually instructed to produce (see
+    // foldedProposal). The stored quote itself is untouched; the
+    // establishment still computes the verdict and reconciliation.
+    const verificationQuote: StoredQuote = { ...validated, proposal: foldedProposal(validated.proposal) };
+    const evidence = establishVerification(verificationQuote, observation);
 
-    if (evidence.stateVerification === "VERIFIED") {
-      return {
-        effect: committedEffect,
-        reconciliation: evidence.reconciliation,
-        status: "COMMITTED",
-        outcome: "COMMITTED_AND_VERIFIED",
-        snapshot: snap,
-      };
-    }
     if (evidence.stateVerification === "MISMATCH") {
       return {
         effect: committedEffect,
@@ -911,9 +998,43 @@ export class StripeAdapter implements SubscriptionProvider {
           status: "VIOLATED",
           reason:
             `Post-commit state verification MISMATCH — a determined negative verification (Decision D3): ` +
-            `${describeStateMismatch(validated.proposal, snap)} The committed figures are the observed actuals; ` +
-            `the mutation has already occurred and cannot be rolled back by this reconciliation.`,
+            `${describeStateMismatch(verificationQuote.proposal, snap)} The committed immediate is this mutation's ` +
+            `bound-invoice actual and the recurring figure reports the observed state; the mutation has ` +
+            `already occurred and cannot be rolled back by this reconciliation.`,
         },
+        status: "COMMITTED",
+        outcome: "COMMITTED_AND_VERIFIED",
+        snapshot: snap,
+      };
+    }
+    if (evidence.stateVerification === "VERIFIED" && interveningInvoiceId !== undefined) {
+      // M3: the observed state still matches this commit's intent,
+      // but a concurrent mutation superseded latest_invoice in the
+      // meantime — the state was not produced by this commit
+      // alone, so its attribution to this commit is UNVERIFIED.
+      // The recorded figures remain this commit's bound-invoice
+      // actuals; nothing is taken from the intervening invoice.
+      return {
+        effect: committedEffect,
+        reconciliation: {
+          status: "UNVERIFIED",
+          reason:
+            `a concurrent mutation intervened between this commit's mutation and its verification read: the ` +
+            `subscription's latest_invoice is ${interveningInvoiceId}, not this commit's bound invoice ` +
+            `${mutationInvoice.id}, so the observed post-commit state was not produced by this commit alone ` +
+            `and cannot be attributed to it. The recorded financial figures are this commit's own ` +
+            `bound-invoice actuals, read by id; no figure was taken from the intervening invoice.`,
+          undeterminedDimensions: [],
+        },
+        status: "COMMITTED_UNVERIFIED",
+        outcome: "COMMITTED_UNVERIFIED",
+        snapshot: snap,
+      };
+    }
+    if (evidence.stateVerification === "VERIFIED") {
+      return {
+        effect: committedEffect,
+        reconciliation: evidence.reconciliation,
         status: "COMMITTED",
         outcome: "COMMITTED_AND_VERIFIED",
         snapshot: snap,
