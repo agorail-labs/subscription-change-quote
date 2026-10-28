@@ -120,9 +120,12 @@ export type PreviewResult = {
    * "no transaction now; the obligation bills later" — the SCQ
    * adapter only ever previews with `prorated_immediately`, where
    * the zero reading is the operative one. The field is ABSENT
-   * (undefined) only under the `_debugOmitImmediateTransaction`
-   * fault hook, modeling a provider response that omits the figure
-   * entirely — that absence means NOT ESTABLISHED (unknown).
+   * (undefined) only on `previewUpdate`'s returned surface under
+   * the `_debugOmitImmediateTransaction` fault hook, modeling a
+   * provider preview response that omits the figure entirely —
+   * that absence means NOT ESTABLISHED (unknown). The internal
+   * computation (and therefore `update()`'s persisted transaction)
+   * always carries the true figure; see correction P2.
    */
   immediateTransaction?: ImmediateTransactionPreview | null;
   nextTransaction: { amount: number; currencyCode: string; billedAt: string } | null;
@@ -165,10 +168,36 @@ export class PaddleSim {
   // v0.6.2 (PR-4) fault-injection hooks (migration matrix F-6: the
   // conformance suite needs negative cases the happy-path model
   // cannot produce). All default off; tests set them explicitly.
-  /** When true, previews return WITHOUT an immediate-transaction figure — the preview cannot establish the incurred obligation. Generated transactions are unaffected: the flag models a sparse PREVIEW, not a sparse transaction. */
+  /**
+   * When true, PREVIEW responses omit the immediate-transaction
+   * figure — the preview cannot establish the incurred obligation.
+   * The omission applies ONLY at the preview surface
+   * (`previewUpdate`'s return): the internal computation is never
+   * shaped by this flag, and `update()` always persists the TRUE
+   * incurred amount on its generated transaction (PR #11 review
+   * correction P2 — a sparse preview must never rewrite a
+   * mutation's artifact; the flag models a sparse PREVIEW, not a
+   * sparse transaction).
+   */
   _debugOmitImmediateTransaction = false;
   /** When true, `retrieveTransaction` throws — the post-commit transaction read is unavailable, so committed finances cannot be independently verified. */
   _debugFailTransactionReads = false;
+  /**
+   * When true, `get()` throws for every call made AFTER a mutation
+   * (`update()` / `cancel()`) has landed in this sim —
+   * PERSISTENTLY, not one-shot — modeling a provider whose
+   * subscription reads fail after a successful mutation. Reads
+   * before any mutation are unaffected (quote creation, the
+   * pre-mutation TOCTOU fingerprint, and the commit-time
+   * re-preview all still work). `retrieveTransaction` is NOT
+   * affected (that is `_debugFailTransactionReads`). Added for
+   * PR #11 review correction P1: a successful mutation's
+   * COMMITTED_UNVERIFIED receipt must be recordable without any
+   * further successful provider read.
+   */
+  _debugFailSubscriptionReadsAfterMutation = false;
+  /** Set once any mutation has landed in this sim; gates `_debugFailSubscriptionReadsAfterMutation`. */
+  private hasLandedMutation = false;
   /** When true, the next `update()` fully applies the mutation and persists its transaction, then throws an `api_connection_error` — a response lost AFTER the mutation landed. One-shot: the flag clears itself. */
   _debugLoseNextUpdateResponse = false;
   /** Same lost-response fault for the next `cancel()` call. One-shot. */
@@ -191,6 +220,12 @@ export class PaddleSim {
   }
 
   get(id: string): PaddleSubscription {
+    if (this._debugFailSubscriptionReadsAfterMutation && this.hasLandedMutation) {
+      throw new PaddleSimError(
+        "api_error",
+        "Simulated subscription read failure: subscription reads are unavailable after a mutation has landed (fault injection)"
+      );
+    }
     const sub = this.subs.get(id);
     if (!sub) throw new PaddleSimError("entity_not_found", `subscription ${id} not found`);
     return structuredClone(sub);
@@ -240,7 +275,19 @@ export class PaddleSim {
     prorationBillingMode: ProrationBillingMode
   ): PreviewResult {
     const sub = this.get(subscriptionId);
-    return this.computePreview(sub, proposedItems, prorationBillingMode);
+    const result = this.computePreview(sub, proposedItems, prorationBillingMode);
+    if (this._debugOmitImmediateTransaction) {
+      // Fault injection at the preview SURFACE only (correction
+      // P2): the returned preview omits the immediate figure
+      // entirely — modeled absence, so the incurred obligation
+      // cannot be established from this preview. The internal
+      // computation above is NOT shaped by the hook, and update()
+      // — which runs the same computation — always persists the
+      // true incurred amount on its generated transaction.
+      const { immediateTransaction: _omitted, ...rest } = result;
+      return rest;
+    }
+    return result;
   }
 
   /** PATCH /subscriptions/{id} — mutates. */
@@ -259,6 +306,7 @@ export class PaddleSim {
       if (!price) throw new PaddleSimError("validation_error", `unknown price ${p.priceId}`);
       return { price, quantity: p.quantity };
     });
+    this.hasLandedMutation = true;
 
     // Paddle Billing's billing_cycle is a property of the subscription that
     // tracks the price interval of its items; a price swap that changes
@@ -280,6 +328,11 @@ export class PaddleSim {
     // call, so nothing intervened); a null immediate figure under
     // an immediate mode is the established zero (see
     // computePreview), so the persisted incurred amount is 0.
+    // The computation here is the INTERNAL one — it is never
+    // shaped by `_debugOmitImmediateTransaction`, which suppresses
+    // the figure only on previewUpdate's returned surface
+    // (correction P2): a missing preview figure must never turn a
+    // nonzero generated transaction into a zero.
     // Under a deferred mode no immediate transaction is generated.
     let transaction: PaddleTransaction | undefined;
     if (prorationBillingMode === "prorated_immediately" || prorationBillingMode === "full_immediately") {
@@ -326,6 +379,7 @@ export class PaddleSim {
     } else {
       sub.scheduledChange = { action: "cancel", effectiveAt: sub.currentBillingPeriod.endsAt };
     }
+    this.hasLandedMutation = true;
     if (this._debugLoseNextCancelResponse) {
       // Fault injection: the cancellation HAS landed — only the
       // response is lost (the indeterminate case, as in update()).
@@ -391,14 +445,6 @@ export class PaddleSim {
     } else {
       // prorated_immediately
       incurredAmount = Math.round((nextTotal - oldTotal) * fractionRemaining);
-    }
-
-    if (this._debugOmitImmediateTransaction) {
-      // Fault injection: the response omits the immediate figure
-      // entirely — the incurred obligation cannot be established
-      // from this preview (modeled absence, distinct from the
-      // established-zero null below).
-      return { nextTransaction };
     }
 
     if (incurredAmount === 0) {

@@ -270,6 +270,34 @@ function snapshotFrom(sub: PaddleSubscription): SubscriptionSnapshot {
 }
 
 /**
+ * v0.6.2 (PR-4, PR #11 review correction P1): a receipt snapshot
+ * built ENTIRELY from data already in hand — the mutation
+ * response's subscription object — performing NO provider read.
+ *
+ * The establish methods' `snapshotOf` stamps the snapshot's
+ * version via `fingerprint()`, which performs another `get`. On
+ * the unverified-candidate paths — reached precisely BECAUSE
+ * post-commit reads are failing — that extra read can throw after
+ * the mutation has already landed, and a successful mutation
+ * would then record NOTHING instead of its COMMITTED_UNVERIFIED
+ * receipt. The candidate paths therefore use this construction:
+ * the snapshot's contents come from the mutation response, and
+ * its version is left explicitly UNVERSIONED ("", the value
+ * `snapshotFrom` itself produces before any stamping) — the
+ * fingerprint of the post-mutation state cannot be established
+ * without a read, and inventing one would mislabel it (reusing
+ * the quote's `subscription_version_at_quote`, for instance,
+ * would present the PRE-mutation state's fingerprint as the
+ * post-mutation snapshot's version). The receipt this snapshot
+ * rides on is COMMITTED_UNVERIFIED: the snapshot is a candidate
+ * record of the mutation response, not a verified post-commit
+ * read, and its unversioned state says exactly that.
+ */
+function snapshotFromMutationResponse(sub: PaddleSubscription): SubscriptionSnapshot {
+  return snapshotFrom(sub);
+}
+
+/**
  * Builds an effect from a folded-set preview (§3.11): `immediate`
  * comes from the preview immediate transaction's INCURRED
  * component ONLY; the transaction's payment total never enters
@@ -814,6 +842,17 @@ export class PaddleAdapter implements SubscriptionProvider {
    *    unestablished under UNKNOWN determinacy — what a later
    *    independent observation must confirm, verbatim, for
    *    verifyCommitReceipt to transition the record.
+   *
+   * Correction P1: the read-failed path is constructed ENTIRELY
+   * from data already in hand (the mutation response and the
+   * stored quote) — its receipt snapshot is
+   * `snapshotFromMutationResponse`, which performs no provider
+   * read. (Previously the snapshot went through `snapshotOf`,
+   * whose `fingerprint()` performs another `get`; under a
+   * persistent post-mutation read failure that threw, and the
+   * successful mutation recorded nothing.) Once the mutation has
+   * succeeded, recording the COMMITTED_UNVERIFIED receipt never
+   * depends on a subsequent successful provider read.
    */
   private establishCommittedEffect(
     validated: StoredQuote,
@@ -895,7 +934,12 @@ export class PaddleAdapter implements SubscriptionProvider {
         },
         status: "COMMITTED_UNVERIFIED",
         outcome: "COMMITTED_UNVERIFIED",
-        snapshot: snapshotOf(mutationSub),
+        // Correction P1: built from the mutation response alone —
+        // NO further provider read (see
+        // snapshotFromMutationResponse). Recording this receipt
+        // must never depend on a read succeeding after the
+        // mutation has landed.
+        snapshot: snapshotFromMutationResponse(mutationSub),
       };
     }
 
@@ -1023,12 +1067,20 @@ export class PaddleAdapter implements SubscriptionProvider {
    *    established contradiction: MISMATCH.
    *  - TERM_END intent: the re-read must carry the SCHEDULED
    *    cancellation — `scheduledChange.action === "cancel"` with
-   *    its effective date at the current period boundary — while
-   *    the subscription is still active (kind SCHEDULED); a
-   *    terminal read is also established (kind TERMINAL — already
-   *    effective). A still-active subscription WITHOUT the
-   *    scheduled change, or with a different effective date, is an
-   *    established contradiction: MISMATCH.
+   *    its effective date equal to the QUOTED effective date (the
+   *    boundary recorded on the quote at quote time) — while the
+   *    subscription is still active (kind SCHEDULED). A terminal
+   *    read establishes the cancellation (kind TERMINAL) ONLY
+   *    once that quoted boundary has been reached; a terminal
+   *    read BEFORE it is a premature termination — the provider
+   *    ended the subscription earlier than the quoted effective
+   *    date, a different outcome than the one quoted — and is an
+   *    established contradiction: MISMATCH (PR #11 review
+   *    correction P3; previously any terminal read verified, and
+   *    the scheduled date was compared against the record's
+   *    current period end, which a later change can drift). A
+   *    still-active subscription WITHOUT the scheduled change, or
+   *    with a different effective date, is likewise MISMATCH.
    *  - MISMATCH (D3): a determined negative verification —
    *    COMMITTED / COMMITTED_AND_VERIFIED with a VIOLATED
    *    reconciliation, and the committed figures honestly report
@@ -1037,7 +1089,11 @@ export class PaddleAdapter implements SubscriptionProvider {
    *  - Re-read unavailable: landing is established (the cancel
    *    call returned) but verification is not —
    *    COMMITTED_UNVERIFIED with candidate figures labeled
-   *    unestablished under UNKNOWN determinacy.
+   *    unestablished under UNKNOWN determinacy. Correction P1:
+   *    this path is constructed entirely from data already in
+   *    hand (its snapshot is `snapshotFromMutationResponse`, no
+   *    provider read), so recording it never depends on a further
+   *    successful read after the mutation has landed.
    */
   private establishCancelCommit(
     validated: StoredQuote,
@@ -1098,7 +1154,12 @@ export class PaddleAdapter implements SubscriptionProvider {
         },
         status: "COMMITTED_UNVERIFIED",
         outcome: "COMMITTED_UNVERIFIED",
-        snapshot: snapshotOf(mutationSub),
+        // Correction P1: built from the mutation response alone —
+        // NO further provider read (see
+        // snapshotFromMutationResponse). Recording this receipt
+        // must never depend on a read succeeding after the
+        // mutation has landed.
+        snapshot: snapshotFromMutationResponse(mutationSub),
       };
     }
 
@@ -1115,12 +1176,40 @@ export class PaddleAdapter implements SubscriptionProvider {
       }
     } else {
       // TERM_END: do NOT require a terminal state now — verify the
-      // SCHEDULED cancellation itself.
+      // SCHEDULED cancellation itself, against the QUOTED
+      // effective date: the boundary recorded on the quote at
+      // quote time (`quoted.effectiveAt`). Correction P3: the
+      // comparison reference is the quoted date, NOT the record's
+      // current billing-period end — the record's period end can
+      // drift after quoting, and a scheduled date that merely
+      // matches a drifted period end is not the cancellation that
+      // was quoted.
+      const quotedEffectiveAt = quoted.effectiveAt;
       if (readSub.status === "canceled") {
-        verifiedKind = "TERMINAL"; // already effective — established
+        // A terminal read establishes the cancellation ONLY once
+        // the quoted boundary has been reached (the scheduled
+        // cancellation has taken effect). A terminal state
+        // observed BEFORE the boundary is a PREMATURE termination:
+        // the subscription was ended earlier than the quoted
+        // effective date, which is a different outcome than the
+        // scheduled cancellation that was quoted — an established
+        // contradiction (MISMATCH), never a verified scheduled
+        // cancellation. (The sim's clock is the provider clock for
+        // this comparison; the quoted date is a provider-domain
+        // timestamp recorded at quote time.)
+        if (quotedEffectiveAt !== undefined && this.sim.currentTime().getTime() >= Date.parse(quotedEffectiveAt)) {
+          verifiedKind = "TERMINAL"; // boundary reached — the scheduled cancellation is in effect
+        } else {
+          mismatchReason =
+            `the post-commit re-read shows the subscription in the terminal "canceled" state BEFORE the ` +
+            `quoted TERM_END effective boundary (${quotedEffectiveAt}) — a premature termination: the ` +
+            `subscription was ended earlier than the effective date this commit was quoted for, which is a ` +
+            `different outcome than the scheduled cancellation quoted`;
+        }
       } else if (
         readSub.scheduledChange?.action === "cancel" &&
-        readSub.scheduledChange.effectiveAt === readSub.currentBillingPeriod.endsAt &&
+        quotedEffectiveAt !== undefined &&
+        readSub.scheduledChange.effectiveAt === quotedEffectiveAt &&
         readSub.status === "active"
       ) {
         verifiedKind = "SCHEDULED";
@@ -1131,8 +1220,8 @@ export class PaddleAdapter implements SubscriptionProvider {
       } else {
         mismatchReason =
           `the post-commit re-read shows a scheduled change (action ${readSub.scheduledChange.action}, effective ` +
-          `${readSub.scheduledChange.effectiveAt}) that does not match the intended scheduled cancellation at the ` +
-          `period boundary (${readSub.currentBillingPeriod.endsAt})`;
+          `${readSub.scheduledChange.effectiveAt}) that does not match the quoted scheduled cancellation's ` +
+          `effective date (${quotedEffectiveAt})`;
       }
     }
 
@@ -1186,9 +1275,12 @@ export class PaddleAdapter implements SubscriptionProvider {
         recurring:
           `${PROV_CANCEL_RECURRING_QUOTE} — established at commit by the post-commit re-read: ` +
           (verifiedKind === "TERMINAL"
-            ? `the subscription reads in the terminal "canceled" state (verification kind TERMINAL)`
+            ? effectiveFrom === "next_billing_period"
+              ? `the subscription reads in the terminal "canceled" state at/after the quoted effective boundary ` +
+                `(${quoted.effectiveAt}) — the scheduled cancellation has taken effect (verification kind TERMINAL)`
+              : `the subscription reads in the terminal "canceled" state (verification kind TERMINAL)`
             : `the scheduled cancellation is present with effective date ${readSub.scheduledChange?.effectiveAt} ` +
-              `(the period boundary) on a still-active subscription (verification kind SCHEDULED)`),
+              `(the quoted effective date) on a still-active subscription (verification kind SCHEDULED)`),
         committedSource: "defined_equal_exact",
       },
     };
