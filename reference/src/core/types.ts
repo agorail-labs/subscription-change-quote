@@ -428,6 +428,24 @@ export type CommittedFigureSource =
  * (verified within envelope), or reconciliation VIOLATED
  * (verified-with-violation — established actuals outside the
  * envelope; never reportable as OK).
+ *
+ * PR #8 review correction, round 2 (R3): this type is a TOKEN,
+ * not a form a caller fills in. `verifyCommitReceipt` accepts
+ * only evidence minted by `establishVerification` (quote-store.ts)
+ * from a `ProviderObservation` — the establishment procedure
+ * computes the state verification and the reconciliation FROM the
+ * observation and brands the resulting object; a caller-constructed
+ * object with identical fields (even one built from the stored
+ * receipt's own figures, labeled "provider_actual", asserting
+ * state VERIFIED) is self-asserted and is refused. The brand
+ * guarantees the evidence passed through the establishment
+ * computation over a caller-supplied observation; it cannot prove
+ * the observation truly came from a provider — binding an
+ * observation to a real provider read is the adapters' duty
+ * (PR-3..PR-7), and the store additionally re-validates the
+ * token's contents against the recorded receipt at the
+ * transition, so a token whose contents were altered after
+ * minting is refused as well.
  */
 export type VerificationEvidence = {
   committedEffect: CommercialEffect;
@@ -436,6 +454,40 @@ export type VerificationEvidence = {
   reconciliation: ReconciliationResult;
   /** When the verification was performed (ISO timestamp); defaults to the transition time. */
   at?: string;
+};
+
+/**
+ * v0.6.2 (CORE-8, PR #8 review correction round 2 — R3): an
+ * INDEPENDENT post-commit provider observation — the raw material
+ * `establishVerification` computes verification evidence from.
+ *
+ * "Independent" is the load-bearing word: the observation is a
+ * read of provider-side state made after the commit, NOT derived
+ * from the stored receipt and NOT the quote's own figures. Its
+ * `committedEffect` must carry an establishing committedSource
+ * ("provider_actual" / "defined_equal_exact"): an observation
+ * whose figures are a revalidated preview or a pre-mutation
+ * estimate is quote-side data and establishment refuses it, and an
+ * observation that IS the quote's quoted effect (the estimate
+ * itself, relabeled) is refused on sight. `resultingSnapshot` is
+ * the post-commit subscription state as read from the provider;
+ * the establishment procedure computes the §6.12 state
+ * verification from it against the proposal's intent — the caller
+ * never asserts the state result. Absent snapshot (or absent
+ * members the intent's checks need) computes UNVERIFIABLE, never
+ * VERIFIED.
+ */
+export type ProviderObservation = {
+  /** The subscription the observation is OF — must name the quote's subscription. */
+  subscriptionRef: string;
+  /** The committed figures as read from the provider side after the commit. */
+  committedEffect: CommercialEffect;
+  /** The post-commit subscription state as read from the provider (drives the computed state verification). */
+  resultingSnapshot?: SubscriptionSnapshot;
+  /** Descriptor of the read that produced this observation (adapter read path, for the audit trail). */
+  source: string;
+  /** When the observation was made (ISO timestamp). */
+  observedAt?: string;
 };
 
 /**

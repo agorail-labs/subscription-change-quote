@@ -17,7 +17,7 @@
 // relying on replay semantics; see
 // research/chargebee-live-v1/LIMITATIONS-AND-GAPS.md D-3.
 
-import { SCQError, type CommercialEffect, type GuaranteeCoverage, type GuaranteeMode, type MultiChangeConsistency, type MutationOutcome, type ReconciliationResult, type SubscriptionChangeProposal, type SubscriptionChangeReceipt, type VerificationEvidence } from "../core/types.js";
+import { SCQError, type CommercialEffect, type GuaranteeCoverage, type GuaranteeMode, type MultiChangeConsistency, type MutationOutcome, type ProviderObservation, type ReconciliationResult, type SubscriptionChangeProposal, type SubscriptionChangeReceipt, type VerificationEvidence } from "../core/types.js";
 import { reconcileCommittedEffect } from "../core/scq-engine.js";
 
 /**
@@ -150,6 +150,12 @@ export type StoredQuote<TPreviewInput = unknown> = {
    * outcome/status/reconciliation. The as-recorded original is
    * preserved separately in `commit_receipt_recorded` and is never
    * rewritten.
+   *
+   * Round 2 (R1): idempotent replay does NOT read this field —
+   * §6.10's "return the original receipt" is served from
+   * `commit_receipt_recorded` (see `recordedReceipt` below), so a
+   * replay after verification still returns the receipt as
+   * recorded. This field is the separate current-state read.
    */
   commit_receipt?: SubscriptionChangeReceipt;
   /**
@@ -203,12 +209,59 @@ export type StoredQuote<TPreviewInput = unknown> = {
 export class QuoteStore {
   private quotes = new Map<string, StoredQuote>();
 
+  /**
+   * Stores the store's OWN copy of the quote (PR #8 review
+   * correction, round 2 — R2): the caller keeps no alias into
+   * stored state, symmetric with the copy-on-read rule on `get`.
+   * Callers that keep mutating their local object after `put`
+   * (adapters build their response objects separately) are
+   * unaffected; a caller that needs later state changes goes
+   * through the store's write methods.
+   */
   put(quote: StoredQuote): void {
-    this.quotes.set(quote.quote_id, quote);
+    this.quotes.set(quote.quote_id, deepCopy(quote));
   }
 
+   /**
+   * Reads a quote as a DEFENSIVE COPY, never the internal record
+   * (PR #8 review correction, round 2 — R2). Round 1 (C3) made
+   * `recordCommitReceipt` copy defensively, but `get` kept handing
+   * out the internal StoredQuote — including its mutable
+   * `commit_receipt` — so any caller holding that reference could
+   * rewrite the record's current reconciliation (or its recorded
+   * snapshot reference) without `verifyCommitReceipt`, bypassing
+   * every evidence check. Copy-on-read closes that route on this
+   * and every other egress (`all`, `recordedReceipt`,
+   * `recordCommitReceipt` / `verifyCommitReceipt` returns,
+   * `receiptsWithReconciliation`); `serializeReceiptRecords`
+   * returns an immutable JSON string by construction. Mutating a
+   * returned object changes nothing stored — the identity digest
+   * included. State changes flow only through this class's write
+   * methods (`put`, `updateStatus`, `recordCommitReceipt`,
+   * `verifyCommitReceipt`, `recordCommitOutcome`,
+   * `restoreReceiptRecords`).
+   */
   get(quoteId: string): StoredQuote | undefined {
-    return this.quotes.get(quoteId);
+    const q = this.quotes.get(quoteId);
+    return q ? deepCopy(q) : undefined;
+  }
+
+  /**
+   * v0.6.2 (PR #8 review correction, round 2 — R1): the §6.10
+   * replay read — a defensive copy of the receipt EXACTLY as
+   * recorded (`commit_receipt_recorded`), for a COMMITTED quote.
+   * This is the only read idempotent replay may use: after a
+   * verification transition the current view (`commit_receipt`)
+   * shows the verified state, but a repeated commit returns the
+   * ORIGINAL receipt. The latest verified state is read through
+   * `get()`'s `commit_receipt` / `receiptsWithReconciliation`.
+   */
+  recordedReceipt(quoteId: string): SubscriptionChangeReceipt | undefined {
+    const q = this.quotes.get(quoteId);
+    if (q && q.status === "COMMITTED" && q.commit_receipt_recorded) {
+      return deepCopy(q.commit_receipt_recorded);
+    }
+    return undefined;
   }
 
   updateStatus(quoteId: string, status: QuoteStatus): void {
@@ -236,7 +289,9 @@ export class QuoteStore {
    *    under any other quote/subscription/figures — throws
    *    CONFLICTING_RECEIPT_IDENTITY and leaves the original record
    *    byte-identical. Identity is never resolved by overwriting.
-   * Returns the stored (current-view) receipt, or `undefined` when
+   * Returns the receipt AS RECORDED (a defensive copy of
+   * `commit_receipt_recorded`) — for a first recording and for a
+   * replay alike, per §6.10 (round 2, R1) — or `undefined` when
    * no such quote exists (the historical no-op for unknown quotes).
    */
   recordCommitReceipt(quoteId: string, receipt: SubscriptionChangeReceipt): SubscriptionChangeReceipt | undefined {
@@ -286,11 +341,15 @@ export class QuoteStore {
     if (q.commit_receipt) {
       if (q.commit_receipt_identity_digest === digest) {
         // Idempotent replay of the ORIGINAL recorded identity —
-        // including after a verification transition (C3): the
-        // caller gets the record's CURRENT view (verified, if it
-        // has since been verified), never a conflict and never a
-        // second record.
-        return deepCopy(q.commit_receipt);
+        // including after a verification transition. Per §6.10 the
+        // caller gets the ORIGINAL receipt as recorded (round 2,
+        // R1 — this corrects round 1's C3 behavior, which returned
+        // the current view and so handed a post-verification
+        // replay the VERIFIED receipt). The latest verified state
+        // remains available through the separate current-view
+        // reads. Never a conflict, never a second record, and the
+        // replay itself transitions nothing.
+        return deepCopy(q.commit_receipt_recorded!);
       }
       throw new SCQError(
         "CONFLICTING_RECEIPT_IDENTITY",
@@ -359,6 +418,18 @@ export class QuoteStore {
    * `restoreReceiptRecords` (recovery coherence: a persisted
    * trail entry's evidence must validate the same way). Throws on
    * the first failed requirement; returns nothing on success.
+   *
+   * Round 2 (R3) note: this is the CONTENT validation. The live
+   * transition additionally requires the establishment brand
+   * (checked in `verifyCommitReceipt` before this runs). Recovery
+   * deliberately does NOT require the brand: it is a runtime
+   * property that serialization cannot carry, so a restored
+   * record's trust rests on this content validation plus the
+   * identity-digest binding and whole-set coherence (C2) — a
+   * persisted trail entry whose evidence was self-asserted before
+   * persistence is indistinguishable from an established one
+   * after the fact, which is one more reason the live path must
+   * refuse self-assertion at issuance time.
    */
   private assertEvidenceValid(
     q: StoredQuote,
@@ -458,6 +529,15 @@ export class QuoteStore {
    * the store itself recomputes from the evidence's inputs)
    * before transitioning.
    *
+   * Round 2 (R3) tightens "independently established" from a
+   * content property to an issuance property: C1 validated the
+   * evidence object's CONTENTS, and a caller could construct a
+   * passing object from the receipt's own data (the old test 15.4
+   * did exactly that). Now the evidence must additionally be a
+   * token minted by `establishVerification` — computed FROM an
+   * independent provider observation — and unbranded objects are
+   * refused as self-asserted before content validation runs.
+   *
    * On success the record's CURRENT view advances to
    * status "COMMITTED" / outcome COMMITTED_AND_VERIFIED carrying
    * the evidence's determined reconciliation — OK (verified
@@ -481,6 +561,27 @@ export class QuoteStore {
     const q = this.quotes.get(quoteId);
     if (!q || !q.commit_receipt || !q.commit_receipt_recorded) {
       throw new Error(`Verification refused: no receipt recorded for quote ${quoteId}; nothing to verify.`);
+    }
+    // Round 2 (R3): the evidence must be an ESTABLISHED token —
+    // minted by `establishVerification` from an independent
+    // provider observation and carrying its brand. A
+    // caller-constructed object is self-asserted evidence: round 1
+    // accepted one built from the receipt's own figures, labeled
+    // provider_actual, asserting state VERIFIED — nothing in it
+    // established an independent observation. Unbranded evidence
+    // is refused here, before any content validation, because
+    // content checks alone cannot distinguish an assertion from
+    // an observation. Branded tokens are STILL fully
+    // content-validated below (assertEvidenceValid): the token
+    // object remains caller-held after minting, so altered
+    // contents are refused on recomputation/identity grounds.
+    if (!evidence || !establishedEvidenceTokens.has(evidence)) {
+      throw new Error(
+        `Verification refused: the presented evidence is not an established evidence token. Evidence is ` +
+          `accepted only as minted by establishVerification from an independent provider observation; a ` +
+          `caller-constructed evidence object is self-asserted, and self-asserted evidence cannot verify ` +
+          `the record for quote ${quoteId}.`
+      );
     }
     if (presentedReceipt && receiptIdentityDigest(presentedReceipt) !== q.commit_receipt_identity_digest) {
       throw new SCQError(
@@ -750,7 +851,184 @@ export class QuoteStore {
     }
   }
 
+  /** Defensive copies, like `get` (round 2, R2) — never the internal records. */
   all(): StoredQuote[] {
-    return Array.from(this.quotes.values());
+    return Array.from(this.quotes.values(), (q) => deepCopy(q));
   }
+}
+
+/**
+ * PR #8 review correction, round 2 (R3): the brand on established
+ * evidence tokens. `establishVerification` adds every token it
+ * mints to this module-private WeakSet; `verifyCommitReceipt`
+ * accepts only branded tokens. The set is unforgeable from outside
+ * this module — a caller cannot brand a hand-built object — and
+ * being a WeakSet it neither leaks into serialization nor keeps
+ * tokens alive.
+ */
+const establishedEvidenceTokens = new WeakSet<object>();
+
+const TERMINAL_SUBSCRIPTION_STATES: ReadonlySet<string> = new Set(["cancelled", "canceled", "terminated"]);
+
+/**
+ * Computes the §6.12 post-commit state verification FROM an
+ * observation's resulting snapshot against the proposal's intent —
+ * per change, action-specific (the D3 contract), provider-neutral:
+ *   CHANGE_QUANTITY — the targeted item is present with exactly
+ *     the intended quantity;
+ *   CHANGE_PLAN — the targeted item carries the intended offering;
+ *   CHANGE_CADENCE — the billing cadence matches the intent;
+ *   CANCEL — the subscription reads in a terminal state. For a
+ *     TERM_END / AT_DATE intent the snapshot alone cannot
+ *     establish the scheduled-vs-terminal kind (it carries no
+ *     cancellation schedule — the F3 read-time distinction), so a
+ *     non-terminal read is UNVERIFIABLE there rather than a
+ *     mismatch; for an IMMEDIATE cancel it is a MISMATCH.
+ * A read that does not contain what a check needs (no snapshot,
+ * no items list, an absent quantity/cadence/status member)
+ * computes UNVERIFIABLE for that check — never VERIFIED. Any
+ * established contradiction is a MISMATCH, and a mismatch is a
+ * DETERMINED negative verification: it never collapses into
+ * UNVERIFIABLE (D3).
+ */
+function observedStateVerification(
+  quote: StoredQuote,
+  observation: ProviderObservation
+): "VERIFIED" | "MISMATCH" | "UNVERIFIABLE" {
+  const snapshot = observation.resultingSnapshot;
+  if (!snapshot) return "UNVERIFIABLE";
+  const changes = quote.proposal.changes;
+  if (!Array.isArray(changes) || changes.length === 0) return "UNVERIFIABLE";
+  let sawUnverifiable = false;
+  for (const change of changes) {
+    switch (change.action) {
+      case "CHANGE_QUANTITY": {
+        if (!Array.isArray(snapshot.items)) {
+          sawUnverifiable = true;
+          break;
+        }
+        const item = snapshot.items.find((candidate) => candidate.id === change.itemId);
+        if (!item) return "MISMATCH";
+        if (typeof item.quantity !== "number") {
+          sawUnverifiable = true;
+          break;
+        }
+        if (item.quantity !== change.quantity) return "MISMATCH";
+        break;
+      }
+      case "CHANGE_PLAN": {
+        if (!Array.isArray(snapshot.items)) {
+          sawUnverifiable = true;
+          break;
+        }
+        const item = snapshot.items.find((candidate) => candidate.id === change.itemId);
+        if (!item) return "MISMATCH";
+        if (item.offeringRef !== change.offeringRef) return "MISMATCH";
+        break;
+      }
+      case "CHANGE_CADENCE": {
+        const cadence = snapshot.billing?.cadence;
+        if (typeof cadence !== "string" || cadence.length === 0) {
+          sawUnverifiable = true;
+          break;
+        }
+        if (cadence.toUpperCase() !== change.cadence) return "MISMATCH";
+        break;
+      }
+      case "CANCEL": {
+        const status = snapshot.status;
+        if (typeof status !== "string" || status.length === 0) {
+          sawUnverifiable = true;
+          break;
+        }
+        if (!TERMINAL_SUBSCRIPTION_STATES.has(status.toLowerCase())) {
+          if (quote.proposal.effectiveIntent?.type === "IMMEDIATE") return "MISMATCH";
+          sawUnverifiable = true;
+        }
+        break;
+      }
+      default:
+        sawUnverifiable = true;
+    }
+  }
+  return sawUnverifiable ? "UNVERIFIABLE" : "VERIFIED";
+}
+
+/**
+ * v0.6.2 (PR #8 review correction, round 2 — R3): THE trusted
+ * evidence path — the only way a `VerificationEvidence` token
+ * comes into existence. It takes a quote and an INDEPENDENT
+ * post-commit `ProviderObservation` (see types.ts), and COMPUTES
+ * the evidence from the observation:
+ *
+ *   - association: the observation must name the quote's own
+ *     subscription;
+ *   - provenance: the observation's committed figures must carry
+ *     an establishing committedSource ("provider_actual" /
+ *     "defined_equal_exact") — an observation whose figures are
+ *     a revalidated preview, a pre-mutation estimate, or
+ *     unestablished is refused, as is an observation that IS the
+ *     quote's own quoted effect (the estimate itself, relabeled);
+ *   - state verification: computed by `observedStateVerification`
+ *     from the observation's resulting snapshot against the
+ *     proposal's intent — the caller never asserts it;
+ *   - reconciliation: computed by `reconcileCommittedEffect` from
+ *     the quote, the observation's figures, and the envelope —
+ *     never asserted either.
+ *
+ * The minted token is branded (module-private WeakSet);
+ * `verifyCommitReceipt` refuses unbranded objects and then
+ * re-validates the token's contents against the recorded receipt
+ * (the token object remains caller-held, so its contents are
+ * never trusted merely for carrying the brand).
+ *
+ * WHAT "TRUSTED" MEANS HERE — AND ITS LIMIT, stated plainly: the
+ * brand guarantees the evidence passed through this establishment
+ * computation over a caller-supplied observation, with the
+ * provenance, state, and reconciliation results computed rather
+ * than asserted. It CANNOT prove the observation truly came from
+ * a provider: nothing in this module can distinguish a genuine
+ * provider read from a fabricated observation object with
+ * establishing labels. Binding observations to real provider
+ * reads is the adapters' duty in the PR-3..PR-7 migrations, where
+ * the observation is constructed inside the adapter from its own
+ * provider call and never crosses a caller boundary. Until then
+ * this path removes SELF-ASSERTED evidence (the round-1 defect);
+ * it does not — and does not claim to — authenticate the provider
+ * channel.
+ */
+export function establishVerification(quote: StoredQuote, observation: ProviderObservation): VerificationEvidence {
+  if (!observation || observation.subscriptionRef !== quote.subscription_id) {
+    throw new Error(
+      `Establishment refused: the observation names subscription ${observation?.subscriptionRef}, but quote ` +
+        `${quote.quote_id} is for subscription ${quote.subscription_id}; an observation of one subscription ` +
+        `cannot establish verification for another.`
+    );
+  }
+  if (observation.committedEffect === quote.quoted_effect) {
+    throw new Error(
+      `Establishment refused: the observation's committed figures ARE the quote's own quoted effect — the ` +
+        `estimate itself, relabeled. Verification is established from an independent post-commit provider ` +
+        `read, never from quote-side figures.`
+    );
+  }
+  const source = observation.committedEffect?.provenance?.committedSource;
+  if (source !== "provider_actual" && source !== "defined_equal_exact") {
+    throw new Error(
+      `Establishment refused: the observation's committed figures carry committedSource ` +
+        `${source === undefined ? "(absent — unestablished)" : JSON.stringify(source)}; only "provider_actual" / ` +
+        `"defined_equal_exact" figures establish committed actuals. Revalidated previews and pre-mutation ` +
+        `estimates are quote-side data — the lineage the v0.6.2 migration eliminates — and can never ` +
+        `establish a verification.`
+    );
+  }
+  const token: VerificationEvidence = {
+    committedEffect: deepCopy(observation.committedEffect),
+    committedSource: source,
+    stateVerification: observedStateVerification(quote, observation),
+    reconciliation: reconcileCommittedEffect(quote.quoted_effect, observation.committedEffect, quote.proposal.acceptanceEnvelope),
+    ...(observation.observedAt ? { at: observation.observedAt } : {}),
+  };
+  establishedEvidenceTokens.add(token);
+  return token;
 }

@@ -56,11 +56,19 @@ import type { QuoteStore, StoredQuote } from "../store/quote-store.js";
  * `validateCommit`.
  */
 export function checkIdempotentReplay(store: QuoteStore, quoteId: string): SubscriptionChangeReceipt | undefined {
-  const quote = store.get(quoteId);
-  if (quote && quote.status === "COMMITTED" && quote.commit_receipt) {
-    return quote.commit_receipt;
-  }
-  return undefined;
+  // §6.10: a repeated commit returns the ORIGINAL receipt — the
+  // receipt as recorded at commit time (commit_receipt_recorded),
+  // NOT the mutable current view (commit_receipt). After a
+  // verification transition the current view shows the verified
+  // state, but a replaying caller must receive the receipt it
+  // originally got; the latest verified state is exposed only
+  // through the store's separate current-view reads (store.get()'s
+  // commit_receipt / receiptsWithReconciliation). PR #8 review
+  // correction, round 2 (R1): this previously returned
+  // commit_receipt, so a post-verification replay silently
+  // returned the VERIFIED receipt — changing what §6.10 promises.
+  // The store returns a defensive copy of the recorded snapshot.
+  return store.recordedReceipt(quoteId);
 }
 
 /**
@@ -457,6 +465,7 @@ export type DeterminacyAuditFinding =
   | "WOULD_REFUSE_UNKNOWN"
   | "INVALID_DETERMINED_VALUE"
   | "MISSING_PROVENANCE"
+  | "PROVENANCE_NOT_ESTABLISHING"
   | "UNJUSTIFIED_NOT_APPLICABLE"
   | "MISSING_ACTION_CONTEXT"
   | "MISSING_APPLICABILITY_PROVENANCE";
@@ -510,19 +519,41 @@ function auditOneEffect(
     // verification. A DETERMINED dimension must carry supporting
     // provenance — the dimension's own provenance note
     // (provenance.immediate / provenance.recurring), or, on a
-    // committed effect, an established committedSource (anything
-    // other than "unestablished"). Provenance is reported ONLY for
-    // otherwise-valid determined values (an invalid value reports
-    // INVALID_DETERMINED_VALUE alone), and never for UNKNOWN
-    // dimensions (already WOULD_REFUSE_UNKNOWN) or NOT_APPLICABLE
-    // assertions (whose provenance mechanism is the applicability
-    // citation, checked below).
+    // committed effect, an ESTABLISHING committedSource.
+    // Provenance is reported ONLY for otherwise-valid determined
+    // values (an invalid value reports INVALID_DETERMINED_VALUE
+    // alone), and never for UNKNOWN dimensions (already
+    // WOULD_REFUSE_UNKNOWN) or NOT_APPLICABLE assertions (whose
+    // provenance mechanism is the applicability citation, checked
+    // below).
+    //
+    // Round 2 (R4) — the committedSource rule is ROLE-AWARE.
+    // Asserting a committedSource presents the effect's figures as
+    // committed actuals (committedSource is meaningful only on a
+    // committed effect — see types.ts), and only two sources
+    // ESTABLISH actuals: "provider_actual" and
+    // "defined_equal_exact". An estimate-derived source
+    // ("revalidated_preview" / "pre_mutation_estimate") reports
+    // PROVENANCE_NOT_ESTABLISHING for the dimension: revalidated
+    // and estimate figures must never establish committed actuals,
+    // so presenting them as provenance for committed figures is
+    // itself the finding — distinct from MISSING_PROVENANCE
+    // (nothing offered at all). C4's original rule counted ANY
+    // source other than "unestablished" as provenance, which let
+    // exactly those estimate lineages pass the migration audit.
+    // Quote-side effects assert no committedSource (their figures
+    // are estimates by nature) and keep the note-based treatment.
     const dimensionProvenance =
       dimension === "immediateFinancialEffect" ? effect.provenance?.immediate : effect.provenance?.recurring;
     const committedSource = effect.provenance?.committedSource;
+    if (committedSource === "revalidated_preview" || committedSource === "pre_mutation_estimate") {
+      findings.add("PROVENANCE_NOT_ESTABLISHING");
+      return;
+    }
     const hasProvenance =
       (typeof dimensionProvenance === "string" && dimensionProvenance.length > 0) ||
-      (committedSource !== undefined && committedSource !== "unestablished");
+      committedSource === "provider_actual" ||
+      committedSource === "defined_equal_exact";
     if (!hasProvenance) {
       findings.add("MISSING_PROVENANCE");
     }

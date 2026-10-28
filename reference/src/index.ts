@@ -10,7 +10,7 @@
  * an absolute spending cap or authorization grant.
  */
 export * from "./core/types.js";
-export { QuoteStore } from "./store/quote-store.js";
+export { QuoteStore, establishVerification } from "./store/quote-store.js";
 export { StripeAdapter } from "./adapters/stripe-adapter.js";
 export { StripeSim } from "./adapters/stripe-sim.js";
 export { PaddleAdapter } from "./adapters/paddle-adapter.js";
