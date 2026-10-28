@@ -1,0 +1,59 @@
+name: Protocol freeze guard
+
+# SCQ v0.6.1 is a frozen protocol version under external review (see
+# CONTRIBUTING.md). This check fails any PR that touches normative
+# surface — the spec itself, or the core types/engine that implement it —
+# unless the PR carries the `protocol-change-approved` label. Feedback is
+# meant to be logged as an issue first and discussed before any change to
+# frozen surface is made; this workflow is the mechanical backstop for
+# that policy, not a replacement for the discussion.
+
+on:
+  pull_request:
+    branches: [main]
+    types: [opened, synchronize, reopened, labeled, unlabeled]
+
+jobs:
+  check-frozen-surface:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Check whether this PR touches frozen protocol surface
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+        run: |
+          set -e
+          CHANGED=$(git diff --name-only "$BASE_SHA" "$HEAD_SHA" -- \
+            spec/scq-v0.6.1-spec.md \
+            reference/src/core/types.ts \
+            reference/src/core/scq-engine.ts)
+
+          if [ -z "$CHANGED" ]; then
+            echo "No frozen-surface files changed. OK."
+            exit 0
+          fi
+
+          echo "This PR modifies frozen protocol surface:"
+          echo "$CHANGED"
+
+          HAS_LABEL=$(gh pr view "$PR_NUMBER" \
+            --json labels --jq '[.labels[].name] | index("protocol-change-approved") != null')
+
+          if [ "$HAS_LABEL" = "true" ]; then
+            echo "Labeled protocol-change-approved — proceeding."
+            exit 0
+          fi
+
+          echo ""
+          echo "BLOCKED: this PR changes normative spec/core-engine surface but is not"
+          echo "labeled 'protocol-change-approved'. Per CONTRIBUTING.md, protocol changes"
+          echo "are made deliberately in response to a specific, discussed issue — link"
+          echo "that issue in the PR description, then have a maintainer apply the"
+          echo "'protocol-change-approved' label to unblock this check."
+          exit 1

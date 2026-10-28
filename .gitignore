@@ -1,0 +1,7 @@
+node_modules/
+dist/
+.env
+.env.*
+.cb_env
+*.log
+.DS_Store

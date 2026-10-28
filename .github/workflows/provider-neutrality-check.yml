@@ -1,0 +1,38 @@
+name: Provider-neutrality check
+
+# SCQ's core types must never name a specific billing provider (Stripe,
+# Paddle, Zuora, Chargebee) in an actual type/interface/export declaration
+# — provider-specific concepts belong only in reference/src/adapters/*.
+# Provider names ARE allowed in comments (explaining design rationale), so
+# this check only flags matches on declaration lines, mirroring the manual
+# grep this repo's research process has used since v0.6.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  check-neutrality:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: types.ts must not name a provider in a declaration
+        run: |
+          set -e
+          FILE=reference/src/core/types.ts
+          MATCHES=$(grep -inE "^\s*(export |type |interface )" "$FILE" \
+            | grep -iE "stripe|paddle|zuora|chargebee" || true)
+
+          if [ -n "$MATCHES" ]; then
+            echo "BLOCKED: $FILE names a specific provider in a type/interface/export declaration:"
+            echo "$MATCHES"
+            echo ""
+            echo "Provider-specific concepts belong in reference/src/adapters/*, not in the"
+            echo "provider-neutral core. Provider names in comments (explaining rationale) are fine."
+            exit 1
+          fi
+
+          echo "OK: no provider name found in a declaration in $FILE."

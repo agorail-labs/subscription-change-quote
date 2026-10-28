@@ -1,0 +1,35 @@
+{
+  "name": "@arjun2075/scq-reference",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Experimental simulator-backed SCQ v0.6.1 subscription change contract and reference adapters; not a production billing SDK",
+  "type": "module",
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "test": "tsc -p tsconfig.json && node --test dist/tests/*.test.js",
+    "demo": "npm run build && node dist/demo/seat-expansion.js",
+    "demo:commit": "npm run build && node dist/demo/seat-expansion.js --simulate-approved-commit",
+    "smoke:pack": "npm run build && node scripts/smoke-pack.mjs"
+  },
+  "devDependencies": {
+    "typescript": "^5.5.4",
+    "@types/node": "^20.14.0"
+  },
+  "license": "Apache-2.0",
+  "engines": {
+    "node": ">=20"
+  },
+  "main": "./dist/src/index.js",
+  "types": "./dist/src/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/src/index.d.ts",
+      "import": "./dist/src/index.js"
+    }
+  },
+  "files": [
+    "dist/src/",
+    "README.md",
+    "LICENSE"
+  ]
+}

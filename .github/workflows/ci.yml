@@ -1,0 +1,43 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  build-and-test:
+    name: Build & test (Node ${{ matrix.node }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        node: [20, 22]
+    defaults:
+      run:
+        working-directory: reference
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ matrix.node }}
+          cache: npm
+          cache-dependency-path: reference/package-lock.json
+
+      - name: Install
+        run: npm ci
+
+      - name: Build + run full test suite (66 tests)
+        run: npm test
+
+      - name: Run quote-only simulator demo
+        run: npm run demo
+
+      - name: Run explicitly approved simulated-commit demo
+        run: npm run demo:commit
+
+
+      - name: Pack tarball and validate outside-package consumer
+        run: npm run smoke:pack
