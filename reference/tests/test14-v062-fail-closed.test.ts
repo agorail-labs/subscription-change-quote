@@ -14,9 +14,11 @@ import {
   type CommercialEffect,
   type MutationOutcome,
   type SubscriptionChangeReceipt,
+  type VerificationEvidence,
 } from "../src/core/types.js";
 import {
   QuoteStore,
+  establishVerification,
   receiptIdentityDigest,
   type StoredQuote,
 } from "../src/store/quote-store.js";
@@ -111,20 +113,34 @@ function makeUnverifiedReceipt(overrides: Partial<SubscriptionChangeReceipt> = {
 const isConflict = (e: unknown): boolean => e instanceof SCQError && e.code === "CONFLICTING_RECEIPT_IDENTITY";
 
 /**
- * PR #8 corrections: well-formed C1 VerificationEvidence for the
- * standard unverified receipt (recorded actuals 1000/5000,
- * independently sourced, state VERIFIED, honestly computed OK).
+ * PR #8 corrections, round 2 (R3; disclosed helper rewrite):
+ * evidence for the standard fixtures is MINTED by
+ * establishVerification from an independent observation — the
+ * simulated post-commit provider read (item_1 at quantity 2,
+ * provider-actual figures 1000/5000). Round 1's helper constructed
+ * the evidence object from the receipt under test and asserted
+ * its state/reconciliation; that construction is the
+ * self-assertion R3 closes, so the helper now goes through the
+ * establishment procedure, which computes both.
  */
-function makeEvidence(receipt: SubscriptionChangeReceipt): unknown {
-  return {
+function mintEvidenceFor(store: QuoteStore): VerificationEvidence {
+  return establishVerification(store.get("q1")!, {
+    subscriptionRef: "sub_1",
+    source: "test fixture: simulated post-commit provider read",
+    observedAt: "2026-10-28T00:06:00.000Z",
     committedEffect: {
-      ...JSON.parse(JSON.stringify(receipt.committedEffect)),
+      immediate: { net: 1000 },
+      recurring: { resultingAmount: 5000, currency: "usd" },
       provenance: { committedSource: "provider_actual" },
     },
-    committedSource: "provider_actual",
-    stateVerification: "VERIFIED",
-    reconciliation: { status: "OK" },
-  };
+    resultingSnapshot: {
+      id: "sub_1",
+      version: "v2",
+      status: "active",
+      items: [{ id: "item_1", offeringRef: "plan", quantity: 2 }],
+      billing: { currency: "usd" },
+    },
+  });
 }
 
 // ---------------------------------------------------------------------------
@@ -441,9 +457,11 @@ test("Test 14.18 (F4): verify transitions COMMITTED_UNVERIFIED exactly once, app
   store.recordCommitReceipt("q1", original);
   const digestBefore = store.get("q1")!.commit_receipt_identity_digest;
 
-  // PR #8 correction C1 (disclosed call update): the transition
-  // takes VerificationEvidence, not a bare verdict.
-  const verified = store.verifyCommitReceipt("q1", makeEvidence(original) as never, makeUnverifiedReceipt());
+  // PR #8 correction C1, round 2 R3 (disclosed call update): the
+  // transition takes VerificationEvidence minted by
+  // establishVerification from an independent observation — not a
+  // bare verdict (C1) and not a caller-constructed object (R3).
+  const verified = store.verifyCommitReceipt("q1", mintEvidenceFor(store), makeUnverifiedReceipt());
   assert.equal(verified.status, "COMMITTED");
   assert.equal(verified.outcome, "COMMITTED_AND_VERIFIED");
   assert.equal(verified.reconciliation.status, "OK");
@@ -452,7 +470,7 @@ test("Test 14.18 (F4): verify transitions COMMITTED_UNVERIFIED exactly once, app
   assert.equal(q.commit_receipt_identity_digest, digestBefore, "digest is computed over the recorded fields and is stable across the transition");
   assert.equal(q.commit_receipt_recorded?.status, "COMMITTED_UNVERIFIED", "the recorded original is preserved");
   assert.equal(q.commit_receipt_verifications?.length, 1);
-  assert.throws(() => store.verifyCommitReceipt("q1", makeEvidence(original) as never), /only a COMMITTED_UNVERIFIED record can transition/);
+  assert.throws(() => store.verifyCommitReceipt("q1", mintEvidenceFor(store)), /only a COMMITTED_UNVERIFIED record can transition/);
   assert.equal(store.get("q1")!.commit_receipt_verifications?.length, 1, "exactly one transition");
 });
 
@@ -464,7 +482,7 @@ test("Test 14.19 (F4): a verification presented under a conflicting identity tra
     committedEffect: { immediate: { net: 4242 }, recurring: { resultingAmount: 5000, currency: "usd" } },
   });
   assert.throws(
-    () => store.verifyCommitReceipt("q1", makeEvidence(store.get("q1")!.commit_receipt!) as never, foreign),
+    () => store.verifyCommitReceipt("q1", mintEvidenceFor(store), foreign),
     isConflict
   );
   assert.equal(store.get("q1")!.commit_receipt?.reconciliation.status, "UNVERIFIED");
@@ -476,24 +494,23 @@ test("Test 14.20 (F4): a verification must carry a determined reconciliation; a 
   store.put(makeQuote("q1"));
   const unverified = makeUnverifiedReceipt();
   store.recordCommitReceipt("q1", unverified);
-  assert.throws(
-    () =>
-      store.verifyCommitReceipt("q1", {
-        ...(makeEvidence(unverified) as Record<string, unknown>),
-        reconciliation: {
-          status: "UNVERIFIED",
-          reason: "still unknown",
-          undeterminedDimensions: ["immediateFinancialEffect"],
-        },
-      } as never),
-    /determined reconciliation/
-  );
+  // Round 2 (R3): mint a genuine token, then replace its computed
+  // reconciliation with an UNVERIFIED one — the transition must
+  // still refuse: a verification that establishes nothing (no
+  // determined reconciliation) transitions nothing.
+  const undetermined = mintEvidenceFor(store);
+  undetermined.reconciliation = {
+    status: "UNVERIFIED",
+    reason: "still unknown",
+    undeterminedDimensions: ["immediateFinancialEffect"],
+  };
+  assert.throws(() => store.verifyCommitReceipt("q1", undetermined), /determined reconciliation/);
 
   const store2 = new QuoteStore();
   store2.put(makeQuote("q1"));
   const verifiedReceipt = makeReceipt();
   store2.recordCommitReceipt("q1", verifiedReceipt);
-  assert.throws(() => store2.verifyCommitReceipt("q1", makeEvidence(verifiedReceipt) as never), /only a COMMITTED_UNVERIFIED/);
+  assert.throws(() => store2.verifyCommitReceipt("q1", mintEvidenceFor(store2)), /only a COMMITTED_UNVERIFIED/);
 });
 
 test("Test 14.21 (CORE-8): commit outcomes are recorded for no-receipt classes too, and UNVERIFIED receipts are enumerable", () => {

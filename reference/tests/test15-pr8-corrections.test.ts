@@ -4,10 +4,13 @@ import { auditDeterminacy } from "../src/core/scq-engine.js";
 import {
   SCQError,
   type CommercialEffect,
+  type ProviderObservation,
   type SubscriptionChangeReceipt,
+  type VerificationEvidence,
 } from "../src/core/types.js";
 import {
   QuoteStore,
+  establishVerification,
   receiptIdentityDigest,
   type StoredQuote,
 } from "../src/store/quote-store.js";
@@ -29,6 +32,19 @@ import {
 //   C4 — auditDeterminacy reports MISSING_PROVENANCE for DETERMINED
 //        dimensions with no supporting provenance (a finite number
 //        alone is not verification).
+//
+// ROUND 2 addendum (R1/R3 — see test16 for the dedicated
+// regressions): the C1 success-path tests below no longer construct
+// evidence objects by hand. Round 1's makeEvidence built the
+// evidence FROM the stored receipt's own figures and asserted the
+// state and reconciliation — exactly the self-assertion R3 closes.
+// Evidence is now minted by establishVerification from INDEPENDENT
+// observation fixtures (literal provider-side state), and the
+// procedure computes the state verification and reconciliation.
+// Test 15.15's central assertion is FLIPPED: round 1 asserted that
+// a post-verification replay returns the current verified record;
+// §6.10 requires the ORIGINAL recorded receipt (R1), and 15.15 now
+// asserts that.
 
 // ---------------------------------------------------------------------------
 // helpers
@@ -97,22 +113,44 @@ function makeUnverifiedReceipt(overrides: Partial<SubscriptionChangeReceipt> = {
 }
 
 /**
- * Well-formed C1 evidence for the standard unverified receipt:
- * the committed figures are the receipt's recorded actuals,
- * independently sourced, state verified, reconciliation honestly
- * computed (quoted 1000/5000 vs committed 1000/5000 → OK).
+ * An INDEPENDENT post-commit observation for the standard
+ * fixtures: literal provider-side state (item_1 at quantity 2 —
+ * the proposal's intent — provider-actual figures), NOT derived
+ * from any receipt object. Round 2 (R3): evidence exists only as
+ * minted from such an observation by `establishVerification`,
+ * which computes the state verification and the reconciliation.
  */
-function makeEvidence(receipt: SubscriptionChangeReceipt, overrides: Record<string, unknown> = {}): unknown {
+function observationFor(
+  figures: { immediate: number; recurring: number },
+  overrides: Partial<ProviderObservation> = {}
+): ProviderObservation {
   return {
+    subscriptionRef: "sub_1",
+    source: "test fixture: simulated post-commit provider read",
+    observedAt: "2026-10-28T00:06:00.000Z",
     committedEffect: {
-      ...JSON.parse(JSON.stringify(receipt.committedEffect)),
+      immediate: { net: figures.immediate },
+      recurring: { resultingAmount: figures.recurring, currency: "usd" },
       provenance: { committedSource: "provider_actual" },
     },
-    committedSource: "provider_actual",
-    stateVerification: "VERIFIED",
-    reconciliation: { status: "OK" },
+    resultingSnapshot: {
+      id: "sub_1",
+      version: "v2",
+      status: "active",
+      items: [{ id: "item_1", offeringRef: "plan", quantity: 2 }],
+      billing: { currency: "usd" },
+    },
     ...overrides,
   };
+}
+
+/** Mints established evidence for q1 from an independent observation. */
+function mintEvidence(
+  store: QuoteStore,
+  figures: { immediate: number; recurring: number } = { immediate: 1000, recurring: 5000 },
+  overrides: Partial<ProviderObservation> = {}
+): VerificationEvidence {
+  return establishVerification(store.get("q1")!, observationFor(figures, overrides));
 }
 
 const isConflict = (e: unknown): boolean => e instanceof SCQError && e.code === "CONFLICTING_RECEIPT_IDENTITY";
@@ -138,45 +176,70 @@ test("Test 15.1 (C1): a bare caller-supplied verdict cannot promote COMMITTED_UN
   assert.equal(q.commit_receipt_verifications?.length ?? 0, 0);
 });
 
-test("Test 15.2 (C1): evidence with estimate-derived or quote-shared provenance is refused", () => {
+test("Test 15.2 (C1, round 2 R3): estimate-derived or unestablished figures cannot establish evidence — and hand-built evidence objects are refused as self-asserted", () => {
   for (const source of ["pre_mutation_estimate", "revalidated_preview", "unestablished"]) {
     const store = new QuoteStore();
     store.put(makeQuote("q1"));
     const receipt = makeUnverifiedReceipt();
     store.recordCommitReceipt("q1", receipt);
+    // The observation route: establishment itself refuses the
+    // lineage — such figures never become evidence at all.
+    const observation = observationFor(
+      { immediate: 1000, recurring: 5000 },
+      {
+        committedEffect: {
+          immediate: { net: 1000 },
+          recurring: { resultingAmount: 5000, currency: "usd" },
+          provenance: { committedSource: source as never },
+        },
+      }
+    );
+    assert.throws(() => establishVerification(store.get("q1")!, observation), /Establishment refused/, `committedSource=${source} must not establish`);
+    // The direct route (round 1's shape): a hand-built object
+    // asserting the source is self-asserted and refused unbranded.
     assert.throws(
-      () => store.verifyCommitReceipt("q1", makeEvidence(receipt, { committedSource: source }) as never),
-      /provenance|source/i,
+      () =>
+        store.verifyCommitReceipt(
+          "q1",
+          {
+            committedEffect: {
+              ...JSON.parse(JSON.stringify(receipt.committedEffect)),
+              provenance: { committedSource: source },
+            },
+            committedSource: source,
+            stateVerification: "VERIFIED",
+            reconciliation: { status: "OK" },
+          } as never
+        ),
+      /established|self-asserted/i,
       `committedSource=${source} must be refused`
     );
     assert.equal(store.get("q1")!.commit_receipt?.outcome, "COMMITTED_UNVERIFIED");
   }
 });
 
-test("Test 15.3 (C1): evidence whose figures contradict the stored record is refused", () => {
+test("Test 15.3 (C1): established evidence whose figures contradict the stored record is refused", () => {
   const store = new QuoteStore();
   store.put(makeQuote("q1"));
   const receipt = makeUnverifiedReceipt();
   store.recordCommitReceipt("q1", receipt);
-  const contradicting = makeEvidence(receipt, {
-    committedEffect: {
-      immediate: { net: 2000 },
-      recurring: { resultingAmount: 5000, currency: "usd" },
-      provenance: { committedSource: "provider_actual" },
-    },
-  });
-  assert.throws(() => store.verifyCommitReceipt("q1", contradicting as never), isConflict);
+  // The observation is genuine establishment material — but for
+  // figures (2000) that are NOT this record's recorded actuals
+  // (1000). Establishment mints it; the identity binding refuses
+  // the transition.
+  const contradicting = mintEvidence(store, { immediate: 2000, recurring: 5000 });
+  assert.throws(() => store.verifyCommitReceipt("q1", contradicting), isConflict);
   assert.equal(store.get("q1")!.commit_receipt?.outcome, "COMMITTED_UNVERIFIED");
 });
 
-test("Test 15.4 (C1): well-formed independent evidence transitions exactly once; the recorded identity never moves", () => {
+test("Test 15.4 (C1, round 2 R3): evidence established from an independent observation transitions exactly once; the recorded identity never moves", () => {
   const store = new QuoteStore();
   store.put(makeQuote("q1"));
   const receipt = makeUnverifiedReceipt();
   store.recordCommitReceipt("q1", receipt);
   const digestBefore = store.get("q1")!.commit_receipt_identity_digest;
 
-  const verified = store.verifyCommitReceipt("q1", makeEvidence(receipt) as never, makeUnverifiedReceipt());
+  const verified = store.verifyCommitReceipt("q1", mintEvidence(store), makeUnverifiedReceipt());
   assert.equal(verified.status, "COMMITTED");
   assert.equal(verified.outcome, "COMMITTED_AND_VERIFIED");
   assert.equal(verified.reconciliation.status, "OK");
@@ -185,55 +248,69 @@ test("Test 15.4 (C1): well-formed independent evidence transitions exactly once;
   assert.equal(q.commit_receipt_identity_digest, digestBefore);
   assert.equal(q.commit_receipt_recorded?.status, "COMMITTED_UNVERIFIED", "recorded original preserved");
   assert.equal(q.commit_receipt_verifications?.length, 1);
-  assert.throws(() => store.verifyCommitReceipt("q1", makeEvidence(receipt) as never), /only.*COMMITTED_UNVERIFIED|exactly once|already/i);
+  assert.throws(() => store.verifyCommitReceipt("q1", mintEvidence(store)), /only.*COMMITTED_UNVERIFIED|exactly once|already/i);
   assert.equal(store.get("q1")!.commit_receipt_verifications?.length, 1);
 });
 
-test("Test 15.5 (C1): VIOLATED-outcome evidence transitions to verified-with-violation — never to OK", () => {
+test("Test 15.5 (C1): an observation whose computed reconciliation is VIOLATED transitions to verified-with-violation — never to OK", () => {
   const store = new QuoteStore();
-  // Zero-tolerance envelope: committed actuals (1500) honestly
-  // exceed the quote (1000) — the reconciliation IS violated, and
-  // that established fact is what the evidence carries.
+  // Zero-tolerance envelope: the observed actuals (1500) honestly
+  // exceed the quote (1000) — establishment COMPUTES the violated
+  // reconciliation from the observation, and that established fact
+  // is what transitions the record.
   store.put(makeQuote("q1", "sub_1", { acceptanceEnvelope: {} }));
   const receipt = makeUnverifiedReceipt({
     committedEffect: { immediate: { net: 1500 }, recurring: { resultingAmount: 5000, currency: "usd" } },
   });
   store.recordCommitReceipt("q1", receipt);
-  const evidence = makeEvidence(receipt, {
-    reconciliation: { status: "VIOLATED", reason: "committed immediate exceeds the zero-tolerance envelope" },
-  });
-  const verified = store.verifyCommitReceipt("q1", evidence as never);
+  const evidence = mintEvidence(store, { immediate: 1500, recurring: 5000 });
+  assert.equal(evidence.reconciliation.status, "VIOLATED", "the violation is computed at establishment, not asserted");
+  const verified = store.verifyCommitReceipt("q1", evidence);
   assert.equal(verified.reconciliation.status, "VIOLATED", "verified-with-violation, distinguishable from OK");
   assert.equal(verified.outcome, "COMMITTED_AND_VERIFIED", "the figures ARE established — verified means measured, not within-envelope");
   assert.equal(verified.status, "COMMITTED");
 });
 
-test("Test 15.6 (C1): evidence without an established state verification is refused (MISMATCH / UNVERIFIABLE)", () => {
-  for (const sv of ["MISMATCH", "UNVERIFIABLE"]) {
+test("Test 15.6 (C1, round 2 R3): evidence whose computed state verification is not VERIFIED is refused (MISMATCH / UNVERIFIABLE)", () => {
+  const cases: Array<{ state: string; overrides: Partial<ProviderObservation> }> = [
+    {
+      state: "MISMATCH",
+      overrides: {
+        resultingSnapshot: {
+          id: "sub_1",
+          version: "v2",
+          status: "active",
+          items: [{ id: "item_1", offeringRef: "plan", quantity: 99 }],
+          billing: { currency: "usd" },
+        },
+      },
+    },
+    { state: "UNVERIFIABLE", overrides: { resultingSnapshot: undefined } },
+  ];
+  for (const { state, overrides } of cases) {
     const store = new QuoteStore();
     store.put(makeQuote("q1"));
     const receipt = makeUnverifiedReceipt();
     store.recordCommitReceipt("q1", receipt);
-    assert.throws(
-      () => store.verifyCommitReceipt("q1", makeEvidence(receipt, { stateVerification: sv }) as never),
-      /state/i
-    );
+    const evidence = mintEvidence(store, { immediate: 1000, recurring: 5000 }, overrides);
+    assert.equal(evidence.stateVerification, state, "the state result is computed from the observation");
+    assert.throws(() => store.verifyCommitReceipt("q1", evidence), /state/i);
     assert.equal(store.get("q1")!.commit_receipt?.outcome, "COMMITTED_UNVERIFIED");
   }
 });
 
-test("Test 15.7 (C1): a caller's reconciliation that contradicts the store's recomputation from the evidence is refused", () => {
+test("Test 15.7 (C1, round 2 R3): an established token whose reconciliation is altered after minting contradicts the store's recomputation and is refused", () => {
   const store = new QuoteStore();
-  store.put(makeQuote("q1", "sub_1", { acceptanceEnvelope: {} }));
+  store.put(makeQuote("q1"));
   const receipt = makeUnverifiedReceipt();
   store.recordCommitReceipt("q1", receipt);
-  // Figures match the record and recompute to OK under the
-  // envelope, but the caller claims VIOLATED — internally
-  // inconsistent evidence must not transition anything.
-  const inconsistent = makeEvidence(receipt, {
-    reconciliation: { status: "VIOLATED", reason: "caller assertion" },
-  });
-  assert.throws(() => store.verifyCommitReceipt("q1", inconsistent as never), /inconsistent|recomput/i);
+  // Mint a genuine token (its computed reconciliation is OK),
+  // then alter the caller-held token to claim VIOLATED. The brand
+  // proves issuance, not content integrity — the store's
+  // recomputation at the transition refuses the altered content.
+  const inconsistent = mintEvidence(store);
+  inconsistent.reconciliation = { status: "VIOLATED", reason: "caller assertion" };
+  assert.throws(() => store.verifyCommitReceipt("q1", inconsistent), /inconsistent|recomput/i);
   assert.equal(store.get("q1")!.commit_receipt?.outcome, "COMMITTED_UNVERIFIED");
 });
 
@@ -246,7 +323,7 @@ function verifiedStore(): { store: QuoteStore; persisted: string } {
   store.put(makeQuote("q1"));
   const receipt = makeUnverifiedReceipt();
   store.recordCommitReceipt("q1", receipt);
-  store.verifyCommitReceipt("q1", makeEvidence(receipt) as never);
+  store.verifyCommitReceipt("q1", mintEvidence(store));
   return { store, persisted: store.serializeReceiptRecords() };
 }
 
@@ -355,16 +432,26 @@ test("Test 15.14 (C3): stored receipt data is protected from caller mutation —
   assert.equal(store.recordCommitReceipt("q1", makeUnverifiedReceipt())?.committedEffect.immediate?.net, 1000);
 });
 
-test("Test 15.15 (C3): original-payload replay AFTER verification returns the current verified record — not a conflict, not a duplicate", () => {
+test("Test 15.15 (C3, CORRECTED round 2 R1): original-payload replay AFTER verification returns the ORIGINAL recorded receipt (§6.10) — not a conflict, not a duplicate; the verified state is the separate current-view read", () => {
+  // ROUND-2 CORRECTION, flagged per the review: this test
+  // previously asserted that replay returns the CURRENT VERIFIED
+  // record. That assertion encoded the R1 defect — §6.10 requires
+  // a repeated commit to return the ORIGINAL receipt. The test now
+  // asserts the original; the current view is checked separately.
   const store = new QuoteStore();
   store.put(makeQuote("q1"));
   const receipt = makeUnverifiedReceipt();
   store.recordCommitReceipt("q1", receipt);
-  store.verifyCommitReceipt("q1", makeEvidence(receipt) as never);
+  store.verifyCommitReceipt("q1", mintEvidence(store));
 
   const replayed = store.recordCommitReceipt("q1", makeUnverifiedReceipt());
-  assert.equal(replayed?.outcome, "COMMITTED_AND_VERIFIED", "replay of the original identity returns the current (verified) record");
-  assert.equal(replayed?.reconciliation.status, "OK");
+  assert.equal(replayed?.status, "COMMITTED_UNVERIFIED", "replay returns the receipt as originally recorded");
+  assert.equal(replayed?.outcome, "COMMITTED_UNVERIFIED");
+  assert.equal(replayed?.reconciliation.status, "UNVERIFIED");
+  assert.deepEqual(replayed, store.get("q1")!.commit_receipt_recorded);
+  const current = store.get("q1")!.commit_receipt;
+  assert.equal(current?.outcome, "COMMITTED_AND_VERIFIED", "the verified state is exposed through the current-view read");
+  assert.equal(current?.reconciliation.status, "OK");
   assert.equal(store.get("q1")!.commit_receipt_verifications?.length, 1, "replay does not create a second record or transition");
 });
 
