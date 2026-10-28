@@ -5,3 +5,7 @@ dist/
 .cb_env
 *.log
 .DS_Store
+
+# SCQ Chargebee live validation: sanitized evidence fixtures stay local
+research/chargebee-live-v1/evidence/*
+!research/chargebee-live-v1/evidence/README.md
