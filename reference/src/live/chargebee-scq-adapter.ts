@@ -306,6 +306,20 @@ function itemRecurringContribution(
  *     (an empty array is a provider-stated zero); in both cases minus
  *     credit_note_estimates[].total (member must be present for the net
  *     to be final). Absent sources => immediate ABSENT, never zero.
+ *     Member ELEMENTS are held to the same standard: an unbilled-charge
+ *     element without a numeric `amount`, or a credit-note element
+ *     without a numeric `total`, makes the dimension ABSENT rather
+ *     than silently counting that element as 0.
+ *     SEMANTICS of the resulting figure (what SCQ `immediate` means
+ *     for this adapter): the net obligation the change itself incurs
+ *     at effect time. Sourced from unbilled_charge_estimates, it is a
+ *     newly incurred UNBILLED obligation — under this adapter's commit
+ *     parameters (invoice_immediately=false) it is NOT invoiced at
+ *     commit, NOT a payment due at commit, and NOT cash collected; it
+ *     is invoiced at the next billing cycle. Sourced from
+ *     invoice_estimate.total, it is the provider's estimate of the
+ *     total of the invoice that WOULD be issued for the change — an
+ *     estimated invoice total, still not a payment or a collection.
  *   - recurring: subscription_estimate.subscription_items amounts when
  *     the provider states them; else a per-item computation in which
  *     every item's contribution must be justified (see
@@ -332,31 +346,44 @@ export function interpretChargebeeEstimate(
   const creditNotes = estimate?.credit_note_estimates as Array<{ total?: number }> | undefined;
   let base: number | undefined;
   let baseSource = "";
+  let baseBlocked = "";
   if (inv && typeof inv.total === "number") { base = inv.total; baseSource = "invoice_estimate.total"; }
-  else if (Array.isArray(unbilled)) { base = unbilled.reduce((s, u) => s + (u.amount ?? 0), 0); baseSource = "sum(unbilled_charge_estimates[].amount)"; }
+  else if (Array.isArray(unbilled)) {
+    // Strict member-element rule: an element without a numeric amount
+    // is NOT a zero — it makes the sum undeterminable (absent).
+    if (unbilled.every((u) => typeof u.amount === "number")) {
+      base = unbilled.reduce((s, u) => s + (u.amount as number), 0);
+      baseSource = "sum(unbilled_charge_estimates[].amount)";
+    } else {
+      baseBlocked = "an unbilled_charge_estimates element lacks a numeric amount — the sum cannot be determined (an element is never counted as 0)";
+    }
+  }
   if (base !== undefined) {
-    if (Array.isArray(creditNotes)) {
-      const credits = creditNotes.reduce((s, c) => s + (c.total ?? 0), 0);
+    if (!Array.isArray(creditNotes)) {
+      provenance.immediate = `absent: ${baseSource} present but credit_note_estimates member absent — net cannot be finalized`;
+    } else if (!creditNotes.every((c) => typeof c.total === "number")) {
+      provenance.immediate = "absent: a credit_note_estimates element lacks a numeric total — the net cannot be finalized (an element is never counted as 0)";
+    } else {
+      const credits = creditNotes.reduce((s, c) => s + (c.total as number), 0);
       const net = base - credits;
       effect.immediate = { charge: net > 0 ? net : undefined, credit: net < 0 ? -net : undefined, net };
       provenance.immediate = `${baseSource} − sum(credit_note_estimates[].total)`;
-    } else {
-      provenance.immediate = `absent: ${baseSource} present but credit_note_estimates member absent — net cannot be finalized`;
     }
   } else {
-    provenance.immediate = "absent: neither invoice_estimate nor unbilled_charge_estimates present in the estimate";
+    provenance.immediate = `absent: ${baseBlocked || "neither invoice_estimate nor unbilled_charge_estimates present in the estimate"}`;
   }
 
   // --- recurring ---
   const subEstItems = estimate?.subscription_estimate?.subscription_items as Array<{ item_price_id: string; quantity: number; unit_price?: number; amount?: number }> | undefined;
   let resulting: number | undefined;
-  if (Array.isArray(subEstItems) && subEstItems.length > 0) {
-    if (subEstItems.every((i) => typeof i.amount === "number" || typeof i.unit_price === "number")) {
-      resulting = subEstItems.reduce((s, i) => s + (i.amount ?? (i.unit_price ?? 0) * i.quantity), 0);
-      provenance.recurring = "subscription_estimate.subscription_items[].amount (provider-stated)";
-    } else {
-      provenance.recurring = "absent: subscription_estimate.subscription_items present but an item lacks amount and unit_price";
-    }
+  if (Array.isArray(subEstItems) && subEstItems.length > 0 && subEstItems.every((i) => typeof i.amount === "number")) {
+    // Provider-stated path: EVERY item carries its own stated amount.
+    // An item with only a unit_price is NOT summed as unit_price ×
+    // quantity here — that multiplication is justified only per
+    // pricing model (a flat_fee item would be overstated), so such a
+    // payload falls through to the per-item computation below.
+    resulting = subEstItems.reduce((s, i) => s + (i.amount as number), 0);
+    provenance.recurring = "subscription_estimate.subscription_items[].amount (provider-stated)";
   } else {
     const currentById = new Map(ctx.currentItems.map((i) => [i.itemPriceId, i]));
     let sum = 0;
@@ -370,7 +397,7 @@ export function interpretChargebeeEstimate(
       resulting = sum;
       provenance.recurring = "computed per item: unchanged items at provider-stated amount; flat_fee at fixed price (quantity never multiplied); per_unit at (quantity − free_quantity) × unit price — all terms from the subscription payload and item-price metadata";
     } else {
-      provenance.recurring = "absent: subscription_estimate carries no subscription_items and at least one target item's contribution cannot be justified from its pricing model/terms";
+      provenance.recurring = "absent: no fully provider-stated subscription_estimate item amounts, and at least one target item's contribution cannot be justified from its pricing model/terms";
     }
   }
   const previous = ctx.currentItems.every((i) => typeof i.amount === "number")
@@ -685,12 +712,27 @@ export class ChargebeeLiveAdapter implements SubscriptionProvider {
 
   private committedEffectFromState(quoted: CommercialEffect, after: CbSubscription, fallback: CommercialEffect, updateJson?: any): CommercialEffect {
     const items = after.subscription_items ?? [];
-    const recurringAmount = items.reduce((s, i) => s + (i.amount ?? (i.unit_price ?? 0) * i.quantity), 0);
+    // Recurring from provider-stated item amounts ONLY. An item without
+    // a stated amount is never reconstructed as unit_price × quantity
+    // (unjustified for flat_fee and unproven in general): the dimension
+    // is then left absent rather than fabricated. (The frozen snapshot/
+    // effect types force a number in some sibling paths — see the
+    // protocol-defect proposal — but this reconciliation input does
+    // not have to invent one.)
+    const recurringAmount = items.every((i) => typeof i.amount === "number")
+      ? items.reduce((s, i) => s + (i.amount as number), 0)
+      : undefined;
     const invoiceTotal = updateJson?.invoice?.total;
-    const unbilledTotal = (updateJson?.unbilled_charges as Array<{ amount?: number }> | undefined)?.reduce((s, u) => s + (u.amount ?? 0), 0);
-    const net = typeof invoiceTotal === "number" ? invoiceTotal : typeof unbilledTotal === "number" && unbilledTotal !== 0 ? unbilledTotal : fallback.immediate?.net;
+    const unbilledMember = updateJson?.unbilled_charges as Array<{ amount?: number }> | undefined;
+    // A present unbilled_charges member states the committed unbilled
+    // total — including a genuine 0 (empty array). An element without a
+    // numeric amount makes the member unusable, never a 0.
+    const unbilledTotal = Array.isArray(unbilledMember) && unbilledMember.every((u) => typeof u.amount === "number")
+      ? unbilledMember.reduce((s, u) => s + (u.amount as number), 0)
+      : undefined;
+    const net = typeof invoiceTotal === "number" ? invoiceTotal : unbilledTotal !== undefined ? unbilledTotal : fallback.immediate?.net;
     const effect: CommercialEffect = {
-      recurring: { resultingAmount: recurringAmount, currency: after.currency_code ?? quoted.recurring?.currency ?? "USD", ...(quoted.recurring?.previousAmount !== undefined ? { previousAmount: quoted.recurring.previousAmount } : {}) },
+      recurring: { ...(recurringAmount !== undefined ? { resultingAmount: recurringAmount } : {}), currency: after.currency_code ?? quoted.recurring?.currency ?? "USD", ...(quoted.recurring?.previousAmount !== undefined ? { previousAmount: quoted.recurring.previousAmount } : {}) },
       effectiveAt: quoted.effectiveAt,
     };
     if (net !== undefined && net !== 0) effect.immediate = { charge: net > 0 ? net : undefined, credit: net < 0 ? -net : undefined, net };

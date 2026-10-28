@@ -22,6 +22,13 @@
  *   - It does NOT commit. Commit requires SCQ_LIVE_COMMIT_ENABLED=true
  *     AND a separate explicit approval for the exact operation (see
  *     research/chargebee-live-v1/TEST-RESULTS.md §"Approval needed").
+ *   - Reading a printed quote: `commercialEffect.immediate` for this
+ *     adapter is the net obligation the change incurs at effect time.
+ *     When it is sourced from unbilled_charge_estimates (the usual
+ *     case here) it is a newly incurred UNBILLED obligation — not an
+ *     issued invoice, not a payment due now, not cash collected; this
+ *     adapter commits with invoice_immediately=false, so such charges
+ *     are invoiced at the next billing cycle.
  *
  * No credentials, authorization headers, or provider payloads are printed.
  */
