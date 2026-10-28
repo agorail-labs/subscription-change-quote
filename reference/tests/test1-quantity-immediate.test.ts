@@ -46,7 +46,19 @@ test("Test 1 (Stripe, REVALIDATE): 100->120 seats immediate — quote doesn't mu
   assert.equal(receipt.guaranteeMode, "REVALIDATE");
   assert.equal(receipt.consistencyGuarantee, "BEST_EFFORT", "Stripe must never claim ATOMIC");
   assert.equal(receipt.resultingSnapshot.items[0].quantity, 120, "commit must mutate subscription");
-  assert.deepEqual(receipt.committedEffect, receipt.quotedEffect, "with zero elapsed time, REVALIDATE's re-derived figure matches the quote");
+  // PR-3 DISCLOSED EXPECTATION CHANGE (v0.6.2 Stripe migration):
+  // this previously asserted whole-effect deepEqual(committedEffect,
+  // quotedEffect). Under CORE-2 a committed effect must record what
+  // its figures ARE (provenance.committedSource): here they are
+  // post-commit actuals read back after the mutation, NOT the
+  // quote's estimates — so whole-object equality with the quote is
+  // no longer the contract, and asserting it would erase exactly
+  // the lineage distinction the migration exists to create. What
+  // still coincides exactly — the point this test makes — is the
+  // FIGURES: assert those, plus the committed provenance.
+  assert.deepEqual(receipt.committedEffect.immediate, receipt.quotedEffect.immediate, "with zero elapsed time, the committed incurred figure matches the quote");
+  assert.deepEqual(receipt.committedEffect.recurring, receipt.quotedEffect.recurring);
+  assert.equal(receipt.committedEffect.provenance?.committedSource, "provider_actual");
 });
 
 test("Test 1 (Paddle, REVALIDATE): 100->120 seats immediate — quote doesn't mutate, commit does, committedEffect is the re-derived figure", async () => {

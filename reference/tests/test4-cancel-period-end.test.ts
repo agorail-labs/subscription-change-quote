@@ -17,7 +17,20 @@ test("Test 4 (Stripe): CANCEL at PERIOD_END — remains active until period end,
   assert.equal(receipt.resultingSnapshot.term?.autoRenew, false);
   assert.equal(receipt.consistencyGuarantee, "BEST_EFFORT");
   assert.equal(receipt.multiChangeConsistency, "ATOMIC", "single-change is trivially ATOMIC");
-  assert.deepEqual(receipt.committedEffect, receipt.quotedEffect, "CANCEL has no proration component; quoted and committed always coincide");
+  // PR-3 DISCLOSED EXPECTATION CHANGE (v0.6.2 Stripe migration; the
+  // Paddle variant below is NOT migrated and keeps the original
+  // whole-effect assertion): this previously asserted whole-effect
+  // deepEqual(committedEffect, quotedEffect). The FIGURES still
+  // always coincide for CANCEL (no proration component — the point
+  // of this test), but under CORE-2 the committed effect
+  // additionally records its defined equality in provenance
+  // (committedSource: "defined_equal_exact"), which a quote-side
+  // effect never carries. Assert the coinciding
+  // figures/determinacy and the committed provenance separately.
+  assert.deepEqual(receipt.committedEffect.immediate, receipt.quotedEffect.immediate);
+  assert.deepEqual(receipt.committedEffect.recurring, receipt.quotedEffect.recurring, "CANCEL has no proration component; quoted and committed figures always coincide");
+  assert.deepEqual(receipt.committedEffect.determinacy, receipt.quotedEffect.determinacy);
+  assert.equal(receipt.committedEffect.provenance?.committedSource, "defined_equal_exact");
 
   console.log("[Test 4 / Stripe] resultingSnapshot:", JSON.stringify(receipt.resultingSnapshot));
 });
