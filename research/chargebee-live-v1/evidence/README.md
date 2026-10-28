@@ -16,3 +16,11 @@ Rules for anything placed here:
 In this run the directory is empty of fixtures by design: all live cases were
 BLOCKED — CREDENTIALS NOT AVAILABLE, and mocked-transport fixtures are preserved
 in-file in `reference/tests/test13-chargebee-http.test.ts` where they are executable.
+
+**Exception (Phase 3, 2026-10-27):** `PHASE3-EVIDENCE-SUMMARY.md` in this
+directory IS tracked (see the `.gitignore` exception). It is a sanitized,
+reviewed summary — narrative results, classifications, and amounts in minor
+units for the synthetic demo subscription only; it contains no credentials,
+no raw provider payloads, and no customer data beyond the demo identifiers
+already used across this branch's documents. Raw fixtures and run metadata
+remain local-only under the rules above.

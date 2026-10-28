@@ -102,10 +102,11 @@ If a future run is approved, the smallest live experiment is, in order:
 
 Phase 3 ran WITH test-site credentials (read/estimate only; commit
 disabled; zero mutations — subscription `resource_version` and item
-state verified identical before and after every live step). Full
-sanitized evidence:
-`~/workspace/scq-live-validation-evidence/PHASE3-RUN-2026-10-27.md`
-(outside this repo).
+state verified identical before and after every live step). Sanitized
+evidence: **in this repo** at
+`research/chargebee-live-v1/evidence/PHASE3-EVIDENCE-SUMMARY.md`;
+the full run report also exists outside the repo at
+`~/workspace/scq-live-validation-evidence/PHASE3-RUN-2026-10-27.md`.
 
 What changed and why (all findings live-verified on the test site
 `arjunsamplecompany-test`, demo subscription
@@ -140,7 +141,11 @@ What changed and why (all findings live-verified on the test site
   LIVE_PASS** — immediate 185240 from
   `unbilled_charge_estimates` (provider proration; time-dependent),
   recurring 60900 → 80900 (flat_fee 59900 once + per_unit 21 × 1000),
-  coverage REVALIDATE/UNKNOWN (no EXACT).
+  coverage REVALIDATE/UNKNOWN (no EXACT). Semantics of that immediate
+  figure: a **newly incurred unbilled obligation** — not an issued
+  invoice, not a payment due at commit, not cash collected; the
+  adapter commits with `invoice_immediately=false`, so such charges
+  are invoiced at the next billing cycle.
 - **L-REFUSAL (flat_fee plan quantity 1→21, through the adapter):
   LIVE-verified refusal** — UNSUPPORTED_CHANGE before any estimate
   call; the raw provider validation error was reproduced separately
@@ -154,6 +159,63 @@ What changed and why (all findings live-verified on the test site
   estimate — the reason both bugs were invisible) + 11 Phase 3
   regression tests. Full clean build: **95 pass / 0 fail** (84 on the
   rebased pre-fix branch), smoke OK. Frozen files unchanged.
+
+## Final pre-PR checks addendum (2026-10-28) — semantics + unknown-vs-zero
+
+Two focused audits ran against this branch before PR submission. No
+live API calls were made in these checks; all results below are
+mock-backed (SIMULATED_PASS) or document audits.
+
+**Check 1 — financial-effect semantics.** The 185240 immediate figure
+is, and is now documented everywhere in this branch as, a newly
+incurred **unbilled** obligation (see the L-QUOTE bullet above and
+the adapter's `interpretChargebeeEstimate` documentation): not an
+invoice, not a payment due, not a collection. The three estimate
+sources (`invoice_estimate`, `unbilled_charge_estimates`,
+`next_invoice_estimate`) are kept strictly distinct in code, tests,
+and docs. One normative gap was found and recorded OUTSIDE this repo
+as a protocol-defect proposal: the frozen spec never defines
+`CommercialEffect.immediate` semantics at all (it references the type
+without defining it), so "incurred vs invoiced vs due" is currently
+adapter convention, not protocol. The frozen spec was NOT edited.
+
+**Check 2 — unknown-versus-zero.** `checkAcceptanceEnvelope` (frozen
+core) coerces absent dimensions to 0 (`?? 0`, scq-engine.ts:130-152).
+The live adapter's remaining silent-zero sites were fixed:
+member ELEMENTS are now strict (an unbilled element without
+`amount`, or a credit-note element without `total`, makes the
+dimension ABSENT, never 0); the provider-stated recurring path now
+requires a stated `amount` on every item (a unit_price-only item is
+never summed as unit_price × quantity — it falls through to the
+pricing-model computation); the post-commit effect builder uses
+stated amounts only. New negative regression tests (all in test13;
+neg1–neg4 verified to FAIL against the pre-fix adapter):
+
+| Test | Result | Classification |
+|---|---|---|
+| 13-neg1 unbilled element without amount → quote refused (QUOTE_NOT_DETERMINISTIC) | pass | SIMULATED_PASS |
+| 13-neg2 credit_note_estimates member absent / element without total → refused / immediate absent | pass | SIMULATED_PASS |
+| 13-neg3 commit revalidation turns unknown → commit refuses; the mutating endpoint is never invoked (transport log asserted) | pass | SIMULATED_PASS |
+| 13-neg4 stated items with unit_price but no amount → flat_fee never unit_price × quantity | pass | SIMULATED_PASS |
+| 13-zero1 provider-STATED zero (both members present, empty) → accepted as actual zero; quote succeeds | pass | SIMULATED_PASS |
+
+The four simulator-backed adapters were audited and NOT changed:
+their per-change effects are built from deterministic in-repo
+simulator previews whose net is always a computed number, and
+`immediate` is omitted only when that number is exactly 0 (or, for
+Paddle, when no immediate transaction exists) — absence there encodes
+a computed zero / not-applicable by construction, not unknown
+provider data. The general protocol defect (absent is indistinguishable
+from zero to the frozen envelope function) is recorded in the same
+external proposal; any future adapter combining effects from a real
+provider must not copy the combine pattern without the live adapter's
+fail-closed discipline.
+
+**Updated totals:** test13 = 34 tests; full clean build
+**100 pass / 0 fail**; smoke OK; provider-neutrality check OK;
+freeze guard: 0-line diff on the frozen files vs merged main
+`cde8faa`; secrets/unsanitized-data scan over the full branch diff:
+clean.
 
 ## Phase 2A re-run (2026-10-27) — claim corrections applied
 

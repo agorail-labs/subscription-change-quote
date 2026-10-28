@@ -9,3 +9,6 @@ dist/
 # SCQ Chargebee live validation: sanitized evidence fixtures stay local
 research/chargebee-live-v1/evidence/*
 !research/chargebee-live-v1/evidence/README.md
+# The Phase 3 summary is sanitized and reviewed for publication, so the
+# classifications in TEST-RESULTS.md are inspectable from the repo alone.
+!research/chargebee-live-v1/evidence/PHASE3-EVIDENCE-SUMMARY.md
