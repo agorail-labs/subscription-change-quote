@@ -1,8 +1,12 @@
 // In-memory fake modeling Chargebee's Subscriptions API.
 //
-// Grounded in documented Chargebee behavior as of this writing (not
-// verified against live docs in this sandbox — flagged explicitly where
-// uncertain, same posture as the other three sims):
+// Originally grounded in documented Chargebee behavior as understood
+// when written; the load-bearing assumptions were re-audited against
+// the current official Product Catalog 2.0 documentation in Phase 1
+// (research/chargebee-live-v1/API-CONTRACT-AUDIT.md, docs re-read
+// 2026-10-27) and corrected in Phase 2A where they did not match —
+// each correction is flagged inline below. Remaining uncertain points
+// are flagged explicitly, same posture as the other three sims:
 //
 // - Chargebee's core object is a Subscription with a `subscription_items[]`
 //   array (each item referencing an `item_price_id` from Chargebee's
@@ -23,24 +27,36 @@
 //   equivalent of the older non-itemized `update` endpoint) accepts
 //   `subscription_items[]`, `invoice_immediately`, `prorate`, and
 //   `billing_alignment_mode`, and can change quantity AND swap item prices
-//   (plan/cadence changes) in ONE call, plus optionally schedule the
-//   change via `effective_from` — a real, documented Chargebee parameter:
-//   `Termed` (apply now, prorate against the current term) or `TermEnd`
-//   (apply at the end of the current billing term) or (in newer API
-//   versions) a specific timestamp for `changes_scheduled_at` — Chargebee
-//   DOES support scheduling a subscription change for an arbitrary future
-//   date via its "Scheduled Changes" mechanism
-//   (`POST /subscriptions/{id}/update_for_items` with `effective_from` as
-//   a unix timestamp), which is structurally similar to Zuora's
-//   arbitrary-effectiveDate orders — this is why Chargebee, like Zuora,
-//   is modeled as able to honor `requestedEffectiveAt`.
-// - `POST /subscriptions/{id}/update_for_items?estimate=true`-style
-//   preview: Chargebee has a genuine, documented non-mutating ESTIMATE
-//   endpoint family (`POST /estimates/update_subscription_for_items`) that
-//   returns the resulting invoice estimate (immediate charge/credit line
-//   items) and the resulting subscription estimate (next-term amounts)
-//   WITHOUT mutating anything — analogous to Stripe's upcoming-invoice
-//   preview and Zuora's order preview.
+//   (plan/cadence changes) in ONE call.
+//   Phase 2A CORRECTION (supersedes the scheduling paragraph that stood
+//   here through v0.6.1): `effective_from` is NOT a documented parameter
+//   of `update_for_items` in the current Product Catalog 2.0 docs — it
+//   is the required parameter of Create-a-ramp (Ramps, Early Access).
+//   Scheduling on the update endpoint itself exists only via
+//   deprecated-but-documented paths: the `end_of_term` boolean and
+//   `change_option=end_of_term` (both deprecated toward Ramps) and
+//   `change_option=specific_date` + `changes_scheduled_at` for a future
+//   date (deprecated for scheduling; still documented for backdating).
+//   This simulator's `effectiveFrom` field and pending-scheduled-change
+//   machinery below are therefore a SIMULATOR-ONLY model of legacy
+//   scheduled-change behavior, kept exercisable at the sim layer; the
+//   simulator-backed adapter no longer sends a future `effectiveFrom`
+//   and refuses DATE (and TERM_END for update-backed actions) — see
+//   chargebee-adapter.ts capabilitiesFor. Do not cite this sim as
+//   evidence that `update_for_items` accepts `effective_from`: that
+//   claim is NOT ESTABLISHED (which is weaker than, and different from,
+//   a claim that no equivalent mechanism exists anywhere).
+// - Preview: Chargebee has a genuine, documented non-mutating ESTIMATE
+//   endpoint family (`POST /estimates/update_subscription_for_items`)
+//   that returns the resulting invoice estimate (immediate
+//   charge/credit line items) and the resulting subscription estimate
+//   (next-term amounts) WITHOUT mutating anything — analogous to
+//   Stripe's upcoming-invoice preview and Zuora's order preview.
+//   Phase 2A CORRECTION: an earlier version of this header described a
+//   `POST /subscriptions/{id}/update_for_items?estimate=true`-style
+//   preview on the update endpoint itself; no such preview parameter
+//   is documented — the separate estimates family is the documented
+//   preview (API-CONTRACT-AUDIT.md A10/D-5).
 // - Cancellation: `POST /subscriptions/{id}/cancel_for_items` with
 //   `end_of_term: true|false`. `end_of_term: true` schedules cancellation
 //   for `current_term_end` (subscription stays "active" until then,
@@ -48,18 +64,18 @@
 //   cancels immediately. If a `contract_term` is active and cancellation
 //   happens before `contract_end`, Chargebee can apply an
 //   "early cancellation" consequence governed by
-//   `contract_term.action_at_term_end` / a configured cancellation charge
-//   — similar in spirit to Zuora's early-termination gap, EXCEPT
-//   Chargebee's contract_term object, when present, DOES expose enough
-//   structured data (a `cancellation_cutoff_period`, and whether a
-//   `billing_cycle` early-termination invoice was generated as part of the
-//   cancel response) to make this MORE derivable from the estimate/cancel
-//   response than Zuora's — we model this as a genuine, real difference:
-//   Chargebee's committed-term cancellation termEffect is EXACT if
-//   `contract_term` is present and the cancel estimate call is used,
-//   whereas Zuora's is UNKNOWN for the equivalent case. This asymmetry is
-//   surfaced explicitly in capabilitiesFor() and in research-findings.md
-//   rather than assumed to match Zuora's behavior by default.
+//   `contract_term.action_at_term_end` / a configured cancellation charge.
+//   Phase 2A CORRECTION (the v0.6 correction in chargebee-adapter.ts
+//   already retracted the adapter-level claim; this header lagged it):
+//   an earlier version of this paragraph claimed Chargebee's
+//   contract_term data makes committed-term cancellation termEffect
+//   EXACT, as a "genuine, real difference" from Zuora. That claim was
+//   simulator-only, was never verified against a site with Contract
+//   Terms enabled, and is RETRACTED: the adapter reports UNKNOWN for
+//   committed-term CANCEL, and the deterministic early-termination fee
+//   this sim computes in previewCancel() is a simulator invention kept
+//   only so the sim's arithmetic is exercisable — it is NOT documented
+//   Chargebee behavior and no capability claim may be derived from it.
 // - Versioning / concurrency: Chargebee subscriptions do NOT expose a
 //   documented monotonic version integer analogous to Zuora's `version`
 //   field, as far as we are aware (uncertainty flagged — not verified
@@ -111,7 +127,15 @@ export type ChargebeeSubscription = {
 export type UpdateForItemsInput = {
   items: Array<{ itemPriceId: string; quantity: number }>;
   prorate: boolean;
-  /** Chargebee's real scheduling parameter: undefined = apply now; an ISO timestamp = apply at that future instant (Scheduled Changes). */
+  /**
+   * SIMULATOR-ONLY scheduling field — NOT a documented
+   * `update_for_items` parameter (Phase 2A correction; see file
+   * header). undefined = apply now; an ISO timestamp = the sim holds
+   * the change as pending until that instant, modeling legacy
+   * scheduled-change behavior at the sim layer only. The
+   * simulator-backed adapter never sends a future value after
+   * Phase 2A.
+   */
   effectiveFrom?: string;
 };
 
@@ -131,7 +155,7 @@ const ITEM_PRICE_CATALOG: Record<string, ChargebeeItemPrice> = {
 export class ChargebeeSim {
   private subs = new Map<string, ChargebeeSubscription>();
   private now: Date;
-  /** Simulates a scheduled future change that hasn't executed yet — keyed by subscription id. Chargebee's real Scheduled Changes mechanism holds a pending change server-side until effectiveFrom arrives; we model just enough to test requestedEffectiveAt without building a full job scheduler. */
+  /** Simulates a scheduled future change that hasn't executed yet — keyed by subscription id. SIMULATOR-ONLY model of legacy scheduled-change behavior (the real mechanisms are the deprecated update paths and Early-Access Ramps — see file header); just enough to exercise the sim's own pending-change arithmetic, not evidence about the real API's scheduling execution. */
   private pendingScheduled = new Map<string, { effectiveFrom: string; items: Array<{ itemPriceId: string; quantity: number }> }>();
 
   constructor(now = new Date()) {
@@ -179,8 +203,9 @@ export class ChargebeeSim {
 
     const isFuture = input.effectiveFrom && new Date(input.effectiveFrom).getTime() > this.now.getTime();
     if (isFuture) {
-      // Chargebee's real Scheduled Changes: the change is accepted and
-      // held server-side, NOT applied to subscription_items immediately.
+      // Simulator-only pending-change model: the change is held,
+      // NOT applied to subscription_items immediately. (Not a claim
+      // about the real API — see file header, Phase 2A correction.)
       this.pendingScheduled.set(subscriptionId, { effectiveFrom: input.effectiveFrom!, items: input.items });
     } else {
       this.applyItems(sub, input.items);
@@ -234,12 +259,14 @@ export class ChargebeeSim {
     if (!cancelingEarly) {
       return { netImmediate: 0, earlyTerminationChargeKnown: true };
     }
-    // Chargebee's contract_term object, when present, DOES expose enough
-    // to compute a deterministic early-termination consequence via the
-    // estimate endpoint — modeled here as a simple pro-rata charge for the
-    // remaining contracted value. This is the documented asymmetry vs.
-    // Zuora (see file header): Chargebee's estimate response can surface
-    // this; Zuora's order preview alone cannot.
+    // SIMULATOR INVENTION (Phase 2A correction): the pro-rata charge
+    // computed below is this sim's own simplified formula. It is NOT
+    // documented Chargebee behavior, the committed-term case is
+    // UNVERIFIED against a real site, and the adapter deliberately
+    // does not derive any EXACT claim from this number (it reports
+    // termEffect UNKNOWN for committed-term subscriptions). An earlier
+    // comment here claimed a "documented asymmetry vs. Zuora"; that
+    // claim is retracted — see file header.
     const totalDays = (termEnd.getTime() - new Date(sub.contractTerm.contractStart).getTime()) / (24 * 3600 * 1000);
     const remainingDays = (termEnd.getTime() - cancelDate.getTime()) / (24 * 3600 * 1000);
     const monthlyValue = sub.subscriptionItems.reduce((sum, item) => {
@@ -285,15 +312,20 @@ export class ChargebeeSim {
 
     const lineItems: EstimateResult["invoiceEstimateLineItems"] = [];
     if (!isFuture && input.prorate) {
-      // Deterministic proration pivoted on the order's OWN effective
-      // instant (now, or the caller-stated effectiveFrom if it's not in
-      // the future) and the subscription's current_term boundaries — same
-      // structural shape as Zuora's effectiveDate-pivoted math, NOT
-      // Stripe/Paddle's ambient-wall-clock-at-call-time math. This is why
-      // Chargebee's financial dimensions can be EXACT: the pivot is always
-      // an explicit input (now, captured and replayed) or a scheduled
-      // future timestamp, never silently re-evaluated against a later
-      // "now" the way Stripe/Paddle's un-pinned proration is.
+      // Simulator proration arithmetic: a fraction-of-term calculation
+      // against the sim's OWN clock (`this.now` at call time) and the
+      // subscription's current_term boundaries. Phase 2A CORRECTION:
+      // an earlier version of this comment concluded "this is why
+      // Chargebee's financial dimensions can be EXACT" — that does not
+      // follow. Determinism INSIDE the simulator proves nothing about
+      // the real estimate->update pair, for which no pinning/replay
+      // mechanism is documented and multiple drift sources exist
+      // (site-setting defaults, balances, conditional tax, the
+      // prorate caveat). The adapter therefore reports REVALIDATE for
+      // both financial dimensions, and its commit path re-derives the
+      // effect and enforces the caller's envelope against the fresh
+      // preview — exactly because a later "now" CAN change the number,
+      // as Test 11a now demonstrates.
       const termStart = new Date(sub.currentTermStart).getTime();
       const termEnd = new Date(sub.currentTermEnd).getTime();
       const periodLength = termEnd - termStart;

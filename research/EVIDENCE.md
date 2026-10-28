@@ -16,7 +16,7 @@ SCQ's evidence is deliberately split by confidence level. Provider behavior shou
 | Stripe | Documentation-backed simulation | Preview/update normalization; `proration_date`-style time-basis pinning in the model; EXACT-vs-REVALIDATE distinctions; stale quote and TOCTOU behavior in simulation |
 | Paddle | Documentation-backed simulation | Preview/update normalization; no modeled time-basis pin equivalent; REVALIDATE behavior; stale quote and TOCTOU behavior in simulation |
 | Zuora | Documentation-backed simulation | Orders-style mutations; native subscription version; explicit effective dates; contract-term vocabulary; multi-action order batching; TOCTOU despite stronger staleness detection |
-| Chargebee | **Live test-site API + simulator** | Estimate/commit agreement for tested cases; scheduling; resource-version behavior; absence of atomic conditional write in tested path; multi-change behavior; live silent partial-application hazard |
+| Chargebee | **Limited historical live test-site observations (v0.5-LIVE, prior cycle) + simulator** | Estimate/commit agreement for ONE tested configuration; scheduling via mechanisms since deprecated in current docs; resource-version behavior; absence of atomic conditional write in tested path; multi-change behavior; live silent partial-application hazard. NOT a validation of the current adapters — see the Phase 2A note below. |
 
 ## Live Chargebee observations
 
@@ -108,7 +108,7 @@ The model also shows that a stronger version field improves stale-state detectio
 
 ## Protocol-level evidence
 
-The v0.6 freeze candidate had 54 passing tests. The subsequent v0.6.1 hardening cycle reports **66 passing tests**, adding coverage for reconciliation, expiration, quote-level commit idempotency, direct partial-execution enforcement, and Paddle multi-change behavior.
+The v0.6 freeze candidate had 54 passing tests. The subsequent v0.6.1 hardening cycle reported **66 passing tests** (that cycle's count), adding coverage for reconciliation, expiration, quote-level commit idempotency, direct partial-execution enforcement, and Paddle multi-change behavior. The Chargebee live-validation experiment later added 18 mocked-transport tests (84 total); none of the 84 is a live API test.
 
 The test suite is strongest as evidence that the normalized contract is internally coherent across the four adapter models. It is not a substitute for live integration testing on every provider.
 
@@ -125,3 +125,39 @@ SCQ does not yet prove:
 - exhaustive behavior for provider tax, discount, foreign-exchange, entitlement, or external contract systems.
 
 These are explicit boundaries, not hidden assumptions.
+
+## Phase 2A correction note (2026-10-27) — read before citing the Chargebee rows above
+
+The live observations in this register are **historical**: they were made in the
+v0.5-LIVE cycle against one test site, before the current adapters existed in
+their present form, and only a limited set of Chargebee behaviors was ever
+exercised against a real API. Phase 2A re-audited every Chargebee claim in this
+repository against the current Product Catalog 2.0 documentation
+(`research/chargebee-live-v1/API-CONTRACT-AUDIT.md`) and corrected the
+simulator-backed adapter and its tests. Consequences for citing this register:
+
+- Item 1 ($840 estimate/commit agreement) is a **single observation for one
+  configuration**. It does NOT establish EXACT financial coverage: no
+  estimate-pinning/replay mechanism is documented for the estimate→update
+  pair, so both Chargebee adapters now report REVALIDATE for the financial
+  dimensions. (Language discipline: the pinning mechanism is NOT ESTABLISHED
+  in the documented contract — that is not a claim that no equivalent
+  mechanism exists anywhere.)
+- Item 3 (term-end scheduling) was observed via `end_of_term`, which current
+  documentation marks **deprecated** in favor of Ramps (Early Access).
+  "Deprecated but functional when last tested" is the accurate status.
+  Arbitrary-date scheduling was never exhaustively validated and the
+  `effective_from`-on-`update_for_items` attribution formerly made for it is
+  **not established** — `effective_from` is documented as a Create-a-ramp
+  parameter. The simulator-backed adapter now refuses DATE, and refuses
+  TERM_END for update-backed actions (TERM_END for CANCEL is retained as
+  deprecated-but-documented + historically observed).
+- Items 2, 4, 6, 7, 8 stand as historical observations of the tested
+  configurations/endpoint behavior only. Item 5 (committed-term CANCEL)
+  remains UNVERIFIED.
+- No live evidence was added by the Phase 1 live-validation run or by
+  Phase 2A: all live cases in both were BLOCKED (no credentials). Evidence
+  labels: only the v0.5-LIVE items above are historical-live; everything in
+  `research/chargebee-live-v1/` from those runs is SIMULATED,
+  DOCUMENTATION_SUPPORTED, or BLOCKED — never LIVE_* for those runs.
+- Full per-claim record: `research/chargebee-live-v1/CLAIM-CORRECTION-MATRIX.md`.

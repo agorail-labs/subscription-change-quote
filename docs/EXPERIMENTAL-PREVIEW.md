@@ -1,6 +1,6 @@
 # SCQ v0.6.1 — Experimental developer-preview notes
 
-**Status:** Prepared for a possible first public release; **not yet published or endorsed as a standard**.
+**Status:** Published as a public experimental repository for external review. **Not endorsed as a standard**, not an adopted specification of any provider or standards body, and the reference package is **not published to npm** (the repository is public; the npm package is not).
 
 ## What SCQ provides
 
@@ -17,7 +17,7 @@ The specification distinguishes:
 
 - [Normative SCQ v0.6.1 specification](../spec/scq-v0.6.1-spec.md).
 - [Security considerations](../spec/security-considerations.md).
-- [Draft conformance map](../conformance/conformance.md) and automated research test suite (**66 cases**).
+- [Draft conformance map](../conformance/conformance.md) and automated research test suite (**84 cases**: 66 baseline + 18 mocked-transport Chargebee tests from the live-validation experiment; no test in the suite is a live API test).
 - [Developer quickstart](QUICKSTART.md) using an in-memory, Stripe-shaped example.
 - Simulator-backed reference adapters shaped after Stripe, Paddle, Zuora and Chargebee; TypeScript ESM and declaration exports and a local tarball consumer test.
 - [Research evidence and limitations](../research/EVIDENCE.md).

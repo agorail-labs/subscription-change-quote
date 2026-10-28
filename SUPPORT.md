@@ -4,7 +4,7 @@ SCQ v0.6.1 is an **experimental, independently proposed protocol** with simulate
 
 ## Where to ask
 
-- **[Discussions](../../discussions)** (once enabled): protocol questions, design tradeoffs, implementation approaches, and suggestions for future versions. Share small, synthetic examples and identify the relevant commercial-effect or timing dimension.
+- **[Discussions](../../discussions)**: protocol questions, design tradeoffs, implementation approaches, and suggestions for future versions. Share small, synthetic examples and identify the relevant commercial-effect or timing dimension.
 - **[Issues](../../issues)**: reproducible reference-implementation bugs, incorrect documentation, spec contradictions and conformance gaps. Select a relevant issue template when available.
 - **[Security reporting](SECURITY.md)**: report potentially exploitable or sensitive concerns privately, never in a public issue or Discussion.
 

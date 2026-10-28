@@ -3,6 +3,19 @@
 // This is intentionally a dumb bag of records — no provider logic lives here.
 // It exists so both adapters share the exact same STALE/EXPIRED bookkeeping
 // instead of re-implementing it per provider.
+//
+// DURABILITY LIMIT (explicit — do not soften): this store is a volatile
+// in-process Map. NOTHING in it survives a process restart. SCQ's
+// receipt-replay idempotency (§6.10) is therefore bounded by process
+// lifetime: after a restart an already-committed quote's receipt is
+// unrecoverable, adapters can only fail closed, and exactly-once cannot
+// be proven from this store. There is no indefinitely-safe idempotency
+// here — on the real Chargebee API the only native backstop is the
+// documented 30-minute idempotency window. A conforming deployment
+// MUST substitute a durable, transactional store (atomic
+// status+receipt write keyed by quote id, surviving restart) before
+// relying on replay semantics; see
+// research/chargebee-live-v1/LIMITATIONS-AND-GAPS.md D-3.
 
 import type { CommercialEffect, GuaranteeCoverage, GuaranteeMode, MultiChangeConsistency, SubscriptionChangeProposal, SubscriptionChangeReceipt } from "../core/types.js";
 

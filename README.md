@@ -60,7 +60,10 @@ normative diff from v0.6.
 ## Evidence levels — read this before trusting any capability claim
 
 This research explicitly separates what was **observed against a real provider** from what was
-**modeled in a simulator**. Only one provider received live API validation in this project.
+**modeled in a simulator**. Only one provider has any live API observations in this project,
+and those are LIMITED HISTORICAL observations from a prior research cycle (v0.5-LIVE) against
+one test site — not validation performed by, or of, the current adapters. See
+`research/EVIDENCE.md` for exactly what was and was not observed.
 
 ```text
 LIVE_API_VALIDATED           — observed against a real provider test-site API
@@ -74,7 +77,7 @@ UNVERIFIED                   — intentionally left open; SCQ reports UNKNOWN ra
 
 | Provider | Evidence level |
 |---|---|
-| **Chargebee** | **Live test-site API validation**, plus simulator |
+| **Chargebee** | **Limited historical live test-site observations** (prior cycle only), plus simulator |
 | Stripe | Documentation-backed simulation only |
 | Paddle | Documentation-backed simulation only |
 | Zuora | Documentation-backed simulation only |
@@ -91,7 +94,7 @@ examples/                   Concrete normalized proposal/quote/receipt/failure e
 conformance/                Draft conformance suite — maps tests to normative rules
 research/                   Evidence register and full multi-cycle research findings
 standards/                  Fit analysis against ACP and UCP, and a discussion-draft pre-SEP
-reference/                  TypeScript reference implementation and full test suite (66 tests)
+reference/                  TypeScript reference implementation and full test suite (84 tests)
 ```
 
 - [`spec/scq-v0.6.1-spec.md`](spec/scq-v0.6.1-spec.md) — the normative specification. Start here
@@ -121,7 +124,7 @@ ACP has adopted or will adopt SCQ.
 
 ## Developer quickstart
 
-For the planned experimental preview's actual scope and limitations, see [preview notes](docs/EXPERIMENTAL-PREVIEW.md). For responsible vulnerability reporting, see [Security](SECURITY.md).
+For the experimental preview's actual scope and limitations, see [preview notes](docs/EXPERIMENTAL-PREVIEW.md). For responsible vulnerability reporting, see [Security](SECURITY.md).
 
 Start with the [simulator-only seat-expansion walkthrough](docs/QUICKSTART.md). It shows quote inspection, separate business spending caps, a default no-mutation path, and an explicitly simulated commit. The reference project is **not yet published as an npm package** and its adapters are not production billing SDK integrations.
 
@@ -144,7 +147,7 @@ npm install
 npm test
 ```
 
-Compiles with `tsc` and runs the full suite (66 tests) via Node's built-in test runner. No
+Compiles with `tsc` and runs the full suite (84 tests: 66 baseline + 18 mocked-transport live-shaped tests) via Node's built-in test runner. No
 external test framework dependency.
 
 ## Community and feedback
@@ -152,7 +155,7 @@ external test framework dependency.
 SCQ v0.6.1 is open for **external technical review**, not yet a production-ready billing SDK or an adopted industry standard.
 
 - [GitHub Issues](../../issues) — reproducible bugs, specification inconsistencies, documentation corrections, or conformance gaps.
-- [GitHub Discussions](../../discussions) *(once enabled)* — integration questions, architectural tradeoffs, evidence requests, and feedback on possible future extensions.
+- [GitHub Discussions](../../discussions) — integration questions, architectural tradeoffs, evidence requests, and feedback on possible future extensions. (Discussions is enabled on the public repository.)
 - [Contribution guidelines](CONTRIBUTING.md) — how to document observations and distinguish live API evidence from simulator results.
 - [Security policy](SECURITY.md) — how to report security-sensitive concerns privately.
 

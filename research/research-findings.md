@@ -2039,3 +2039,57 @@ behavior was already correct and only needed its documentation to catch up to it
 unresolved items (U-1 through U-8, G-2/G-5/G-6) are exactly the shape of open questions
 appropriate to hand to an external reviewer alongside a hardened spec, not blockers to reaching
 one.
+
+---
+
+# Phase 2A Addendum (2026-10-27) — Chargebee Evidence Correction (appended; earlier sections NOT rewritten)
+
+This log is append-only history. The v0.5 and v0.5-LIVE sections above
+contain Chargebee capability claims that Phase 2A (see
+`research/chargebee-live-v1/CLAIM-CORRECTION-MATRIX.md`) has corrected
+in code, tests, and current-facing docs. This addendum supersedes the
+following historical statements wherever they conflict — the original
+text is preserved above as the record of what was claimed at the time:
+
+1. **v0.5 capability matrix, financial rows** ("EXACT for every
+   action", "genuinely stronger than Stripe … and Paddle"): SUPERSEDED.
+   No estimate-pinning/replay mechanism is documented for Chargebee's
+   estimate→update pair; `effective_from` is not a documented
+   `update_for_items` parameter (it is Create-a-ramp's). Both Chargebee
+   adapters now report REVALIDATE for both financial dimensions, and an
+   overall EXACT request is refused for every Chargebee action. The
+   provider-comparison superlatives in that matrix ("genuinely
+   stronger", "sharpest asymmetry") are withdrawn as framing — they
+   were never evidence statements.
+2. **v0.5 matrix, effectiveAt row** ("EXACT — Chargebee's real
+   Scheduled Changes mechanism (`effective_from` on
+   `update_for_items`)"): SUPERSEDED. DATE is refused by both adapters.
+   Documented update-endpoint scheduling is deprecated toward Ramps
+   (Early Access, unimplemented here). TERM_END survives only for
+   CANCEL, labeled deprecated-but-documented + historically observed.
+3. **v0.5 matrix, committed-term CANCEL row** ("EXACT at the quote
+   level for BOTH evergreen AND committed-term"): already retracted in
+   v0.6 for the committed-term half; Phase 2A additionally narrows the
+   evergreen half to the termEffect dimension only (the evergreen quote
+   is no longer all-EXACT).
+4. **v0.5-LIVE updated matrix, recurring row** ("EXACT, but
+   client-computed"): SUPERSEDED. Client-side computation of a
+   recurring total from known item prices is normalization work, not a
+   provider-backed guarantee; the governing posture is REVALIDATE.
+5. **What stands from the historical sections:** the v0.5-LIVE
+   observations recorded in research/EVIDENCE.md items 2, 4, 6, 7, 8
+   (estimate shape variance, evergreen cancellation semantics for the
+   tested subscription, no CAS on the tested path, the tested
+   quantity+plan pair, the silent partial-application hazard), item 1
+   as a single-configuration observation, item 3 as
+   deprecated-but-functional-when-tested, and item 5 as UNVERIFIED.
+   No live evidence was added in Phase 1 (live-validation run) or
+   Phase 2A — all live cases in both were BLOCKED.
+
+Phase 2A disposition of D-1/D-2 (LIMITATIONS-AND-GAPS.md): corrected at
+the adapter/test level; the frozen spec's attributions (§4.1, §3.1,
+U-5) are carried as errata proposals
+(`research/chargebee-live-v1/ERRATA-PROPOSAL.md`) for a separately
+reviewed spec revision. The previously proposed 100→120→100 live
+recovery procedure was audited and found NOT COMPLETE; see
+`research/chargebee-live-v1/RECOVERY-AUDIT.md`.
