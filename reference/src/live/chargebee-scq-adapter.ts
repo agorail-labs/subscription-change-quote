@@ -71,6 +71,46 @@
 //     deployment requires a durable transactional quote/receipt
 //     store plus retention of the native key and exact request
 //     parameters — neither is provided here.
+//   - PHASE 3 (2026-10-27, live-verified on a Chargebee TEST site; see
+//     ~/workspace/scq-live-validation-evidence/PHASE3-RUN-2026-10-27.md):
+//     * The estimate endpoint requires the nested subscription[id]
+//       field; a flat subscription_id is ignored and the call 400s.
+//     * The field-GROUPED array encoding (subscription_items[field][i])
+//       is the server's real format. The item-INDEXED shape
+//       (subscription_items[i][field]) is silently ignored — HTTP 200
+//       describing a different item set. (An Oct 27 interim report
+//       concluded the opposite from a single 200; the isolation matrix
+//       in Phase 3 reversed that conclusion. The grouped encoder was
+//       never the bug.)
+//     * The server VALIDATES quantity per item pricing model: changing
+//       the quantity of the observed flat_fee plan item is rejected
+//       (HTTP 400, "This param should not be sent for on_off addon
+//       type" — Chargebee's wording for a non-quantity-priced item).
+//       This adapter therefore refuses CHANGE_QUANTITY on flat_fee
+//       items BEFORE any provider call, and never computes flat_fee
+//       effects as price × quantity.
+//     * Estimate responses are SPARSE in ways the pre-Phase-3 code did
+//       not survive: a priced per_unit change returns ONLY
+//       unbilled_charge_estimates + a subscription_estimate with NO
+//       subscription_items and NO next_invoice_estimate; an unchanged
+//       baseline returns ONLY next_invoice_estimate. Financial
+//       interpretation below is per-source with recorded provenance,
+//       never cross-mapped: next_invoice_estimate figures (total,
+//       amount_due after credits, date) are NOT the immediate charge
+//       and NOT the recurring amount, and SCQ v0.6.1 has no field that
+//       can hold them — they are surfaced in providerMetadata only.
+//     * FAIL-CLOSED RULE: when a financial dimension (immediate /
+//       recurring) cannot be determined from an authoritative provider
+//       field or a pricing-model-justified computation, the dimension
+//       is ABSENT (never zero, never fabricated) and the quote is
+//       REFUSED (QUOTE_NOT_DETERMINISTIC), because the mandatory
+//       REVALIDATE acceptance envelope cannot be enforced on an
+//       unknown dimension. The frozen core engine's
+//       checkAcceptanceEnvelope treats absent dimensions as 0
+//       (`?? 0`); this adapter never feeds it an effect with an absent
+//       bounded dimension — it refuses first, at quote time and again
+//       at commit revalidation time. (Protocol gap, recorded for
+//       future spec work; the frozen engine is NOT modified here.)
 //   - SCHEDULED CHANGES / MANDATORY ADDONS (Phase 2A recovery audit):
 //     a forward update_for_items call can delete or override a
 //     subscription's pre-existing scheduled changes (documented
@@ -131,7 +171,7 @@ type CbSubscription = {
   next_billing_at?: number;
   has_scheduled_changes?: boolean;
   has_scheduled_advance_invoices?: boolean;
-  subscription_items?: Array<{ item_price_id: string; quantity: number; unit_price?: number; amount?: number }>;
+  subscription_items?: Array<{ item_price_id: string; quantity: number; unit_price?: number; amount?: number; free_quantity?: number }>;
 };
 
 function fingerprintOf(sub: CbSubscription): string {
@@ -166,21 +206,193 @@ function snapshotFrom(sub: CbSubscription): SubscriptionSnapshot {
   };
 }
 
-function estimateEffect(estimate: any, currency: string): CommercialEffect {
+/** Authoritative item-price metadata (GET /item_prices/{id}). */
+export type CbItemPriceInfo = {
+  itemPriceId: string;
+  pricingModel?: string;
+  /** Catalog price in minor units. Subscription-level unit_price overrides take precedence for existing items. */
+  price?: number;
+  freeQuantity?: number;
+  itemType?: string;
+};
+
+export type InterpretedEstimate = {
+  effect: CommercialEffect;
+  /** Per-dimension provenance: which provider field (or justified computation) each SCQ value came from, or why it is absent. */
+  provenance: {
+    immediate: string;
+    recurring: string;
+  };
+  /**
+   * next_invoice_estimate facts, carried SEPARATELY because SCQ v0.6.1
+   * has no CommercialEffect field whose semantics match them: the total
+   * is a next-cycle figure (not the recurring subscription amount —
+   * lines can be missing), amount_due is net of credits (credits do not
+   * reduce the underlying price), and neither is an immediate charge.
+   */
+  nextInvoice?: {
+    total?: number;
+    amountDue?: number;
+    creditsApplied?: number;
+    /** ISO date of the next invoice, from next_invoice_estimate.date (epoch seconds at the provider). */
+    date?: string;
+    lineCount: number;
+  };
+};
+
+type ItemState = { itemPriceId: string; quantity: number; unitPrice?: number; amount?: number; freeQuantity?: number };
+
+/**
+ * Effective free_quantity for a per_unit item, from authoritative data
+ * only: (1) the subscription item's explicit free_quantity; (2) solved
+ * arithmetically from the item's own amount = (quantity − fq) ×
+ * unit_price when that yields an exact non-negative integer; (3) the
+ * catalog free_quantity when the observed amount is exactly consistent
+ * with it. Otherwise undefined (terms incomplete — fail closed).
+ */
+function resolveFreeQuantity(item: ItemState, catalog?: CbItemPriceInfo): number | undefined {
+  if (typeof item.freeQuantity === "number") return item.freeQuantity;
+  const up = item.unitPrice;
+  if (typeof up === "number" && up > 0 && typeof item.amount === "number") {
+    const fq = item.quantity - item.amount / up;
+    if (Number.isInteger(fq) && fq >= 0) return fq;
+    if (typeof catalog?.freeQuantity === "number" && item.amount === Math.max(0, item.quantity - catalog.freeQuantity) * up) return catalog.freeQuantity;
+  }
+  return undefined;
+}
+
+/**
+ * Contribution of ONE item to a recurring amount, or undefined when it
+ * cannot be justified. Rules (Phase 3, Task 3):
+ *   - unchanged item: its observed subscription `amount` (provider-stated).
+ *   - flat_fee: the fixed unit price ONCE — quantity is never multiplied.
+ *   - per_unit: (quantity − free_quantity) × unit price, only when unit
+ *     price and free_quantity are both known from authoritative data.
+ *   - tiered / volume / stairstep / anything else: undefined — no
+ *     computation is justified; only a provider-stated amount may be used.
+ */
+function itemRecurringContribution(
+  target: { itemPriceId: string; quantity: number },
+  current: ItemState | undefined,
+  model: CbItemPriceInfo | undefined,
+): number | undefined {
+  const changed = !current || current.quantity !== target.quantity || current.itemPriceId !== target.itemPriceId;
+  if (!changed && current) return typeof current.amount === "number" ? current.amount : undefined;
+  const pricingModel = model?.pricingModel;
+  if (pricingModel === "flat_fee") {
+    // The fixed price: the subscription's own unit_price for an existing
+    // item, else the catalog price for a newly targeted item price.
+    const fixed = current?.unitPrice ?? model?.price;
+    return typeof fixed === "number" ? fixed : undefined;
+  }
+  if (pricingModel === "per_unit") {
+    const unitPrice = current?.unitPrice ?? model?.price;
+    if (typeof unitPrice !== "number") return undefined;
+    // For a quantity change on an existing item, resolve fq from the
+    // CURRENT item state (its amount/price/quantity are observed facts).
+    const fq = current ? resolveFreeQuantity(current, model) : model?.freeQuantity;
+    if (typeof fq !== "number") return undefined;
+    return Math.max(0, target.quantity - fq) * unitPrice;
+  }
+  return undefined;
+}
+
+/**
+ * Interprets a Chargebee update-estimate response into an SCQ
+ * CommercialEffect with per-dimension provenance. Sources are kept
+ * strictly separate (Phase 3, Task 2):
+ *   - immediate: invoice_estimate.total when present; else the SUM of
+ *     unbilled_charge_estimates[].amount when that member is present
+ *     (an empty array is a provider-stated zero); in both cases minus
+ *     credit_note_estimates[].total (member must be present for the net
+ *     to be final). Absent sources => immediate ABSENT, never zero.
+ *   - recurring: subscription_estimate.subscription_items amounts when
+ *     the provider states them; else a per-item computation in which
+ *     every item's contribution must be justified (see
+ *     itemRecurringContribution). Any unjustifiable item => recurring
+ *     ABSENT. next_invoice_estimate is NEVER used for recurring.
+ *   - previousAmount: the sum of the CURRENT subscription items'
+ *     provider-stated amounts, when all are present.
+ */
+export function interpretChargebeeEstimate(
+  estimate: any,
+  ctx: {
+    currency: string;
+    currentItems: ItemState[];
+    targetItems: Array<{ itemPriceId: string; quantity: number }>;
+    priceInfo: Map<string, CbItemPriceInfo>;
+  },
+): InterpretedEstimate {
+  const provenance = { immediate: "absent", recurring: "absent" };
+  const effect: CommercialEffect = {};
+
+  // --- immediate ---
   const inv = estimate?.invoice_estimate;
-  const unbilled = (estimate?.unbilled_charge_estimates ?? []) as Array<{ amount?: number }>;
-  const creditNotes = (estimate?.credit_note_estimates ?? []) as Array<{ total?: number }>;
-  let net: number | undefined;
-  if (inv && typeof inv.total === "number") net = inv.total;
-  else if (unbilled.length > 0) net = unbilled.reduce((s, u) => s + (u.amount ?? 0), 0);
-  if (net !== undefined) net -= creditNotes.reduce((s, c) => s + (c.total ?? 0), 0);
-  const subEstItems = (estimate?.subscription_estimate?.subscription_items ?? []) as Array<{ quantity: number; unit_price?: number; amount?: number }>;
-  const recurring = subEstItems.length > 0
-    ? subEstItems.reduce((s, i) => s + (i.amount ?? (i.unit_price ?? 0) * i.quantity), 0)
+  const unbilled = estimate?.unbilled_charge_estimates as Array<{ amount?: number }> | undefined;
+  const creditNotes = estimate?.credit_note_estimates as Array<{ total?: number }> | undefined;
+  let base: number | undefined;
+  let baseSource = "";
+  if (inv && typeof inv.total === "number") { base = inv.total; baseSource = "invoice_estimate.total"; }
+  else if (Array.isArray(unbilled)) { base = unbilled.reduce((s, u) => s + (u.amount ?? 0), 0); baseSource = "sum(unbilled_charge_estimates[].amount)"; }
+  if (base !== undefined) {
+    if (Array.isArray(creditNotes)) {
+      const credits = creditNotes.reduce((s, c) => s + (c.total ?? 0), 0);
+      const net = base - credits;
+      effect.immediate = { charge: net > 0 ? net : undefined, credit: net < 0 ? -net : undefined, net };
+      provenance.immediate = `${baseSource} − sum(credit_note_estimates[].total)`;
+    } else {
+      provenance.immediate = `absent: ${baseSource} present but credit_note_estimates member absent — net cannot be finalized`;
+    }
+  } else {
+    provenance.immediate = "absent: neither invoice_estimate nor unbilled_charge_estimates present in the estimate";
+  }
+
+  // --- recurring ---
+  const subEstItems = estimate?.subscription_estimate?.subscription_items as Array<{ item_price_id: string; quantity: number; unit_price?: number; amount?: number }> | undefined;
+  let resulting: number | undefined;
+  if (Array.isArray(subEstItems) && subEstItems.length > 0) {
+    if (subEstItems.every((i) => typeof i.amount === "number" || typeof i.unit_price === "number")) {
+      resulting = subEstItems.reduce((s, i) => s + (i.amount ?? (i.unit_price ?? 0) * i.quantity), 0);
+      provenance.recurring = "subscription_estimate.subscription_items[].amount (provider-stated)";
+    } else {
+      provenance.recurring = "absent: subscription_estimate.subscription_items present but an item lacks amount and unit_price";
+    }
+  } else {
+    const currentById = new Map(ctx.currentItems.map((i) => [i.itemPriceId, i]));
+    let sum = 0;
+    let ok = true;
+    for (const t of ctx.targetItems) {
+      const c = itemRecurringContribution(t, currentById.get(t.itemPriceId), ctx.priceInfo.get(t.itemPriceId));
+      if (c === undefined) { ok = false; break; }
+      sum += c;
+    }
+    if (ok) {
+      resulting = sum;
+      provenance.recurring = "computed per item: unchanged items at provider-stated amount; flat_fee at fixed price (quantity never multiplied); per_unit at (quantity − free_quantity) × unit price — all terms from the subscription payload and item-price metadata";
+    } else {
+      provenance.recurring = "absent: subscription_estimate carries no subscription_items and at least one target item's contribution cannot be justified from its pricing model/terms";
+    }
+  }
+  const previous = ctx.currentItems.every((i) => typeof i.amount === "number")
+    ? ctx.currentItems.reduce((s, i) => s + (i.amount ?? 0), 0)
     : undefined;
-  const effect: CommercialEffect = { recurring: recurring !== undefined ? { resultingAmount: recurring, currency } : undefined };
-  if (net !== undefined && net !== 0) effect.immediate = { charge: net > 0 ? net : undefined, credit: net < 0 ? -net : undefined, net };
-  return effect;
+  if (resulting !== undefined) {
+    effect.recurring = { resultingAmount: resulting, currency: ctx.currency, ...(previous !== undefined ? { previousAmount: previous } : {}) };
+  }
+
+  // --- next invoice (metadata only; never mapped into the effect) ---
+  let nextInvoice: InterpretedEstimate["nextInvoice"];
+  const ni = estimate?.next_invoice_estimate;
+  if (ni && typeof ni === "object") {
+    nextInvoice = {
+      total: typeof ni.total === "number" ? ni.total : undefined,
+      amountDue: typeof ni.amount_due === "number" ? ni.amount_due : undefined,
+      creditsApplied: typeof ni.credits_applied === "number" ? ni.credits_applied : undefined,
+      date: typeof ni.date === "number" ? new Date(ni.date * 1000).toISOString() : undefined,
+      lineCount: Array.isArray(ni.line_items) ? ni.line_items.length : 0,
+    };
+  }
+  return { effect, provenance, nextInvoice };
 }
 
 export type ChargebeeLiveAdapterOptions = {
@@ -225,6 +437,28 @@ export class ChargebeeLiveAdapter implements SubscriptionProvider {
 
   async getSubscription(subscriptionId: string): Promise<SubscriptionSnapshot> {
     return snapshotFrom(await this.readSubscription(subscriptionId));
+  }
+
+  /**
+   * Fetches authoritative item-price metadata for the given item price
+   * ids. A failed lookup leaves the id ABSENT from the map (pricing
+   * model unknown): interpretation then fails closed for any item whose
+   * contribution would need that metadata, rather than guessing.
+   */
+  private async fetchPriceInfo(itemPriceIds: string[]): Promise<Map<string, CbItemPriceInfo>> {
+    const out = new Map<string, CbItemPriceInfo>();
+    for (const id of [...new Set(itemPriceIds)]) {
+      try {
+        const { json } = await this.client.getItemPrice(id);
+        const ip = (json as any)?.item_price;
+        if (ip) out.set(id, { itemPriceId: id, pricingModel: ip.pricing_model, price: ip.price, freeQuantity: ip.free_quantity, itemType: ip.item_type });
+      } catch { /* unknown metadata — interpretation fails closed where it matters */ }
+    }
+    return out;
+  }
+
+  private itemStatesOf(sub: CbSubscription): ItemState[] {
+    return (sub.subscription_items ?? []).map((i) => ({ itemPriceId: i.item_price_id, quantity: i.quantity, unitPrice: i.unit_price, amount: i.amount, freeQuantity: i.free_quantity }));
   }
 
   private updateParams(items: Array<{ itemPriceId: string; quantity: number }>): Record<string, unknown> {
@@ -280,6 +514,26 @@ export class ChargebeeLiveAdapter implements SubscriptionProvider {
       targetItems = currentItems.map((i) => (i.itemPriceId === change.itemId ? { ...i, itemPriceId: change.offeringRef } : i));
     }
 
+    // Authoritative pricing metadata BEFORE the estimate: it decides
+    // both a pre-call refusal (flat_fee quantity change) and how the
+    // estimate response may lawfully be interpreted.
+    const priceInfo = await this.fetchPriceInfo([...currentItems.map((i) => i.itemPriceId), ...targetItems.map((i) => i.itemPriceId)]);
+
+    if (change.action === "CHANGE_QUANTITY") {
+      const model = priceInfo.get(change.itemId)?.pricingModel;
+      const currentQty = currentItems.find((i) => i.itemPriceId === change.itemId)?.quantity;
+      if (model === "flat_fee" && change.quantity !== currentQty) {
+        // Live-verified (Phase 3 isolation matrix, test site): the
+        // provider rejects a quantity change on a flat_fee item with
+        // HTTP 400 "This param should not be sent for on_off addon
+        // type" — quantity is not a priced (or settable) dimension of
+        // a flat_fee item. Refuse here, before any estimate call,
+        // rather than forwarding a request the provider will reject
+        // or, worse, computing price × quantity for it.
+        throw new SCQError("UNSUPPORTED_CHANGE", `CHANGE_QUANTITY on ${change.itemId} is refused: item-price metadata reports pricing_model "flat_fee", for which quantity is not a settable dimension (the provider rejects such a change with a validation error). A flat_fee item's price does not vary with quantity, so no honest quote can be built on a quantity change for it.`, { itemPriceId: change.itemId, pricingModel: model, currentQuantity: currentQty, requestedQuantity: change.quantity });
+      }
+    }
+
     let estimate: any;
     try {
       const { json } = await this.client.estimateUpdateForItems(subscriptionId, this.updateParams(targetItems));
@@ -288,15 +542,21 @@ export class ChargebeeLiveAdapter implements SubscriptionProvider {
     if (!estimate) throw new SCQError("PROVIDER_ERROR", "Chargebee estimate returned no estimate object");
 
     const currency = sub.currency_code ?? "USD";
-    const commercialEffect = estimateEffect(estimate, currency);
+    const interpreted = interpretChargebeeEstimate(estimate, { currency, currentItems: this.itemStatesOf(sub), targetItems, priceInfo });
+    const commercialEffect = interpreted.effect;
     commercialEffect.effectiveAt = this.now().toISOString();
-    if (!commercialEffect.recurring) {
-      // The estimate's subscription_estimate is the only documented source
-      // for the resulting item set; if it is absent we compute recurring
-      // from the target items at CURRENT unit prices and mark nothing
-      // stronger — coverage is already REVALIDATE.
-      const priceById = new Map((sub.subscription_items ?? []).map((i) => [i.item_price_id, i.unit_price ?? 0]));
-      commercialEffect.recurring = { resultingAmount: targetItems.reduce((s, i) => s + (priceById.get(i.itemPriceId) ?? 0) * i.quantity, 0), currency };
+    // FAIL CLOSED: the REVALIDATE acceptance envelope (mandatory for
+    // these actions) is enforced by comparing immediate.net and
+    // recurring.resultingAmount. A dimension the provider data cannot
+    // determine would be compared as absent — and the frozen core
+    // engine treats absent as 0 — so an undetermined dimension makes
+    // the envelope unenforceable. Refuse rather than quote it.
+    if (!commercialEffect.immediate || !commercialEffect.recurring) {
+      const missing = [
+        ...(!commercialEffect.immediate ? [`immediate (${interpreted.provenance.immediate})`] : []),
+        ...(!commercialEffect.recurring ? [`recurring (${interpreted.provenance.recurring})`] : []),
+      ];
+      throw new SCQError("QUOTE_NOT_DETERMINISTIC", `The provider's estimate does not determine the ${missing.join(" and ")} financial dimension(s) from any authoritative field or justified computation, so the acceptance envelope cannot be enforced for this proposal. Refusing to quote an invented number.`, { provenance: interpreted.provenance, nextInvoicePresent: interpreted.nextInvoice !== undefined });
     }
 
     const quoteId = `scq_cblive_${crypto.randomBytes(8).toString("hex")}`;
@@ -336,6 +596,16 @@ export class ChargebeeLiveAdapter implements SubscriptionProvider {
           ? "Subscription has scheduled changes (has_scheduled_changes=true). An immediate update can interact with / supersede scheduled changes per Chargebee's documented 'impacts on existing scheduled changes'; SCQ does not model that interaction — termEffect is UNKNOWN and no scheduled-change guarantee is made."
           : undefined,
         rampsNote: "TERM_END/DATE scheduling via the deprecated change_option paths and via Ramps (early access) is NOT implemented or validated by this adapter.",
+        // Phase 3: exact financial-field provenance for this quote.
+        financialProvenance: interpreted.provenance,
+        pricingModels: Object.fromEntries([...priceInfo.values()].map((p) => [p.itemPriceId, p.pricingModel ?? "unknown"])),
+        // next_invoice_estimate is reported here ONLY: SCQ v0.6.1 has
+        // no CommercialEffect field whose semantics match it (it is
+        // neither the immediate charge nor the recurring amount, and
+        // its amount_due is net of credits). null when the provider
+        // did not return one for this estimate.
+        nextInvoiceEstimate: interpreted.nextInvoice ?? null,
+        nextInvoiceNote: "next_invoice_estimate figures were NOT mapped into commercialEffect: its total is a next-cycle figure whose line set can be incomplete, and its amount_due is net of credits_applied (credits do not change the underlying subscription price).",
       },
     };
   }
@@ -360,10 +630,18 @@ export class ChargebeeLiveAdapter implements SubscriptionProvider {
       const { json } = await this.client.estimateUpdateForItems(validated.subscription_id, this.updateParams(input.items));
       freshEstimate = (json as any)?.estimate;
     } catch (e) { throw this.toSCQ(e, validated.subscription_id); }
+    if (!freshEstimate) throw new SCQError("PROVIDER_ERROR", "Chargebee revalidation estimate returned no estimate object");
     const currency = current.currency_code ?? "USD";
-    const revalidated = estimateEffect(freshEstimate, currency);
+    const priceInfo = await this.fetchPriceInfo(input.items.map((i) => i.itemPriceId));
+    const revalidated = interpretChargebeeEstimate(freshEstimate, { currency, currentItems: this.itemStatesOf(current), targetItems: input.items, priceInfo }).effect;
     revalidated.effectiveAt = validated.quoted_effect.effectiveAt;
-    if (!revalidated.recurring) revalidated.recurring = validated.quoted_effect.recurring;
+    // FAIL CLOSED (Phase 3): never feed an effect with an absent
+    // bounded dimension into checkAcceptanceEnvelope — the frozen core
+    // engine compares absent dimensions as 0, which would silently
+    // "enforce" the envelope against an invented zero.
+    if (!revalidated.immediate || !revalidated.recurring || !validated.quoted_effect.immediate || !validated.quoted_effect.recurring) {
+      throw new SCQError("QUOTE_NOT_DETERMINISTIC", "The pre-commit revalidation estimate does not determine every financial dimension the acceptance envelope bounds, so the envelope cannot be enforced. No mutation was performed.", { blocked: "ENVELOPE_UNENFORCEABLE_ON_REVALIDATION" });
+    }
     const violation = checkAcceptanceEnvelope(validated.quoted_effect, revalidated, proposal.acceptanceEnvelope!);
     if (violation) {
       throw new SCQError("QUOTE_DRIFTED", `Recomputed commercial effect fell outside the caller's acceptance envelope: ${violation}. No mutation was performed.`, { quoted: validated.quoted_effect, revalidated, envelope: proposal.acceptanceEnvelope });
@@ -412,7 +690,7 @@ export class ChargebeeLiveAdapter implements SubscriptionProvider {
     const unbilledTotal = (updateJson?.unbilled_charges as Array<{ amount?: number }> | undefined)?.reduce((s, u) => s + (u.amount ?? 0), 0);
     const net = typeof invoiceTotal === "number" ? invoiceTotal : typeof unbilledTotal === "number" && unbilledTotal !== 0 ? unbilledTotal : fallback.immediate?.net;
     const effect: CommercialEffect = {
-      recurring: { resultingAmount: recurringAmount, currency: after.currency_code ?? quoted.recurring?.currency ?? "USD" },
+      recurring: { resultingAmount: recurringAmount, currency: after.currency_code ?? quoted.recurring?.currency ?? "USD", ...(quoted.recurring?.previousAmount !== undefined ? { previousAmount: quoted.recurring.previousAmount } : {}) },
       effectiveAt: quoted.effectiveAt,
     };
     if (net !== undefined && net !== 0) effect.immediate = { charge: net > 0 ? net : undefined, credit: net < 0 ? -net : undefined, net };

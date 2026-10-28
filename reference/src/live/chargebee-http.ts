@@ -77,7 +77,25 @@ export function chargebeeConfigFromEnv(env: Record<string, string | undefined> =
   };
 }
 
-/** Chargebee form encoding: nested objects/arrays use bracket notation, e.g. subscription_items[item_price_id][0]. */
+/**
+ * Chargebee form encoding: nested objects/arrays use bracket notation.
+ *
+ * Array-of-object encoding is FIELD-GROUPED, exactly as Chargebee's API
+ * reference specifies for subscription_items ("pass parameters as
+ * subscription_items[<param name>][<idx:0..n>]"):
+ * subscription_items[item_price_id][0], subscription_items[quantity][0].
+ *
+ * PHASE 3 CORRECTION (2026-10-27, live-verified on a test site): an
+ * earlier draft of this file's callers experimented with the
+ * item-indexed shape subscription_items[0][quantity]. That shape is NOT
+ * recognized by the estimate endpoint: the parameters are silently
+ * ignored (Chargebee does not reject unrecognized parameters) and the
+ * returned estimate describes a DIFFERENT item set than the one
+ * requested — an HTTP 200 with wrong content. The grouped shape is the
+ * only one for which the server demonstrably parses the items (it
+ * validates them: e.g. it rejects a quantity change for a flat_fee plan
+ * item). Do not "fix" this encoder to the indexed shape.
+ */
 export function formEncode(params: Record<string, unknown>, prefix = ""): string {
   const parts: string[] = [];
   const enc = (k: string, v: unknown) => { parts.push(`${encodeURIComponent(k)}=${encodeURIComponent(String(v))}`); };
@@ -171,9 +189,25 @@ export class ChargebeeClient {
     return this.request("GET", `/subscriptions/${encodeURIComponent(subscriptionId)}`);
   }
 
-  /** POST /estimates/update_subscription_for_items — documented non-mutating estimate family. Estimates do NOT support idempotency keys (docs: idempotency). */
+  /**
+   * POST /estimates/update_subscription_for_items — documented
+   * non-mutating estimate family. Estimates do NOT support idempotency
+   * keys (docs: idempotency).
+   *
+   * PHASE 3 FIX (live-verified 2026-10-27): the subscription id must be
+   * sent as the nested object field subscription[id]. A flat
+   * subscription_id field is not read by this endpoint and the call
+   * fails with HTTP 400 "subscription[id] : cannot be blank"
+   * (param_required). formEncode renders the nested object as
+   * subscription[id]=<id>.
+   */
   estimateUpdateForItems(subscriptionId: string, params: Record<string, unknown>) {
-    return this.request("POST", `/estimates/update_subscription_for_items`, { subscription_id: subscriptionId, ...params });
+    return this.request("POST", `/estimates/update_subscription_for_items`, { subscription: { id: subscriptionId }, ...params });
+  }
+
+  /** GET /item_prices/{id} — authoritative item-price metadata (pricing_model, catalog price, free_quantity, item_type). Read-only. */
+  getItemPrice(itemPriceId: string) {
+    return this.request("GET", `/item_prices/${encodeURIComponent(itemPriceId)}`);
   }
 
   /** POST /subscriptions/{id}/update_for_items — the mutating call. Caller MUST gate this behind explicit enablement. */
