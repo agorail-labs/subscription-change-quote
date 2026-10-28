@@ -61,6 +61,18 @@ export type PaddleSubscription = {
   currentBillingPeriod: { startsAt: string; endsAt: string };
   nextBilledAt: string | null;
   scheduledChange?: { action: "cancel"; effectiveAt: string } | null;
+  /**
+   * v0.6.2 (PR-4): pre-existing customer credit balance (minor
+   * units). Same standing-fixture posture as the Stripe sim's
+   * `customer_balance`: it is applied against the PAYMENT total of
+   * an immediate transaction (see PaddleTransaction.total), but it
+   * never changes what a change itself incurs, never changes
+   * subscription state, and is deliberately NOT part of the
+   * fingerprint. Modeled as non-depleting — previews/updates
+   * report how much WOULD be applied; the balance-ledger lifecycle
+   * is out of scope for this model.
+   */
+  creditBalance?: number;
 };
 
 export type ProrationBillingMode =
@@ -70,9 +82,72 @@ export type ProrationBillingMode =
   | "full_next_billing_period"
   | "do_not_bill";
 
+/**
+ * v0.6.2 (PR-4) — the immediate transaction's figures are SPLIT by
+ * economic meaning (previously `immediateTransaction.amount` was
+ * the bare proration delta, so nothing in the model could express
+ * the difference between the obligation a change incurs and the
+ * payment a transaction collects, and the adapter mapped the
+ * transaction figure straight into `CommercialEffect.immediate`):
+ *
+ * - `incurredAmount` is the net obligation the PROPOSED CHANGE
+ *   itself incurs at its effective time — the prorated (or full)
+ *   delta between the current and proposed item totals. This is
+ *   the only figure an SCQ `immediate` effect may carry (§3.11).
+ * - `creditBalanceApplied` is the portion of the subscription's
+ *   pre-existing `creditBalance` applied against this transaction.
+ *   Credits reduce what is DUE; they never change the incurred
+ *   obligation or any price.
+ * - `amount` is the transaction's PAYMENT total:
+ *   `incurredAmount - creditBalanceApplied`. It is what would be
+ *   collected for this transaction — NOT the obligation the
+ *   change incurs — and must never be mapped into an SCQ effect.
+ */
+export type ImmediateTransactionPreview = {
+  incurredAmount: number;
+  creditBalanceApplied: number;
+  amount: number;
+  currencyCode: string;
+};
+
 export type PreviewResult = {
-  immediateTransaction: { amount: number; currencyCode: string } | null;
+  /**
+   * `null` under an immediate billing mode means the incurred
+   * amount is EXACTLY 0 (see computePreview — the null is produced
+   * iff the computed amount is 0): an established zero, not an
+   * absence of information. Under a deferred mode
+   * (`*_next_billing_period` / `do_not_bill`) null instead means
+   * "no transaction now; the obligation bills later" — the SCQ
+   * adapter only ever previews with `prorated_immediately`, where
+   * the zero reading is the operative one. The field is ABSENT
+   * (undefined) only under the `_debugOmitImmediateTransaction`
+   * fault hook, modeling a provider response that omits the figure
+   * entirely — that absence means NOT ESTABLISHED (unknown).
+   */
+  immediateTransaction?: ImmediateTransactionPreview | null;
   nextTransaction: { amount: number; currencyCode: string; billedAt: string } | null;
+};
+
+/**
+ * A transaction record as PERSISTED by `update()` and read back
+ * via `retrieveTransaction(id)` — the post-commit read path. The
+ * persisted record is what makes M3-style identity binding
+ * possible: a mutation's financial actuals are established from
+ * the transaction THAT mutation generated, retrieved by its id,
+ * not from the mutation response object and not from an
+ * unqualified latest-transaction pointer.
+ */
+export type PaddleTransaction = {
+  id: string; // txn_...
+  subscriptionId: string;
+  /** Net obligation the mutation's change incurred (the transaction's lines total). */
+  incurredAmount: number;
+  /** Pre-existing customer credits applied against this transaction. */
+  creditBalanceApplied: number;
+  /** PAYMENT figure: incurredAmount - creditBalanceApplied. Never an incurred obligation. */
+  total: number;
+  currencyCode: string;
+  createdAt: string;
 };
 
 const PRICE_CATALOG: Record<string, PaddlePrice> = {
@@ -83,7 +158,21 @@ const PRICE_CATALOG: Record<string, PaddlePrice> = {
 
 export class PaddleSim {
   private subs = new Map<string, PaddleSubscription>();
+  private transactions = new Map<string, PaddleTransaction>();
+  private transactionIdsBySubscription = new Map<string, string[]>();
   private now: Date;
+
+  // v0.6.2 (PR-4) fault-injection hooks (migration matrix F-6: the
+  // conformance suite needs negative cases the happy-path model
+  // cannot produce). All default off; tests set them explicitly.
+  /** When true, previews return WITHOUT an immediate-transaction figure — the preview cannot establish the incurred obligation. Generated transactions are unaffected: the flag models a sparse PREVIEW, not a sparse transaction. */
+  _debugOmitImmediateTransaction = false;
+  /** When true, `retrieveTransaction` throws — the post-commit transaction read is unavailable, so committed finances cannot be independently verified. */
+  _debugFailTransactionReads = false;
+  /** When true, the next `update()` fully applies the mutation and persists its transaction, then throws an `api_connection_error` — a response lost AFTER the mutation landed. One-shot: the flag clears itself. */
+  _debugLoseNextUpdateResponse = false;
+  /** Same lost-response fault for the next `cancel()` call. One-shot. */
+  _debugLoseNextCancelResponse = false;
 
   constructor(now = new Date()) {
     this.now = now;
@@ -105,6 +194,36 @@ export class PaddleSim {
     const sub = this.subs.get(id);
     if (!sub) throw new PaddleSimError("entity_not_found", `subscription ${id} not found`);
     return structuredClone(sub);
+  }
+
+  /**
+   * Post-commit read: the persisted transaction record for `id`.
+   * Throws `entity_not_found` for an unknown id, and whatever
+   * `_debugFailTransactionReads` injects.
+   */
+  retrieveTransaction(id: string): PaddleTransaction {
+    if (this._debugFailTransactionReads) {
+      throw new PaddleSimError(
+        "api_error",
+        "Simulated transaction read failure: the transaction store is unavailable (fault injection)"
+      );
+    }
+    const txn = this.transactions.get(id);
+    if (!txn) throw new PaddleSimError("entity_not_found", `transaction ${id} not found`);
+    return structuredClone(txn);
+  }
+
+  /**
+   * The id of the most recent transaction generated for a
+   * subscription, or null if none. This is a READ of the
+   * transaction log — it exists so a caller can DETECT that a
+   * later transaction superseded its own (the M3 divergence
+   * signal). It is never a source of financial figures: figures
+   * are bound by id via `retrieveTransaction`.
+   */
+  latestTransactionId(subscriptionId: string): string | null {
+    const ids = this.transactionIdsBySubscription.get(subscriptionId);
+    return ids && ids.length > 0 ? ids[ids.length - 1] : null;
   }
 
   /** Out-of-band mutation simulating another system/webhook changing state directly. */
@@ -129,7 +248,7 @@ export class PaddleSim {
     subscriptionId: string,
     proposedItems: Array<{ priceId: string; quantity: number }>,
     prorationBillingMode: ProrationBillingMode
-  ): { subscription: PaddleSubscription; result: PreviewResult } {
+  ): { subscription: PaddleSubscription; result: PreviewResult; transaction?: PaddleTransaction } {
     const sub = this.subs.get(subscriptionId);
     if (!sub) throw new PaddleSimError("entity_not_found", `subscription ${subscriptionId} not found`);
 
@@ -151,7 +270,50 @@ export class PaddleSim {
       sub.billingCycle = { interval: newInterval, frequency: 1 };
     }
 
-    return { subscription: structuredClone(sub), result };
+    // v0.6.2 (PR-4): under an immediate billing mode the mutation
+    // generates a transaction, which is PERSISTED under its id so
+    // its actuals can be read back afterwards via
+    // retrieveTransaction() — a post-commit read, not the preview
+    // object and not this response. The transaction's incurred
+    // component is the mutation's own computation (the preview
+    // above ran against the pre-mutation state inside this same
+    // call, so nothing intervened); a null immediate figure under
+    // an immediate mode is the established zero (see
+    // computePreview), so the persisted incurred amount is 0.
+    // Under a deferred mode no immediate transaction is generated.
+    let transaction: PaddleTransaction | undefined;
+    if (prorationBillingMode === "prorated_immediately" || prorationBillingMode === "full_immediately") {
+      const immediate = result.immediateTransaction;
+      const incurredAmount = immediate ? immediate.incurredAmount : 0;
+      const creditBalanceApplied = immediate ? immediate.creditBalanceApplied : 0;
+      transaction = {
+        id: `txn_${crypto.randomBytes(6).toString("hex")}`,
+        subscriptionId,
+        incurredAmount,
+        creditBalanceApplied,
+        total: incurredAmount - creditBalanceApplied,
+        currencyCode: sub.currencyCode,
+        createdAt: this.now.toISOString(),
+      };
+      this.transactions.set(transaction.id, structuredClone(transaction));
+      const ids = this.transactionIdsBySubscription.get(subscriptionId) ?? [];
+      ids.push(transaction.id);
+      this.transactionIdsBySubscription.set(subscriptionId, ids);
+    }
+
+    if (this._debugLoseNextUpdateResponse) {
+      // Fault injection: everything above HAS landed (items
+      // applied, transaction persisted) — only the response is
+      // lost. The caller cannot distinguish this from a mutation
+      // that never ran, which is precisely the indeterminate case.
+      this._debugLoseNextUpdateResponse = false;
+      throw new PaddleSimError(
+        "api_connection_error",
+        "Simulated lost response: the update was applied but its response never reached the caller (fault injection)"
+      );
+    }
+
+    return { subscription: structuredClone(sub), result, transaction };
   }
 
   cancel(subscriptionId: string, effectiveFrom: "immediately" | "next_billing_period"): PaddleSubscription {
@@ -164,6 +326,15 @@ export class PaddleSim {
     } else {
       sub.scheduledChange = { action: "cancel", effectiveAt: sub.currentBillingPeriod.endsAt };
     }
+    if (this._debugLoseNextCancelResponse) {
+      // Fault injection: the cancellation HAS landed — only the
+      // response is lost (the indeterminate case, as in update()).
+      this._debugLoseNextCancelResponse = false;
+      throw new PaddleSimError(
+        "api_connection_error",
+        "Simulated lost response: the cancel was applied but its response never reached the caller (fault injection)"
+      );
+    }
     return structuredClone(sub);
   }
 
@@ -174,6 +345,9 @@ export class PaddleSim {
    */
   fingerprint(subscriptionId: string): string {
     const sub = this.get(subscriptionId);
+    // Deliberately NOT fingerprinted: `creditBalance` — a standing
+    // credit fixture that changes amounts due on transactions,
+    // never subscription state or anything a change incurs.
     const material = JSON.stringify({
       status: sub.status,
       items: sub.items.map((i) => ({ price: i.price.id, quantity: i.quantity })),
@@ -201,28 +375,54 @@ export class PaddleSim {
       nextTotal += price.unitAmount * p.quantity;
     }
 
+    const nextTransaction = { amount: nextTotal, currencyCode: sub.currencyCode, billedAt: sub.currentBillingPeriod.endsAt };
+
     if (mode === "do_not_bill" || mode === "full_next_billing_period" || mode === "prorated_next_billing_period") {
-      return {
-        immediateTransaction: null,
-        nextTransaction: { amount: nextTotal, currencyCode: sub.currencyCode, billedAt: sub.currentBillingPeriod.endsAt },
-      };
+      return { immediateTransaction: null, nextTransaction };
     }
 
     // immediate modes: compute a delta transaction now.
     let oldTotal = 0;
     for (const item of sub.items) oldTotal += item.price.unitAmount * item.quantity;
 
-    let immediateAmount: number;
+    let incurredAmount: number;
     if (mode === "full_immediately") {
-      immediateAmount = nextTotal - oldTotal;
+      incurredAmount = nextTotal - oldTotal;
     } else {
       // prorated_immediately
-      immediateAmount = Math.round((nextTotal - oldTotal) * fractionRemaining);
+      incurredAmount = Math.round((nextTotal - oldTotal) * fractionRemaining);
     }
 
+    if (this._debugOmitImmediateTransaction) {
+      // Fault injection: the response omits the immediate figure
+      // entirely — the incurred obligation cannot be established
+      // from this preview (modeled absence, distinct from the
+      // established-zero null below).
+      return { nextTransaction };
+    }
+
+    if (incurredAmount === 0) {
+      // F-3: under an immediate mode, NO immediate transaction is
+      // produced iff the incurred amount is exactly 0. This null
+      // is an established zero — the semantic the SCQ adapter's
+      // DETERMINED-zero mapping rests on.
+      return { immediateTransaction: null, nextTransaction };
+    }
+
+    // Split the transaction figure by economic meaning (PR-4):
+    // the incurred obligation is the delta itself; the payment
+    // total nets out any pre-existing credits applied against it.
+    // Credits apply only against a positive incurred amount (a
+    // net-credit change is a credit, not a payment).
+    const creditBalanceApplied = incurredAmount > 0 ? Math.min(sub.creditBalance ?? 0, incurredAmount) : 0;
     return {
-      immediateTransaction: immediateAmount !== 0 ? { amount: immediateAmount, currencyCode: sub.currencyCode } : null,
-      nextTransaction: { amount: nextTotal, currencyCode: sub.currencyCode, billedAt: sub.currentBillingPeriod.endsAt },
+      immediateTransaction: {
+        incurredAmount,
+        creditBalanceApplied,
+        amount: incurredAmount - creditBalanceApplied,
+        currencyCode: sub.currencyCode,
+      },
+      nextTransaction,
     };
   }
 }
