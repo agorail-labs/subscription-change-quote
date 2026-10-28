@@ -44,42 +44,90 @@ const OFFERING_TO_ITEM_PRICE: Record<string, string> = {
 };
 
 /**
- * v0.6 capability source of truth for Chargebee. `getCapabilities()` and
- * the enforcement functions in createChangeQuote all call this SAME
- * function.
+ * Capability source of truth for the SIMULATOR-BACKED Chargebee adapter.
+ * `getCapabilities()` and the enforcement functions in createChangeQuote
+ * all call this SAME function.
  *
- * GuaranteeCoverage reasoning unchanged from v0.5 for the financial
- * dimensions (EXACT everywhere — real, confirmed by the v0.5-LIVE session:
- * estimate matched committed invoice exactly for CHANGE_QUANTITY) and for
- * termEffect on CHANGE_QUANTITY/CHANGE_PLAN/CHANGE_CADENCE (EXACT / UNKNOWN
- * respectively, unchanged). CANCEL's coarse termEffect stays UNKNOWN here
- * (a conservative default — the real answer depends on subscription state,
- * see quoteLevelCancelTermCoverage, which is ALSO where the v0.6 UNVERIFIED
- * correction lives — do not read this coarse row as claiming anything about
- * the committed-term case).
+ * Phase 2A correction (2026-10-27, see
+ * research/chargebee-live-v1/CLAIM-CORRECTION-MATRIX.md and
+ * API-CONTRACT-AUDIT.md A6/A8): the pre-correction values claimed EXACT
+ * on both financial dimensions for every action, EXACT termEffect for
+ * CHANGE_QUANTITY, EXACT effectiveAt, and supportedEffectiveIntents
+ * ["IMMEDIATE", "TERM_END", "DATE"] for every action. Current Chargebee
+ * Product Catalog 2.0 documentation does NOT establish those claims:
  *
- * `supportedEffectiveIntents`: "IMMEDIATE" everywhere (confirmed live).
- * "TERM_END" for CANCEL (real `end_of_term=true` on `cancel_for_items`,
- * confirmed live via `cancel_subscription_for_items_estimate` with
- * `cancel_option=end_of_term` matching the real commit exactly) AND for
- * CHANGE_QUANTITY/CHANGE_PLAN/CHANGE_CADENCE (Chargebee's real
- * `end_of_term=true` on `update_for_items` — confirmed to exist and defer
- * application via `has_scheduled_changes`/`changes_scheduled_at`, though
- * NOT independently re-verified end-to-end in the same live session as the
- * DATE case — see research-findings.md v0.5-LIVE Experiment 2). "DATE" via
- * `effective_from` is advertised as supported (the mechanism's existence
- * and response shape were confirmed live, sharing structure with the
- * TERM_END verification) but its OWN independent end-to-end raw
- * request/response pair was not captured this session — flagged as
- * UNVERIFIED-for-DATE-specifically in research-findings.md, not silently
- * assumed equivalent to the TERM_END verification.
+ * - Financial dimensions are REVALIDATE, not EXACT. No estimate-pinning
+ *   or replay mechanism is documented for the estimate->update pair, and
+ *   `effective_from` is NOT a documented `update_for_items` parameter
+ *   (it is the required parameter of Create-a-ramp). This adapter now
+ *   matches the posture of the experimental live adapter in the
+ *   unpublished Change B (REVALIDATE / REVALIDATE). One
+ *   historical live case where estimate and commit agreed ($840,
+ *   research/EVIDENCE.md item 1) is a single observation, not a
+ *   guarantee mechanism. NOTE the language discipline: undocumented
+ *   pinning is NOT ESTABLISHED — this correction does not claim proof
+ *   that no equivalent mechanism exists anywhere; it claims only that
+ *   none is documented for this endpoint pair, so EXACT is not an
+ *   honest advertisement.
+ * - termEffect is UNKNOWN for every action at this coarse level.
+ *   CHANGE_QUANTITY previously claimed EXACT; documented term
+ *   interactions (force_term_reset, automatic term reset on billing-
+ *   period change, contract-term parameters) mean term consequences
+ *   are not fully derivable from the estimate/update pair. The ONE
+ *   quote-level exception is CANCEL on an evergreen subscription —
+ *   see quoteLevelCancelTermCoverage.
+ * - effectiveAt is REVALIDATE, not EXACT, for the same reason as the
+ *   financial dimensions.
+ * - Scheduling: deprecated-but-documented is NOT the same as
+ *   supported-by-this-adapter. `end_of_term` and
+ *   `change_option=specific_date`/`changes_scheduled_at` (future) on
+ *   `update_for_items` are documented but DEPRECATED in favor of Ramps
+ *   (Early Access, site-gated, a separate resource this adapter does
+ *   not call). DATE is therefore refused for every action, and
+ *   TERM_END is refused for the update-backed actions
+ *   (CHANGE_QUANTITY/CHANGE_PLAN/CHANGE_CADENCE) — the simulator never
+ *   modeled `end_of_term` as the distinct boolean the real endpoint
+ *   takes; it folded TERM_END into a timestamp parameter that is not
+ *   documented on that endpoint (see chargebee-sim.ts).
+ * - CANCEL keeps ["IMMEDIATE", "TERM_END"]: `end_of_term=true` on the
+ *   SEPARATE `cancel_for_items` endpoint is also deprecated-adjacent
+ *   in current docs, but it is the mechanism that was historically
+ *   observed working in the prior v0.5-LIVE cycle (limited historical
+ *   research against a real test site — see research/EVIDENCE.md
+ *   items 3-4), and the simulator models that endpoint's boolean
+ *   faithfully rather than folding it into another parameter. It is
+ *   retained as deprecated-but-documented + historically observed,
+ *   with financial coverage downgraded to REVALIDATE like everything
+ *   else, so an overall EXACT request is still refused for CANCEL.
+ */
+/**
+ * Scheduling taxonomy (Phase 2B, 2026-10-27 — canonical table in
+ * spec/ERRATA-v0.6.1.md §6; every advertised Chargebee scheduling
+ * capability carries exactly one classification):
+ * - IMMEDIATE (all actions, this adapter): Supported and tested.
+ * - TERM_END for CANCEL (cancel_for_items `end_of_term`): Documented
+ *   but deprecated (retained under that label; historically observed).
+ * - TERM_END for update-backed actions: Unsupported by the current
+ *   adapter (mechanism documented but deprecated; refused).
+ * - DATE via update_for_items: Unsupported by the current adapter
+ *   (deprecated paths refused; `effective_from`-on-update NOT
+ *   ESTABLISHED).
+ * - DATE/TERM_END via Ramps: Site-feature-dependent or early-access
+ *   (not implemented).
+ * - CANCEL on a committed-term subscription: Site-feature-dependent
+ *   (Contract Terms feature; UNVERIFIED).
  */
 function capabilitiesFor(action: ChangeAction): ActionCapabilities {
-  const guaranteeCoverage: GuaranteeCoverage =
-    action === "CHANGE_QUANTITY"
-      ? { immediateFinancialEffect: "EXACT", recurringFinancialEffect: "EXACT", termEffect: "EXACT", effectiveAt: "EXACT" }
-      : { immediateFinancialEffect: "EXACT", recurringFinancialEffect: "EXACT", termEffect: "UNKNOWN", effectiveAt: "EXACT" };
-  return { guaranteeCoverage, supportedEffectiveIntents: ["IMMEDIATE", "TERM_END", "DATE"] };
+  const guaranteeCoverage: GuaranteeCoverage = {
+    immediateFinancialEffect: "REVALIDATE",
+    recurringFinancialEffect: "REVALIDATE",
+    termEffect: "UNKNOWN",
+    effectiveAt: "REVALIDATE",
+  };
+  return {
+    guaranteeCoverage,
+    supportedEffectiveIntents: action === "CANCEL" ? ["IMMEDIATE", "TERM_END"] : ["IMMEDIATE"],
+  };
 }
 
 /**
@@ -97,26 +145,40 @@ function capabilitiesFor(action: ChangeAction): ActionCapabilities {
  *
  *     UNVERIFIED — Contract Terms feature not enabled on test site.
  *
- * This function reflects that honestly: evergreen resolves EXACT (real,
- * confirmed); a subscription WITH a contract_term resolves UNKNOWN, not
- * EXACT — the type system's only conservative choice, since
- * GuaranteeCoverage.termEffect has no third "UNVERIFIED" value and
- * claiming EXACT for an unverified case would be exactly the mistake this
- * correction exists to prevent. If a future cycle verifies real
- * committed-term Chargebee CANCEL behavior against a site with Contract
- * Terms enabled, THIS is the function to update — with real evidence, not
- * inference.
+ * This function reflects that honestly, for the termEffect DIMENSION
+ * ONLY: evergreen resolves EXACT (the term outcome of cancelling an
+ * evergreen subscription — no commitment created, auto-renew off — was
+ * observed in the limited historical v0.5-LIVE research); a subscription
+ * WITH a contract_term resolves UNKNOWN, not EXACT — the type system's
+ * only conservative choice, since GuaranteeCoverage.termEffect has no
+ * third "UNVERIFIED" value and claiming EXACT for an unverified case
+ * would be exactly the mistake this correction exists to prevent. If a
+ * future cycle verifies real committed-term Chargebee CANCEL behavior
+ * against a site with Contract Terms enabled, THIS is the function to
+ * update — with real evidence, not inference.
+ *
+ * Phase 2A note: this EXACT applies to termEffect alone. Since Phase 2A
+ * the financial dimensions of a CANCEL quote are REVALIDATE (see
+ * capabilitiesFor), so an evergreen CANCEL quote no longer backs an
+ * overall EXACT request — overall EXACT requires every dimension.
  */
 function quoteLevelCancelTermCoverage(sub: ChargebeeSubscription): "EXACT" | "UNKNOWN" {
   return sub.contractTerm ? "UNKNOWN" : "EXACT";
 }
 
 /**
- * v0.5: Chargebee's real `update_for_items` accepts a full item list in
- * one call (quantity AND plan/cadence swaps bundle atomically, same
- * reasoning as Stripe/Paddle's items[] parameter). CANCEL is a distinct
- * endpoint (`cancel_for_items`) that cannot be combined with an
- * update_for_items call in the same request — bundling CANCEL with
+ * Chargebee's documented `update_for_items` accepts a full item list in
+ * one call, so quantity AND plan/cadence swaps bundle into a single
+ * provider request in this model — MultiChangeConsistency "ATOMIC" here
+ * means single-request bundling in the simulator model, NOT a provider
+ * compare-and-swap or transactional guarantee (consistencyGuarantee
+ * remains BEST_EFFORT). Note the documented replacement caveats the
+ * simulator does not model: `replace_items_list` defaults to false
+ * (additive) on the real API, and mandatory addons behave specially
+ * (see API-CONTRACT-AUDIT.md A9 and the experimental live adapter in
+ * the unpublished Change B). CANCEL is a
+ * distinct endpoint (`cancel_for_items`) that cannot be combined with
+ * an update_for_items call in the same request — bundling CANCEL with
  * anything else is UNSUPPORTED.
  */
 function multiChangePairSupport(a: ChangeAction, b: ChangeAction): MultiChangeConsistency {
@@ -271,10 +333,12 @@ export class ChargebeeAdapter implements SubscriptionProvider {
         CANCEL: capabilitiesFor("CANCEL"),
       },
       // No documented compare-and-swap precondition on
-      // update_for_items/cancel_for_items, and no confirmed native
-      // monotonic version field either (see chargebee-sim.ts) — Chargebee
-      // sits in the SAME BEST_EFFORT bucket as Stripe/Paddle/Zuora for
-      // this reason, despite having Zuora-like financial-EXACT coverage.
+      // update_for_items/cancel_for_items (see chargebee-sim.ts) —
+      // Chargebee sits in the SAME BEST_EFFORT bucket as
+      // Stripe/Paddle/Zuora for this reason. (Phase 2A: the earlier
+      // wording here cited "Zuora-like financial-EXACT coverage" as a
+      // contrast; that coverage claim was not established and has been
+      // corrected to REVALIDATE — see capabilitiesFor.)
       consistencyGuarantee: "BEST_EFFORT",
     };
   }
@@ -313,31 +377,28 @@ export class ChargebeeAdapter implements SubscriptionProvider {
       enforceEffectiveIntent(proposal.effectiveIntent, caps.supportedEffectiveIntents);
     }
 
-    // v0.6: TERM_END and DATE are two DISTINCT real Chargebee mechanisms,
-    // confirmed live (v0.5-LIVE Experiment 2) — NOT interchangeable, unlike
-    // v0.5's single requestedEffectiveAt field implied. TERM_END maps to
-    // the real `end_of_term=true` boolean on CANCEL specifically (Chargebee
+    // Phase 2A: the enforceEffectiveIntent loop above has ALREADY
+    // refused every intent this adapter does not support, so by this
+    // point the only reachable cases are: IMMEDIATE for any action, and
+    // TERM_END for a single CANCEL. DATE never reaches here (refused:
+    // its previously claimed mechanism, `effective_from` on
+    // `update_for_items`, is not a documented parameter of that
+    // endpoint — it belongs to Create-a-ramp, Early Access, which this
+    // adapter does not call), and TERM_END for update-backed actions
+    // never reaches here either (refused: `end_of_term` on
+    // `update_for_items` is documented but deprecated toward Ramps,
+    // and the simulator never modeled it as the distinct boolean the
+    // real endpoint takes). For CANCEL, TERM_END maps to the real
+    // `end_of_term=true` boolean on `cancel_for_items` (Chargebee
     // itself determines the date — the current term boundary, no
-    // timestamp is sent); DATE maps to the real `effective_from`
-    // arbitrary-timestamp parameter. For NON-CANCEL changes, this sim
-    // models TERM_END by resolving it to the subscription's own known
-    // currentTermEnd and passing THAT as effectiveFrom to the update sim
-    // call — real Chargebee's own `update_for_items` accepts `end_of_term`
-    // as a genuinely separate boolean parameter (confirmed live — see
-    // research-findings.md v0.5-LIVE Experiment 2), which this
-    // simplification does not yet distinguish at the SIM layer; the
-    // schema/capability-report distinction (this adapter now genuinely
-    // asks which mechanism the caller means) is the v0.6 scope, not a sim
-    // rewrite, which the task's scope explicitly does not call for this
-    // cycle.
+    // timestamp is sent). `effectiveFrom` below is therefore ALWAYS
+    // undefined for update previews after this correction; it is kept
+    // in the sim input shape only so the simulator's legacy
+    // scheduled-change model remains exercisable at the sim layer,
+    // explicitly labeled simulator-only there (see chargebee-sim.ts).
     const isTermEnd = proposal.effectiveIntent.type === "TERM_END";
-    const effectiveFrom =
-      proposal.effectiveIntent.type === "DATE"
-        ? new Date(proposal.effectiveIntent.at).toISOString()
-        : isTermEnd
-          ? sub.currentTermEnd
-          : undefined;
-    const effectiveAtIso = effectiveFrom ?? now.toISOString();
+    const effectiveFrom: string | undefined = undefined;
+    const effectiveAtIso = isTermEnd ? sub.currentTermEnd : now.toISOString();
 
     const fingerprint = this.sim.fingerprint(subscriptionId);
     const quoteId = `scq_chargebee_${crypto.randomBytes(8).toString("hex")}`;
@@ -424,7 +485,15 @@ export class ChargebeeAdapter implements SubscriptionProvider {
   async commitChangeQuote(quoteId: string): Promise<SubscriptionChangeReceipt> {
     // v0.6.1: idempotent replay checked before any read of live provider
     // state or mutating call — see checkIdempotentReplay's doc comment in
-    // scq-engine.ts.
+    // scq-engine.ts. DURABILITY LIMIT (Phase 2A, Task 6): that replay is
+    // NOT indefinitely safe. It depends on the volatile in-memory
+    // QuoteStore — after a process restart the receipt is unrecoverable
+    // and this method can only fail closed (QUOTE_STALE below), never
+    // prove the commit did not already happen. On the real API the only
+    // native backstop is Chargebee's documented 30-minute idempotency
+    // window, which this simulator adapter does not model at all. A
+    // conforming deployment requires a durable transactional store
+    // (LIMITATIONS-AND-GAPS.md D-3).
     const cached = checkIdempotentReplay(this.store, quoteId);
     if (cached) return cached;
 
@@ -463,11 +532,17 @@ export class ChargebeeAdapter implements SubscriptionProvider {
       }
       committedEffect = revalidated;
     } else {
-      // EXACT (or CANCEL, which has no proration ambiguity): replay
-      // verbatim. Chargebee's proration pivots on an explicit
-      // effective_from input, not ambient wall-clock-at-call-time, so
-      // replay reproduces the quoted number exactly, provided the
-      // fingerprint check above passed.
+      // CANCEL path (the only non-REVALIDATE-update case reachable
+      // after the Phase 2A correction — no Chargebee action in this
+      // adapter backs an overall EXACT request anymore, because the
+      // financial dimensions are REVALIDATE): a CANCEL quote carries
+      // no proration to re-derive in the simulator, so the quoted
+      // effect is carried through. Phase 2A removed the earlier
+      // justification here ("proration pivots on an explicit
+      // effective_from input, so replay reproduces the quoted number
+      // exactly") — that pinning mechanism is NOT ESTABLISHED in the
+      // documented update contract and must not be cited as the reason
+      // any number reproduces.
       committedEffect = validated.quoted_effect;
     }
 

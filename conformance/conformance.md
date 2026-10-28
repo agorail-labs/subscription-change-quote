@@ -1,7 +1,32 @@
 # SCQ v0.6.1 — Draft Conformance Suite
 
 This document maps the existing test suite (`tests/*.test.ts`, 66 executed test cases across 11
-files, all passing as of this cycle) onto the normative rules in `scq-v0.6.1-spec.md` §6. It is
+files, all passing as of the Phase 2A correction; no case in the suite is a live API test) onto
+the normative rules in `scq-v0.6.1-spec.md` §6. (The unpublished combined branch adds the
+experimental live adapter's 18 mocked-transport cases in `test13-chargebee-http.test.ts` —
+84 cases there; test13 belongs to the pending Change B and is not executed by this change.)
+
+> **Phase 2B note (2026-10-27):** the dated v0.6.1 errata package
+> (`spec/ERRATA-v0.6.1.md`, entries ER-1…ER-4) corrects the spec's
+> Chargebee factual attributions (EXACT pinning, DATE "verified-once",
+> §3.1 rationale) and adds the §6.10 durability conformance note —
+> factual corrections only; no MUST/MUST NOT, type, definition, or
+> supported action changed, and the published spec file itself is
+> unchanged in this phase (freeze-guard process documented in the
+> errata package §7). The Chargebee scheduling taxonomy table in the
+> errata package §6 is the canonical classification for every
+> scheduling capability advertised in this repository; the §6.10
+> section below carries the corresponding durability note.
+
+> **Phase 2A note (2026-10-27):** the Chargebee rows below were updated for the
+> claim corrections in `research/chargebee-live-v1/CLAIM-CORRECTION-MATRIX.md`:
+> the simulator-backed Chargebee adapter now reports REVALIDATE financial
+> coverage (EXACT refused), UNKNOWN termEffect at the coarse level (the one
+> quote-level exception — evergreen CANCEL `termEffect` EXACT — is covered in
+> §6.5/§6.9), REVALIDATE effectiveAt, and
+> refuses DATE (all actions) and TERM_END (update-backed actions). Tests 11a,
+> 11b, 11d, 11g, 11h, and 11j were rewritten accordingly; their pre-correction
+> assertions are preserved in git history at commit 5dbb9c7. It is
 a **draft** conformance suite: the tests were originally written cycle-by-cycle to validate
 research hypotheses against specific providers, not authored from scratch as a conformance
 matrix. This document is the first pass at treating them as one, with gaps between
@@ -76,7 +101,14 @@ file — the gap being closed was in AUTOMATED verification, not in an actual de
 | Stripe | Test 8c2 (`CHANGE_CADENCE`, fails on `termEffect` despite financial EXACT) |
 | Paddle | Test 8c (`CHANGE_QUANTITY`, fails on `immediateFinancialEffect` and `termEffect`) |
 | Zuora | Test 9d (`CHANGE_CADENCE`, `failingDimension: "termEffect"`) |
-| Chargebee | Test 11b (`CHANGE_CADENCE`, `failingDimension: "termEffect"`); Test 11g (v0.6, committed-term `CANCEL`, `failingDimension: "termEffect"`) |
+| Chargebee | Test 11b (`CHANGE_CADENCE`, `failingDimension: "immediateFinancialEffect"` after Phase 2A — financials are REVALIDATE, so they fail before termEffect); Test 11g (Phase 2A: committed-term and evergreen `CANCEL` EXACT requests both refuse on `immediateFinancialEffect`; termEffect UNKNOWN for committed-term is asserted on the REVALIDATE quote) |
+
+**Phase 2A change:** Chargebee previously appeared in this row as an EXACT-capable provider
+whose only EXACT-refusal was termEffect. After the correction, NO Chargebee action in the
+simulator-backed adapter backs an overall EXACT request; refusals name
+`immediateFinancialEffect` first. The experimental live adapter in the
+unpublished Change B refuses identically in its mocked-transport tests (test13, T11);
+test13 is not part of this change.
 
 **Coverage: full (all 4 providers), including the v0.6-added committed-term CANCEL refusal.**
 
@@ -86,7 +118,7 @@ file — the gap being closed was in AUTOMATED verification, not in an actual de
 |---|---|
 | Stripe + Paddle | Test 8h: cross-checks coarse coverage against actual EXACT enforcement for CHANGE_QUANTITY/CHANGE_CADENCE/CANCEL |
 | Zuora | Test 9j: same, plus explicitly validates the CANCEL quote-level/coarse-level DIVERGENCE is intentional (Test 9e's evergreen case), not drift |
-| Chargebee | Test 11h (v0.6 corrected): coarse CANCEL stays `UNKNOWN`; quote-level resolves `EXACT` for evergreen, `UNKNOWN` for committed-term |
+| Chargebee | Test 11h (v0.6 corrected, Phase 2A re-corrected): coarse coverage is REVALIDATE/UNKNOWN for every action; the quote-level/coarse divergence survives on the termEffect dimension alone (evergreen CANCEL `EXACT`, committed-term `UNKNOWN`) |
 
 **Coverage: full (all 4 providers).**
 
@@ -113,9 +145,10 @@ Low-priority given the shared-type structure, noted for completeness.**
 | Stripe | Test 10a: `effectiveIntent: {type:"DATE"}` refused with `UNSUPPORTED_CHANGE` |
 | Paddle | Test 10b: same |
 | Zuora | Test 10d: `DATE` honored (native future-dating) |
-| Chargebee | Test 11d: `DATE` honored (native Scheduled Changes) |
+| Chargebee | Test 11d (Phase 2A CORRECTED): `DATE` REFUSED, and `TERM_END` refused for update-backed actions — the previously claimed `effective_from`-on-update mechanism is not established in current docs; documented scheduling paths are deprecated toward Early-Access Ramps, which no adapter here implements. `TERM_END` remains honored for CANCEL only (separate endpoint, deprecated-but-documented, historically observed). Experimental live adapter (unpublished Change B): its mocked-transport test T14 refuses both — not part of this change. |
 
-**Coverage: full for the DATE-refusal / DATE-acceptance split. GAP: no test explicitly
+**Coverage: full for the DATE-refusal / DATE-acceptance split (DATE is now refused by
+Stripe, Paddle, AND Chargebee, and honored only by Zuora). GAP: no test explicitly
 exercises `TERM_END` being refused on a provider that doesn't support it — currently ALL four
 reference providers support `TERM_END` for at least CANCEL, so there is no real provider
 counter-example to test against yet. This is a suite-coverage gap caused by the reference set,
@@ -149,7 +182,7 @@ recorded as unresolved (see below).
 
 | Test |
 |---|
-| Test 11g (v0.6 CORRECTED): asserts `UNSUPPORTED_CHANGE`/`termEffect` failing-dimension on an overall EXACT request, and `guaranteeCoverage.termEffect === "UNKNOWN"` on a REVALIDATE quote against a committed-term fixture |
+| Test 11g (v0.6 CORRECTED, Phase 2A re-corrected): asserts `UNSUPPORTED_CHANGE` with `failingDimension: "immediateFinancialEffect"` on an overall EXACT request against a committed-term fixture (the financial dimensions are REVALIDATE and fail first — the refusal does NOT name `termEffect`), and, as a separate assertion, `guaranteeCoverage.termEffect === "UNKNOWN"` on a REVALIDATE quote against the same committed-term fixture |
 | Test 11h (v0.6 CORRECTED): cross-checks the same across both evergreen and committed-term fixtures |
 
 **Coverage: full — and these two tests previously asserted the OPPOSITE (that committed-term
@@ -165,6 +198,17 @@ why.**
 | Contrast: commit before `validUntil` succeeds the expiry check | Test 12e |
 | Repeated commit of an already-committed quote returns the ORIGINAL receipt, no second mutation | Test 12f (Stripe): `deepEqual` of both receipts; quantity confirmed unchanged between the two commits |
 | Idempotent replay succeeds even if the subscription drifted out-of-band AFTER the first commit | Test 12g (Paddle): drift injected between the two commit calls; replay still returns the original receipt unaffected |
+
+**Durability note (errata ER-4, 2026-10-27):** §6.10's replay rule presumes a conforming
+live deployment persists quote, request identity, outcome, and receipt durably, and
+reconciles provider state after an indeterminate outcome before attempting any further
+mutation. The reference implementation's in-memory `QuoteStore` does NOT establish the
+rule across crashes — after a restart adapters fail closed (safe, but not replay
+conformance); that fail-closed behavior (rather than replay) is what the experimental
+live adapter's mocked-transport test demonstrates in the unpublished Change B
+(test13 T13) — no test in this change executes it. Provider-native idempotency is not indefinite: Chargebee's documented native
+window is 30 minutes. Nothing in this suite's passing replay tests should be read as
+evidence of durable exactly-once behavior.
 
 **Coverage: full for the engine-level mechanism (`validateCommit`'s expiry branch,
 `checkIdempotentReplay`), exercised both as a direct unit test (expiration, since real-time
@@ -232,10 +276,15 @@ continuity with the prior cycle's record.
   a fifth, synthetic provider.
 - **G-4 (CLOSED, v0.6.1)**: Paddle now has dedicated multi-change positive (Test 12i) and
   negative (Test 12j) tests, matching Stripe/Zuora/Chargebee.
-- **G-5 (NEW, v0.6.1)**: Idempotent commit replay (§6.10) is exercised end-to-end only through
-  Stripe and Paddle, not Zuora or Chargebee. The underlying mechanism is shared engine/store
-  code identical across all four adapters, so this is analogous in shape to the now-closed G-4,
-  not a known per-provider behavioral difference.
+- **G-5 (NEW, v0.6.1; partially narrowed since)**: Idempotent commit replay (§6.10) is exercised
+  end-to-end through Stripe and Paddle, and — on the unpublished combined branch only —
+  through the live-shaped Chargebee adapter (test13 T06, mocked transport; test13 belongs
+  to the pending Change B and is not executed by this change) — but not through Zuora or
+  the simulator-backed Chargebee adapter. The underlying mechanism is shared engine/store
+  code identical across all adapters,
+  so this remains analogous in shape to the now-closed G-4, not a known per-provider behavioral
+  difference. Separately, replay's durability limit (in-memory store; restart fails closed)
+  is exercised by test13 T13 in the unpublished Change B.
 - **G-6 (NEW, v0.6.1)**: No test drives an actual `reconciliation: {status:"VIOLATED"}` result
   through a real adapter's end-to-end `commitChangeQuote` call (only through the isolated engine
   function, Test 12b). Doing so requires a TOCTOU-style concurrent-write injection targeting the

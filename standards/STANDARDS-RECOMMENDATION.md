@@ -11,7 +11,7 @@
 | Preserves provider neutrality | 4/5 | 4/5 | 5/5 |
 | Adoption potential | 4.5/5 | 4.5/5 | 3.5/5 |
 
-ACP is the strongest eventual standards target. Its mission explicitly includes subscription commerce, and its SEP process is designed for exactly the kind of substantial interoperability feature SCQ represents. SCQ also arrives with unusually strong SEP inputs: normative semantics, a reference implementation, conformance tests, security analysis, multi-provider research, and live Chargebee evidence.
+ACP is the strongest eventual standards target. Its mission explicitly includes subscription commerce, and its SEP process is designed for exactly the kind of substantial interoperability feature SCQ represents. SCQ also arrives with unusually strong SEP inputs: normative semantics, a reference implementation, conformance tests, security analysis, multi-provider research, and limited historical Chargebee live observations (prior cycle; see research/EVIDENCE.md Phase 2A note).
 
 The problem is structural: ACP's current public extension framework augments checkout, while SCQ is a separate post-purchase lifecycle over an existing subscription. Submitting it immediately as an “extension” risks spending the first review cycle arguing about how to squeeze it into checkout instead of whether the commercial-safety model is correct.
 
