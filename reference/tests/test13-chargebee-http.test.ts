@@ -777,7 +777,11 @@ test("Test 13-rec4 (PR #4 review): a complete ACTUAL response is recorded with t
   assert.equal(receipt.committedEffect.recurring?.resultingAmount, 120000, "recurring comes from the re-read post-commit state");
   assert.equal(receipt.quotedEffect.immediate?.net, 20000);
   assert.equal(receipt.reconciliation.status, "VIOLATED", "actual 25000 exceeds the zero-tolerance envelope vs quoted 20000 — reported honestly, not absorbed");
-  assert.equal(store.get(quote.id)?.commit_receipt, receipt);
+  assert.deepEqual(
+    store.get(quote.id)?.commit_receipt,
+    receipt,
+    "the stored record is the original receipt verbatim (by value) — PR #8 correction C3: the store now holds defensive copies, so this is value equality, not reference identity"
+  );
 });
 
 test("Test 13-rec5 (PR #4 final review, Fix A): post-commit re-read OMITS subscription_items entirely — INDETERMINATE, no receipt, recurring is never a verified 0", async () => {
@@ -838,7 +842,11 @@ test("Test 13-rec6 (PR #4 final review, Fix A): an item with a stated amount of 
   assert.equal(receipt.status, "COMMITTED", "an explicitly stated 0 must not be refused as if it were missing data");
   assert.equal(receipt.committedEffect.recurring?.resultingAmount, 120000, "committed recurring = 120000 + the addon's explicitly stated 0 — a determined zero, included in the sum");
   assert.equal(receipt.committedEffect.immediate?.net, 20000);
-  assert.equal(store.get(quote.id)?.commit_receipt, receipt);
+  assert.deepEqual(
+    store.get(quote.id)?.commit_receipt,
+    receipt,
+    "the stored record is the original receipt verbatim (by value) — PR #8 correction C3: the store now holds defensive copies, so this is value equality, not reference identity"
+  );
 });
 
 test("Test 13-rec7 (PR #4 final review, Fix B): update returns HTTP 200 success-shaped but the provider SILENTLY IGNORED the change — INDETERMINATE, no receipt", async () => {
@@ -932,7 +940,11 @@ test("Test 13-rec10 (PR #4 final review, Fix B positive control): re-read matche
   assert.equal(receipt.committedEffect.recurring?.resultingAmount, 120000, "actual post-commit recurring from the verified item set");
   assert.equal(receipt.committedEffect.immediate?.net, 20000, "actual immediate from the update response");
   assert.deepEqual(receipt.reconciliation, { status: "OK" });
-  assert.equal(store.get(quote.id)?.commit_receipt, receipt);
+  assert.deepEqual(
+    store.get(quote.id)?.commit_receipt,
+    receipt,
+    "the stored record is the original receipt verbatim (by value) — PR #8 correction C3: the store now holds defensive copies, so this is value equality, not reference identity"
+  );
   assert.equal(fake.mutationCount, 1);
 });
 

@@ -110,6 +110,23 @@ function makeUnverifiedReceipt(overrides: Partial<SubscriptionChangeReceipt> = {
 
 const isConflict = (e: unknown): boolean => e instanceof SCQError && e.code === "CONFLICTING_RECEIPT_IDENTITY";
 
+/**
+ * PR #8 corrections: well-formed C1 VerificationEvidence for the
+ * standard unverified receipt (recorded actuals 1000/5000,
+ * independently sourced, state VERIFIED, honestly computed OK).
+ */
+function makeEvidence(receipt: SubscriptionChangeReceipt): unknown {
+  return {
+    committedEffect: {
+      ...JSON.parse(JSON.stringify(receipt.committedEffect)),
+      provenance: { committedSource: "provider_actual" },
+    },
+    committedSource: "provider_actual",
+    stateVerification: "VERIFIED",
+    reconciliation: { status: "OK" },
+  };
+}
+
 // ---------------------------------------------------------------------------
 // Type surface + legacy reading
 // ---------------------------------------------------------------------------
@@ -232,21 +249,35 @@ test("Test 14.7 (A5): audit of a legacy pair reports WOULD_REFUSE_UNKNOWN on bot
   }
 });
 
-test("Test 14.8: audit of a fully determined, finite pair reports zero findings (verified zero included)", () => {
+test("Test 14.8: audit of a fully determined, finite, provenance-carrying pair reports zero findings (verified zero included)", () => {
+  // PR #8 correction C4 (disclosed fixture update): a DETERMINED
+  // dimension now also requires supporting provenance for a
+  // zero-finding audit — a finite number alone is not
+  // verification — so the clean fixture carries provenance.
   const effect: CommercialEffect = {
     immediate: { net: 0 },
     recurring: { resultingAmount: 5000, currency: "usd" },
     determinacy: { immediateFinancialEffect: "DETERMINED", recurringFinancialEffect: "DETERMINED" },
+    provenance: {
+      immediate: "simulator invoice total (independently computed)",
+      recurring: "per-item stated amounts",
+    },
   };
   const report = auditDeterminacy(effect, effect, "CHANGE_QUANTITY");
   assert.ok(report.every((e) => e.findings.length === 0), JSON.stringify(report));
 });
 
 test("Test 14.9 (A1): DETERMINED with NaN / missing / infinite values reports INVALID_DETERMINED_VALUE per dimension", () => {
+  // PR #8 correction C4 (disclosed fixture update): the valid
+  // recurring dimension carries provenance so its expected
+  // findings stay [] now that DETERMINED requires provenance;
+  // the invalid dimension reports INVALID_DETERMINED_VALUE alone
+  // (provenance is not double-reported for invalid values).
   const nanPair: CommercialEffect = {
     immediate: { net: Number.NaN },
     recurring: { resultingAmount: 5000, currency: "usd" },
     determinacy: { immediateFinancialEffect: "DETERMINED", recurringFinancialEffect: "DETERMINED" },
+    provenance: { recurring: "per-item stated amounts" },
   };
   const nanReport = auditDeterminacy(nanPair, nanPair, "CHANGE_QUANTITY");
   assert.deepEqual(nanReport.find((e) => e.dimension === "immediateFinancialEffect")?.findings, ["INVALID_DETERMINED_VALUE"]);
@@ -255,6 +286,7 @@ test("Test 14.9 (A1): DETERMINED with NaN / missing / infinite values reports IN
   const missingPair: CommercialEffect = {
     immediate: { net: 10 },
     determinacy: { immediateFinancialEffect: "DETERMINED", recurringFinancialEffect: "DETERMINED" },
+    provenance: { immediate: "invoice total", recurring: "per-item stated amounts" },
   };
   const missingReport = auditDeterminacy(missingPair, missingPair, "CHANGE_QUANTITY");
   assert.deepEqual(missingReport.find((e) => e.dimension === "recurringFinancialEffect")?.findings, ["INVALID_DETERMINED_VALUE"]);
@@ -315,6 +347,10 @@ test("Test 14.13 (A2): licensed, correctly cited CANCEL immediate N/A reports no
     recurring: { resultingAmount: 0, currency: "usd" },
     determinacy: { immediateFinancialEffect: "NOT_APPLICABLE", recurringFinancialEffect: "DETERMINED" },
     provenance: {
+      // PR #8 correction C4 (disclosed fixture update): the
+      // DETERMINED recurring dimension carries provenance, as a
+      // zero-finding audit now requires.
+      recurring: "post-cancellation price level (no items remain)",
       applicabilityCitations: {
         immediateFinancialEffect: { action: "CANCEL", dimension: "immediateFinancialEffect" },
       },
@@ -347,7 +383,12 @@ test("Test 14.14 (F4): recording is idempotent per identity — an identical re-
   const first = store.recordCommitReceipt("q1", receipt);
   const replay = store.recordCommitReceipt("q1", makeUnverifiedReceipt());
   assert.equal(first?.quoteId, "q1");
-  assert.equal(replay, first, "replay returns the existing record");
+  // PR #8 correction C3 (disclosed assertion update): the store
+  // returns defensive copies, not its internal record, so replay
+  // equality is by value and identity — not by reference (the
+  // PR-1 reference-equality expectation is superseded by C3's
+  // caller-mutation protection).
+  assert.deepEqual(replay, first, "replay returns the existing record (by value)");
   const q = store.get("q1")!;
   assert.equal(q.status, "COMMITTED");
   assert.equal(q.commit_receipt?.reconciliation.status, "UNVERIFIED", "replaying an UNVERIFIED receipt never upgrades it");
@@ -400,7 +441,9 @@ test("Test 14.18 (F4): verify transitions COMMITTED_UNVERIFIED exactly once, app
   store.recordCommitReceipt("q1", original);
   const digestBefore = store.get("q1")!.commit_receipt_identity_digest;
 
-  const verified = store.verifyCommitReceipt("q1", { status: "OK" }, makeUnverifiedReceipt());
+  // PR #8 correction C1 (disclosed call update): the transition
+  // takes VerificationEvidence, not a bare verdict.
+  const verified = store.verifyCommitReceipt("q1", makeEvidence(original) as never, makeUnverifiedReceipt());
   assert.equal(verified.status, "COMMITTED");
   assert.equal(verified.outcome, "COMMITTED_AND_VERIFIED");
   assert.equal(verified.reconciliation.status, "OK");
@@ -409,7 +452,7 @@ test("Test 14.18 (F4): verify transitions COMMITTED_UNVERIFIED exactly once, app
   assert.equal(q.commit_receipt_identity_digest, digestBefore, "digest is computed over the recorded fields and is stable across the transition");
   assert.equal(q.commit_receipt_recorded?.status, "COMMITTED_UNVERIFIED", "the recorded original is preserved");
   assert.equal(q.commit_receipt_verifications?.length, 1);
-  assert.throws(() => store.verifyCommitReceipt("q1", { status: "OK" }), /only a COMMITTED_UNVERIFIED record can transition/);
+  assert.throws(() => store.verifyCommitReceipt("q1", makeEvidence(original) as never), /only a COMMITTED_UNVERIFIED record can transition/);
   assert.equal(store.get("q1")!.commit_receipt_verifications?.length, 1, "exactly one transition");
 });
 
@@ -420,7 +463,10 @@ test("Test 14.19 (F4): a verification presented under a conflicting identity tra
   const foreign = makeUnverifiedReceipt({
     committedEffect: { immediate: { net: 4242 }, recurring: { resultingAmount: 5000, currency: "usd" } },
   });
-  assert.throws(() => store.verifyCommitReceipt("q1", { status: "OK" }, foreign), isConflict);
+  assert.throws(
+    () => store.verifyCommitReceipt("q1", makeEvidence(store.get("q1")!.commit_receipt!) as never, foreign),
+    isConflict
+  );
   assert.equal(store.get("q1")!.commit_receipt?.reconciliation.status, "UNVERIFIED");
   assert.equal(store.get("q1")!.commit_receipt_verifications, undefined);
 });
@@ -428,21 +474,26 @@ test("Test 14.19 (F4): a verification presented under a conflicting identity tra
 test("Test 14.20 (F4): a verification must carry a determined reconciliation; a verified-class receipt cannot transition", () => {
   const store = new QuoteStore();
   store.put(makeQuote("q1"));
-  store.recordCommitReceipt("q1", makeUnverifiedReceipt());
+  const unverified = makeUnverifiedReceipt();
+  store.recordCommitReceipt("q1", unverified);
   assert.throws(
     () =>
       store.verifyCommitReceipt("q1", {
-        status: "UNVERIFIED",
-        reason: "still unknown",
-        undeterminedDimensions: ["immediateFinancialEffect"],
-      }),
+        ...(makeEvidence(unverified) as Record<string, unknown>),
+        reconciliation: {
+          status: "UNVERIFIED",
+          reason: "still unknown",
+          undeterminedDimensions: ["immediateFinancialEffect"],
+        },
+      } as never),
     /determined reconciliation/
   );
 
   const store2 = new QuoteStore();
   store2.put(makeQuote("q1"));
-  store2.recordCommitReceipt("q1", makeReceipt());
-  assert.throws(() => store2.verifyCommitReceipt("q1", { status: "OK" }), /only a COMMITTED_UNVERIFIED/);
+  const verifiedReceipt = makeReceipt();
+  store2.recordCommitReceipt("q1", verifiedReceipt);
+  assert.throws(() => store2.verifyCommitReceipt("q1", makeEvidence(verifiedReceipt) as never), /only a COMMITTED_UNVERIFIED/);
 });
 
 test("Test 14.21 (CORE-8): commit outcomes are recorded for no-receipt classes too, and UNVERIFIED receipts are enumerable", () => {
