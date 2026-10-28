@@ -456,6 +456,7 @@ export function determinacyOf(effect: CommercialEffect): {
 export type DeterminacyAuditFinding =
   | "WOULD_REFUSE_UNKNOWN"
   | "INVALID_DETERMINED_VALUE"
+  | "MISSING_PROVENANCE"
   | "UNJUSTIFIED_NOT_APPLICABLE"
   | "MISSING_ACTION_CONTEXT"
   | "MISSING_APPLICABILITY_PROVENANCE";
@@ -503,6 +504,27 @@ function auditOneEffect(
       // would otherwise drift through a bound comparison silently:
       // every comparison with NaN is false.)
       findings.add("INVALID_DETERMINED_VALUE");
+      return;
+    }
+    // PR #8 review correction C4: a finite number alone is not
+    // verification. A DETERMINED dimension must carry supporting
+    // provenance — the dimension's own provenance note
+    // (provenance.immediate / provenance.recurring), or, on a
+    // committed effect, an established committedSource (anything
+    // other than "unestablished"). Provenance is reported ONLY for
+    // otherwise-valid determined values (an invalid value reports
+    // INVALID_DETERMINED_VALUE alone), and never for UNKNOWN
+    // dimensions (already WOULD_REFUSE_UNKNOWN) or NOT_APPLICABLE
+    // assertions (whose provenance mechanism is the applicability
+    // citation, checked below).
+    const dimensionProvenance =
+      dimension === "immediateFinancialEffect" ? effect.provenance?.immediate : effect.provenance?.recurring;
+    const committedSource = effect.provenance?.committedSource;
+    const hasProvenance =
+      (typeof dimensionProvenance === "string" && dimensionProvenance.length > 0) ||
+      (committedSource !== undefined && committedSource !== "unestablished");
+    if (!hasProvenance) {
+      findings.add("MISSING_PROVENANCE");
     }
     return;
   }

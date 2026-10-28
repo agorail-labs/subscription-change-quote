@@ -390,6 +390,55 @@ export type CommittedFigureSource =
   | "unestablished";
 
 /**
+ * v0.6.2 (CORE-8, PR #8 review correction C1): the evidence required
+ * to transition a COMMITTED_UNVERIFIED receipt to verified. The
+ * transition NEVER happens on a caller-supplied verdict alone: a
+ * bare "OK"/"VIOLATED" is an assertion, not evidence. The presenter
+ * must supply the material the verdict was computed FROM, and the
+ * store validates that material against the stored record before
+ * transitioning:
+ *
+ *  - `committedEffect` — the committed figures as INDEPENDENTLY
+ *    re-derived (from provider actuals, after the fact). Their
+ *    identity amounts (immediate.net, recurring.resultingAmount)
+ *    must equal the amounts recorded on the receipt at commit
+ *    time: those recorded actuals are what is being verified. (A
+ *    VIOLATED outcome is expressed through `reconciliation`, not
+ *    by substituting different figures: the actuals legitimately
+ *    differ from the QUOTE, never from the record of themselves.)
+ *  - `committedSource` — the provenance of those figures. Must be
+ *    an independently reconcilable source ("provider_actual" or
+ *    "defined_equal_exact"); estimate-derived or quote-shared
+ *    provenance ("pre_mutation_estimate", "revalidated_preview",
+ *    "unestablished") is refused — the same rule reconciliation
+ *    applies to committed figures generally.
+ *  - `stateVerification` — the post-commit state-verification
+ *    result under the §6.12 contract (VERIFIED / MISMATCH /
+ *    UNVERIFIABLE). Only VERIFIED can support a transition.
+ *  - `reconciliation` — the outcome computed FROM the inputs
+ *    above (OK or VIOLATED; never UNVERIFIED). The store
+ *    recomputes the reconciliation from the recorded quoted
+ *    effect, the evidence's committed figures, and the quote's
+ *    acceptance envelope, and refuses evidence whose claimed
+ *    outcome contradicts that recomputation.
+ *
+ * A successful transition ends in exactly one of two terminal
+ * shapes, both with outcome COMMITTED_AND_VERIFIED (the figures
+ * ARE established — verified means measured): reconciliation OK
+ * (verified within envelope), or reconciliation VIOLATED
+ * (verified-with-violation — established actuals outside the
+ * envelope; never reportable as OK).
+ */
+export type VerificationEvidence = {
+  committedEffect: CommercialEffect;
+  committedSource: CommittedFigureSource;
+  stateVerification: "VERIFIED" | "MISMATCH" | "UNVERIFIABLE";
+  reconciliation: ReconciliationResult;
+  /** When the verification was performed (ISO timestamp); defaults to the transition time. */
+  at?: string;
+};
+
+/**
  * v0.4/v0.5, unchanged: per-dimension guarantee coverage. See file header
  * (v0.4 rationale) for what each dimension means.
  */
