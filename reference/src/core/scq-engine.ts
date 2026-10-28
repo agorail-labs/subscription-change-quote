@@ -11,13 +11,24 @@ import {
   type ChangeAction,
   type ChangeSpec,
   type CommercialEffect,
+  type DimensionState,
   type EffectiveIntent,
+  type FinancialDimension,
   type GuaranteeCoverage,
   type GuaranteeMode,
   type MultiChangeConsistency,
+  type ReconciliationResult,
   type SubscriptionChangeProposal,
   type SubscriptionChangeReceipt,
 } from "./types.js";
+
+// v0.6.2 (CORE-4): `ReconciliationResult` is defined ONCE, in
+// types.ts, and re-exported here for import compatibility. Before
+// v0.6.2 this module carried a duplicate local definition of the
+// same type; the two were structurally identical, so TypeScript
+// accepted assignments between them, but widening only one (as
+// CORE-4 does) would have silently forked them.
+export type { ReconciliationResult } from "./types.js";
 import type { QuoteStore, StoredQuote } from "../store/quote-store.js";
 
 /**
@@ -181,11 +192,13 @@ export function checkAcceptanceEnvelope(
  * reconciliation failure is returned as a property on a normal receipt
  * (`reconciliation`), not thrown, because the commit already happened and
  * the caller needs the mutated state regardless.
+ *
+ * (The `ReconciliationResult` type itself lives in types.ts — see the
+ * re-export at the top of this file. Its v0.6.2 UNVERIFIED variant is
+ * produced by adapter-side committed-effect construction and, in a
+ * later v0.6.2 step, by a reworked reconciliation gate; THIS
+ * function's v0.6.1 verdict behavior is unchanged.)
  */
-export type ReconciliationResult =
-  | { status: "OK" }
-  | { status: "VIOLATED"; reason: string };
-
 export function reconcileCommittedEffect(
   quoted: CommercialEffect,
   committed: CommercialEffect,
@@ -411,4 +424,146 @@ export function enforceEffectiveIntent(intent: EffectiveIntent, supportedTypes: 
       { requestedType: intent.type, supportedTypes }
     );
   }
+}
+
+/**
+ * v0.6.2 (CORE-9, exported for audit/migration tooling): the legacy
+ * reading of a CommercialEffect's determinacy. An absent determinacy
+ * map — or an absent entry in it — reads UNKNOWN, never
+ * grandfathered: legacy (v0.6.1) numbers were produced by code paths
+ * that zero-filled absent dimensions and, in places, conflated
+ * economically different quantities, so the mere presence of a
+ * number is not provenance. This function is the single place that
+ * reading lives.
+ *
+ * PR-1 note: in this step the reading is consumed ONLY by
+ * `auditDeterminacy` below (report-only). No enforcement or
+ * reconciliation path reads it yet; wiring it into
+ * `checkAcceptanceEnvelope` / `reconcileCommittedEffect` is the
+ * separately gated fail-closed activation step (BC-1), and those
+ * functions' v0.6.1 behavior is unchanged here.
+ */
+export function determinacyOf(effect: CommercialEffect): {
+  immediateFinancialEffect: DimensionState;
+  recurringFinancialEffect: DimensionState;
+} {
+  return {
+    immediateFinancialEffect: effect.determinacy?.immediateFinancialEffect ?? "UNKNOWN",
+    recurringFinancialEffect: effect.determinacy?.recurringFinancialEffect ?? "UNKNOWN",
+  };
+}
+
+export type DeterminacyAuditFinding =
+  | "WOULD_REFUSE_UNKNOWN"
+  | "INVALID_DETERMINED_VALUE"
+  | "UNJUSTIFIED_NOT_APPLICABLE"
+  | "MISSING_ACTION_CONTEXT"
+  | "MISSING_APPLICABILITY_PROVENANCE";
+
+export type DeterminacyAuditEntry = {
+  dimension: FinancialDimension;
+  quotedState: DimensionState;
+  comparedState: DimensionState;
+  findings: DeterminacyAuditFinding[];
+};
+
+const AUDIT_DIMENSIONS: FinancialDimension[] = ["immediateFinancialEffect", "recurringFinancialEffect"];
+
+/**
+ * The v0.6.2 applicability table (spec §3.10): which dimensions an
+ * action may legitimately assert NOT_APPLICABLE for. Only CANCEL's
+ * immediate dimension is eligible — CANCEL is the one action a
+ * provider model may define as purely prospective (effective at term
+ * end, with no immediate financial event by rule). `recurring` is
+ * never NOT_APPLICABLE for any action: every supported action leaves
+ * a post-change price level (for CANCEL, zero — a DETERMINED zero,
+ * not an absence). An action with no entry here licenses nothing
+ * (fail closed).
+ */
+function applicabilityLicensed(action: string, dimension: FinancialDimension): boolean {
+  return action === "CANCEL" && dimension === "immediateFinancialEffect";
+}
+
+function auditDimensionValue(effect: CommercialEffect, dimension: FinancialDimension): unknown {
+  return dimension === "immediateFinancialEffect" ? effect.immediate?.net : effect.recurring?.resultingAmount;
+}
+
+function auditOneEffect(
+  effect: CommercialEffect,
+  dimension: FinancialDimension,
+  action: string | undefined,
+  findings: Set<DeterminacyAuditFinding>
+): void {
+  const state = determinacyOf(effect)[dimension];
+  if (state === "DETERMINED") {
+    const value = auditDimensionValue(effect, dimension);
+    if (typeof value !== "number" || !Number.isFinite(value)) {
+      // A DETERMINED assertion over a missing, non-numeric, NaN, or
+      // infinite value is not a determined value. (An unvalidated NaN
+      // would otherwise drift through a bound comparison silently:
+      // every comparison with NaN is false.)
+      findings.add("INVALID_DETERMINED_VALUE");
+    }
+    return;
+  }
+  if (state === "NOT_APPLICABLE") {
+    // Justification preconditions, in order (findings-closure F2):
+    // context, then license, then citation — the first failing
+    // precondition is the finding.
+    if (!action) {
+      findings.add("MISSING_ACTION_CONTEXT");
+      return;
+    }
+    if (!applicabilityLicensed(action, dimension)) {
+      findings.add("UNJUSTIFIED_NOT_APPLICABLE");
+      return;
+    }
+    const citation = effect.provenance?.applicabilityCitations?.[dimension];
+    if (!citation || citation.action !== action || citation.dimension !== dimension) {
+      findings.add("MISSING_APPLICABILITY_PROVENANCE");
+    }
+    return;
+  }
+  // UNKNOWN — including a legacy payload's absent determinacy, and
+  // any unrecognized state value at runtime.
+  findings.add("WOULD_REFUSE_UNKNOWN");
+}
+
+/**
+ * v0.6.2 TRANSITIONAL determinacy audit (implementation plan §A.2) —
+ * NON-NORMATIVE, report-only diagnostic tooling. It computes, per
+ * financial dimension, exactly what the v0.6.2 fail-closed envelope
+ * guard WOULD refuse about a (quoted, compared) effect pair, and
+ * changes no verdict: it never throws on malformed payloads, it
+ * mutates nothing, `checkAcceptanceEnvelope` does not call it, and
+ * nothing in any commit/enforcement path may branch on its output.
+ * Its purpose is pre-activation migration gating: adapter migrations
+ * run it over their conformance fixtures in CI, and a migrated
+ * adapter's fixtures must produce no findings (except where a
+ * finding is the fixture's asserted expectation). It is never
+ * serialized and never part of a receipt.
+ *
+ * `action` is the authoritative action of the proposal under
+ * evaluation (from the proposal record, never from either effect's
+ * self-assertion); omit it when no action context is established —
+ * a NOT_APPLICABLE assertion then reports MISSING_ACTION_CONTEXT.
+ */
+export function auditDeterminacy(
+  quoted: CommercialEffect,
+  compared: CommercialEffect,
+  action?: string
+): DeterminacyAuditEntry[] {
+  return AUDIT_DIMENSIONS.map((dimension) => {
+    const findings = new Set<DeterminacyAuditFinding>();
+    auditOneEffect(quoted, dimension, action, findings);
+    auditOneEffect(compared, dimension, action, findings);
+    const quotedStates = determinacyOf(quoted);
+    const comparedStates = determinacyOf(compared);
+    return {
+      dimension,
+      quotedState: quotedStates[dimension],
+      comparedState: comparedStates[dimension],
+      findings: Array.from(findings),
+    };
+  });
 }
