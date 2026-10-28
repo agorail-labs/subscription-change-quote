@@ -77,13 +77,57 @@ export type StripeSubscription = {
   cancel_at_period_end: boolean;
   canceled_at?: number;
   latest_invoice?: string;
+  /**
+   * v0.6.2 (PR-3): pre-existing customer credit balance, in minor
+   * units — a CUSTOMER-level payment attribute (modeled on the
+   * subscription record here only because this sim has no Customer
+   * object). It is applied against invoice amounts due; it is NOT
+   * subscription state, never enters the fingerprint, and never
+   * changes what a change itself incurs. Modeled as a standing
+   * fixture attribute: previews/updates report how much WOULD be
+   * applied, but the sim does not deplete it (balance-ledger
+   * lifecycle is out of scope for this model).
+   */
+  customer_balance?: number;
 };
 
 export type UpcomingInvoicePreview = {
-  amount_due: number; // signed net for this preview (can be negative = credit)
+  /**
+   * v0.6.2 (PR-3) — the preview's figures are SPLIT by economic
+   * meaning (previously `amount_due` was the bare proration total,
+   * which let the adapter conflate a payment figure with an
+   * incurred obligation):
+   *
+   * `incurred_amount` is the net obligation the PROPOSED CHANGE
+   * itself incurs at its effective time — here, the sum of the
+   * line items the change generates (proration lines; this sim
+   * generates no other line kinds). Optional because fault
+   * injection can withhold it from previews (see
+   * `_debugOmitIncurredAmount`): an absent figure means the
+   * preview cannot establish the incurred amount at all.
+   */
+  incurred_amount?: number;
+  /**
+   * The portion of the subscription's pre-existing
+   * `customer_balance` that would be applied against this
+   * invoice. Credits reduce what is DUE; they never change the
+   * incurred obligation or any price.
+   */
+  customer_balance_applied: number;
+  /**
+   * The PAYMENT figure: `incurred_amount - customer_balance_applied`
+   * (can be negative when the change itself nets to a credit).
+   * This is what a customer would be charged for the upcoming
+   * invoice — it is NOT the obligation the change incurs, and
+   * must never be mapped into an SCQ `immediate` effect.
+   */
+  amount_due: number;
   lines: Array<{ description: string; amount: number; proration: boolean }>;
   next_period_recurring_amount: number;
 };
+
+/** An invoice object as persisted by `update()` and read back via `retrieveInvoice()`. */
+export type StripeInvoice = UpcomingInvoicePreview & { id: string };
 
 type ProrationBehavior = "create_prorations" | "none" | "always_invoice";
 
@@ -95,7 +139,18 @@ const PRICE_CATALOG: Record<string, StripePrice> = {
 
 export class StripeSim {
   private subs = new Map<string, StripeSubscription>();
+  private invoices = new Map<string, StripeInvoice>();
   private now: number; // unix seconds, mutable so tests can simulate time passing
+
+  // v0.6.2 (PR-3) fault-injection hooks (migration matrix F-6: the
+  // conformance suite needs negative cases the happy-path model
+  // cannot produce). All default off; tests set them explicitly.
+  /** When true, previews return WITHOUT `incurred_amount` — the preview cannot establish the incurred obligation. Generated invoices are unaffected: the flag models a sparse PREVIEW, not a sparse invoice. */
+  _debugOmitIncurredAmount = false;
+  /** When true, `retrieveInvoice` throws — the post-commit invoice read is unavailable, so committed finances cannot be independently verified. */
+  _debugFailInvoiceReads = false;
+  /** When true, the next `update()` fully applies the mutation and persists its invoice, then throws an `api_connection_error` — a response lost AFTER the mutation landed. One-shot: the flag clears itself. */
+  _debugLoseNextUpdateResponse = false;
 
   constructor(nowUnixSeconds = Math.floor(Date.now() / 1000)) {
     this.now = nowUnixSeconds;
@@ -140,7 +195,31 @@ export class StripeSim {
     prorationDate?: number
   ): UpcomingInvoicePreview {
     const sub = this.retrieve(subscriptionId);
-    return this.computeInvoice(sub, proposedItems, prorationBehavior, prorationDate);
+    const preview = this.computeInvoice(sub, proposedItems, prorationBehavior, prorationDate);
+    if (this._debugOmitIncurredAmount) {
+      // Fault injection: a sparse preview that cannot establish the
+      // incurred amount. `amount_due` is still reported (it is the
+      // sim's payment figure), which is exactly why it must never
+      // be substituted for the missing incurred figure.
+      const { incurred_amount: _withheld, ...rest } = preview;
+      return rest;
+    }
+    return preview;
+  }
+
+  /**
+   * v0.6.2 (PR-3): reads back an invoice that a prior `update()`
+   * generated and persisted — the post-commit actual read path,
+   * distinct from any preview. Throws `resource_missing` for an
+   * unknown id, and whatever `_debugFailInvoiceReads` injects.
+   */
+  retrieveInvoice(id: string): StripeInvoice {
+    if (this._debugFailInvoiceReads) {
+      throw new StripeSimError("api_error", `Simulated invoice-read failure for ${id} (fault injection)`);
+    }
+    const invoice = this.invoices.get(id);
+    if (!invoice) throw new StripeSimError("resource_missing", `No such invoice: ${id}`);
+    return structuredClone(invoice);
   }
 
   /**
@@ -157,7 +236,7 @@ export class StripeSim {
     proposedItems: Array<{ id?: string; price: string; quantity: number }>,
     prorationBehavior: ProrationBehavior,
     prorationDate?: number
-  ): { subscription: StripeSubscription; invoice: UpcomingInvoicePreview } {
+  ): { subscription: StripeSubscription; invoice: StripeInvoice } {
     const sub = this.subs.get(subscriptionId);
     if (!sub) throw new StripeSimError("resource_missing", `No such subscription: ${subscriptionId}`);
 
@@ -190,9 +269,28 @@ export class StripeSim {
         sub.items.push({ id: `si_${crypto.randomBytes(6).toString("hex")}`, price, quantity: proposed.quantity });
       }
     }
-    sub.latest_invoice = `in_${crypto.randomBytes(6).toString("hex")}`;
+    // The generated invoice is PERSISTED under its id (and the
+    // subscription points at it via latest_invoice) so a caller can
+    // read the mutation's actuals back afterwards via
+    // retrieveInvoice() — a post-commit read, not the preview object.
+    const invoiceId = `in_${crypto.randomBytes(6).toString("hex")}`;
+    const generated: StripeInvoice = { ...invoice, id: invoiceId };
+    this.invoices.set(invoiceId, structuredClone(generated));
+    sub.latest_invoice = invoiceId;
 
-    return { subscription: structuredClone(sub), invoice };
+    if (this._debugLoseNextUpdateResponse) {
+      // Fault injection: everything above HAS landed (items applied,
+      // invoice persisted) — only the response is lost. The caller
+      // cannot distinguish this from a mutation that never ran,
+      // which is precisely the indeterminate case.
+      this._debugLoseNextUpdateResponse = false;
+      throw new StripeSimError(
+        "api_connection_error",
+        "Simulated lost response: the update was applied but its response never reached the caller (fault injection)"
+      );
+    }
+
+    return { subscription: structuredClone(sub), invoice: generated };
   }
 
   cancel(subscriptionId: string, atPeriodEnd: boolean): StripeSubscription {
@@ -214,6 +312,11 @@ export class StripeSim {
    */
   fingerprint(subscriptionId: string): string {
     const sub = this.retrieve(subscriptionId);
+    // Deliberately NOT fingerprinted: `customer_balance` — a
+    // customer-level payment attribute. A balance change alters
+    // future amounts DUE but neither the subscription's state nor
+    // anything a change incurs, so it must not read as subscription
+    // drift to SCQ's precondition check.
     const material = JSON.stringify({
       status: sub.status,
       items: sub.items.map((i) => ({ id: i.id, price: i.price.id, quantity: i.quantity })),
@@ -269,8 +372,21 @@ export class StripeSim {
       if (!touched) nextPeriodRecurring += existing.price.unitAmount * existing.quantity;
     }
 
-    const amount_due = lines.reduce((sum, l) => sum + l.amount, 0);
-    return { amount_due, lines, next_period_recurring_amount: nextPeriodRecurring };
+    // v0.6.2 (PR-3): split the figures by economic meaning. The
+    // lines total is what the CHANGE incurs; the customer's
+    // pre-existing balance is then applied against it to get what
+    // would be DUE. Before this split the sim reported the lines
+    // total AS `amount_due`, which was numerically the incurred
+    // amount wearing a payment figure's name — the conflation the
+    // migration eliminates. Balance is applied only against a
+    // positive incurred amount: a change that nets to a credit
+    // (negative incurred) is a credit, not a payment, and applying
+    // balance against it would misstate both figures.
+    const incurred_amount = lines.reduce((sum, l) => sum + l.amount, 0);
+    const balance = sub.customer_balance ?? 0;
+    const customer_balance_applied = incurred_amount > 0 ? Math.min(balance, incurred_amount) : 0;
+    const amount_due = incurred_amount - customer_balance_applied;
+    return { amount_due, incurred_amount, customer_balance_applied, lines, next_period_recurring_amount: nextPeriodRecurring };
   }
 }
 
