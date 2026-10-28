@@ -98,6 +98,63 @@ If a future run is approved, the smallest live experiment is, in order:
    fallback — is in RECOVERY-AUDIT.md §"Corrected recovery plan".
 3. Everything else in T01–T14 stays mocked until step 2's evidence exists.
 
+## Phase 3 addendum (2026-10-27) — live quoting repaired and revalidated
+
+Phase 3 ran WITH test-site credentials (read/estimate only; commit
+disabled; zero mutations — subscription `resource_version` and item
+state verified identical before and after every live step). Full
+sanitized evidence:
+`~/workspace/scq-live-validation-evidence/PHASE3-RUN-2026-10-27.md`
+(outside this repo).
+
+What changed and why (all findings live-verified on the test site
+`arjunsamplecompany-test`, demo subscription
+`cbdemo__XpbKpmKUbu8d2cPS`):
+
+- **L-GET: LIVE_PASS** (unchanged from the first live run — the
+  adapter's snapshot matched the raw API).
+- **Root causes of the original estimate HTTP 400s, isolated by a
+  18-cell matrix holding all other parameters constant:** (1) the
+  client sent a flat `subscription_id`; the endpoint requires the
+  nested `subscription[id]` — FIXED. (2) The remaining 400 was NOT an
+  encoding error: the field-grouped array encoding is the server's
+  real format (it is also the documented one), and the
+  item-indexed shape is silently IGNORED (HTTP 200 describing a
+  different item set). The 400 is the server's per-item validation:
+  a quantity CHANGE on a flat_fee item is rejected ("This param
+  should not be sent for on_off addon type"). An interim Oct 27
+  report concluded the opposite on encoding from a single 200; the
+  matrix reversed that conclusion, and the resolution also explains
+  the earlier "addon change produced no estimate delta" observation
+  (the change had never reached the server).
+- **Adapter behavior now:** CHANGE_QUANTITY on a flat_fee item is
+  refused before any provider call (UNSUPPORTED_CHANGE);
+  interpretation is per-source with provenance (unbilled/invoice
+  minus credit notes for immediate; provider-stated items or
+  pricing-model-justified computation for recurring — flat_fee never
+  × quantity); next_invoice_estimate is never mapped into the effect
+  (no SCQ v0.6.1 field matches its semantics) and is reported in
+  providerMetadata only; undeterminable dimensions fail closed
+  (QUOTE_NOT_DETERMINISTIC) at quote and commit-revalidation time.
+- **L-QUOTE (per_unit addon 1→21, through the adapter, real API):
+  LIVE_PASS** — immediate 185240 from
+  `unbilled_charge_estimates` (provider proration; time-dependent),
+  recurring 60900 → 80900 (flat_fee 59900 once + per_unit 21 × 1000),
+  coverage REVALIDATE/UNKNOWN (no EXACT).
+- **L-REFUSAL (flat_fee plan quantity 1→21, through the adapter):
+  LIVE-verified refusal** — UNSUPPORTED_CHANGE before any estimate
+  call; the raw provider validation error was reproduced separately
+  in the matrix.
+- **Updated live classifications:** T01-live → LIVE_PASS;
+  T02-live → LIVE_PASS (adapter quote through the real API, addon
+  scenario); T03-live (commit) and T14-live (scheduling) remain
+  BLOCKED — commit and mutations were not authorized or executed.
+- **Tests:** test13 rebuilt from the captured wire shapes (the old
+  fake accepted the client's own encoding and always returned a rich
+  estimate — the reason both bugs were invisible) + 11 Phase 3
+  regression tests. Full clean build: **95 pass / 0 fail** (84 on the
+  rebased pre-fix branch), smoke OK. Frozen files unchanged.
+
 ## Phase 2A re-run (2026-10-27) — claim corrections applied
 
 Phase 2A corrected the simulator-backed Chargebee adapter and Test 11 to
