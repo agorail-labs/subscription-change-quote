@@ -1,10 +1,12 @@
 # SCQ v0.6.1 — Draft Conformance Suite
 
-This document maps the existing test suite (`tests/*.test.ts`, 66 executed test cases across 11
-files, all passing as of the Phase 2A correction; no case in the suite is a live API test) onto
-the normative rules in `scq-v0.6.1-spec.md` §6. (The unpublished combined branch adds the
-experimental live adapter's 18 mocked-transport cases in `test13-chargebee-http.test.ts` —
-84 cases there; test13 belongs to the pending Change B and is not executed by this change.)
+This document maps the existing test suite (`tests/*.test.ts`, 115 executed test cases across
+12 files, all passing on main as of the PR #4 merge; no case in the suite is a live API test)
+onto the normative rules in `scq-v0.6.1-spec.md` §6. The count includes
+`test13-chargebee-http.test.ts` (49 cases), which exercises the experimental Chargebee live
+adapter (Change B, merged as PR #4) over a **mocked transport** whose fixtures are shaped from
+live-captured responses; the live runs themselves are research evidence recorded in
+`research/chargebee-live-v1/`, not tests executed by this suite.
 
 > **Phase 2B note (2026-10-27):** the dated v0.6.1 errata package
 > (`spec/ERRATA-v0.6.1.md`, entries ER-1…ER-4) corrects the spec's
@@ -13,7 +15,16 @@ experimental live adapter's 18 mocked-transport cases in `test13-chargebee-http.
 > factual corrections only; no MUST/MUST NOT, type, definition, or
 > supported action changed, and the published spec file itself is
 > unchanged in this phase (freeze-guard process documented in the
-> errata package §7). The Chargebee scheduling taxonomy table in the
+> errata package §7).
+
+> **Errata application + Change B merge note (2026-10-28):** ER-1…ER-4 are applied
+> in-spec on branch `review/errata-application-v0.6.1` (narrow PR under the
+> `protocol-change-approved` process; machine-checkable zero-obligation-change proof in
+> `research/errata-application/NORMATIVE-DIFF-PROOF.md`) — until that PR is labeled and
+> merged, the published spec on main remains as the Phase 2B note above describes. Change B
+> (the experimental Chargebee live adapter and test13) has merged as PR #4; statements below
+> that described Change B as unpublished or pending predate that merge and have been
+> corrected in place where they describe the current suite. The Chargebee scheduling taxonomy table in the
 > errata package §6 is the canonical classification for every
 > scheduling capability advertised in this repository; the §6.10
 > section below carries the corresponding durability note.
@@ -106,9 +117,9 @@ file — the gap being closed was in AUTOMATED verification, not in an actual de
 **Phase 2A change:** Chargebee previously appeared in this row as an EXACT-capable provider
 whose only EXACT-refusal was termEffect. After the correction, NO Chargebee action in the
 simulator-backed adapter backs an overall EXACT request; refusals name
-`immediateFinancialEffect` first. The experimental live adapter in the
-unpublished Change B refuses identically in its mocked-transport tests (test13, T11);
-test13 is not part of this change.
+`immediateFinancialEffect` first. The experimental live adapter (Change B, merged as PR #4)
+refuses identically in its mocked-transport tests (test13, T11), which are part of the
+suite on main.
 
 **Coverage: full (all 4 providers), including the v0.6-added committed-term CANCEL refusal.**
 
@@ -145,7 +156,7 @@ Low-priority given the shared-type structure, noted for completeness.**
 | Stripe | Test 10a: `effectiveIntent: {type:"DATE"}` refused with `UNSUPPORTED_CHANGE` |
 | Paddle | Test 10b: same |
 | Zuora | Test 10d: `DATE` honored (native future-dating) |
-| Chargebee | Test 11d (Phase 2A CORRECTED): `DATE` REFUSED, and `TERM_END` refused for update-backed actions — the previously claimed `effective_from`-on-update mechanism is not established in current docs; documented scheduling paths are deprecated toward Early-Access Ramps, which no adapter here implements. `TERM_END` remains honored for CANCEL only (separate endpoint, deprecated-but-documented, historically observed). Experimental live adapter (unpublished Change B): its mocked-transport test T14 refuses both — not part of this change. |
+| Chargebee | Test 11d (Phase 2A CORRECTED): `DATE` REFUSED, and `TERM_END` refused for update-backed actions — the previously claimed `effective_from`-on-update mechanism is not established in current docs; documented scheduling paths are deprecated toward Early-Access Ramps, which no adapter here implements. `TERM_END` remains honored for CANCEL only (separate endpoint, deprecated-but-documented, historically observed). Experimental live adapter (Change B, merged as PR #4): its mocked-transport test T14 refuses both. |
 
 **Coverage: full for the DATE-refusal / DATE-acceptance split (DATE is now refused by
 Stripe, Paddle, AND Chargebee, and honored only by Zuora). GAP: no test explicitly
@@ -205,8 +216,8 @@ reconciles provider state after an indeterminate outcome before attempting any f
 mutation. The reference implementation's in-memory `QuoteStore` does NOT establish the
 rule across crashes — after a restart adapters fail closed (safe, but not replay
 conformance); that fail-closed behavior (rather than replay) is what the experimental
-live adapter's mocked-transport test demonstrates in the unpublished Change B
-(test13 T13) — no test in this change executes it. Provider-native idempotency is not indefinite: Chargebee's documented native
+live adapter's mocked-transport test demonstrates in test13 T13 (Change B, merged as
+PR #4 and executed by the suite on main). Provider-native idempotency is not indefinite: Chargebee's documented native
 window is 30 minutes. Nothing in this suite's passing replay tests should be read as
 evidence of durable exactly-once behavior.
 
@@ -277,14 +288,14 @@ continuity with the prior cycle's record.
 - **G-4 (CLOSED, v0.6.1)**: Paddle now has dedicated multi-change positive (Test 12i) and
   negative (Test 12j) tests, matching Stripe/Zuora/Chargebee.
 - **G-5 (NEW, v0.6.1; partially narrowed since)**: Idempotent commit replay (§6.10) is exercised
-  end-to-end through Stripe and Paddle, and — on the unpublished combined branch only —
-  through the live-shaped Chargebee adapter (test13 T06, mocked transport; test13 belongs
-  to the pending Change B and is not executed by this change) — but not through Zuora or
+  end-to-end through Stripe and Paddle, and through the live-shaped Chargebee adapter
+  (test13 T06, mocked transport; test13 merged as PR #4 and is executed by the suite on
+  main) — but not through Zuora or
   the simulator-backed Chargebee adapter. The underlying mechanism is shared engine/store
   code identical across all adapters,
   so this remains analogous in shape to the now-closed G-4, not a known per-provider behavioral
   difference. Separately, replay's durability limit (in-memory store; restart fails closed)
-  is exercised by test13 T13 in the unpublished Change B.
+  is exercised by test13 T13 (merged as PR #4).
 - **G-6 (NEW, v0.6.1)**: No test drives an actual `reconciliation: {status:"VIOLATED"}` result
   through a real adapter's end-to-end `commitChangeQuote` call (only through the isolated engine
   function, Test 12b). Doing so requires a TOCTOU-style concurrent-write injection targeting the

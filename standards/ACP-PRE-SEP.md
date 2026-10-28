@@ -405,11 +405,11 @@ The model has been exercised across four different provider shapes:
 - Zuora
 - Chargebee
 
-The v0.6.1 hardening report contained 66 passing tests; the suite on the unpublished combined validation branch has since grown to 84 with the mocked-transport Chargebee live-validation tests (those tests are pending publication as the separate Change B; the suite in this change is 66; none of them is a live API test).
+The v0.6.1 hardening report contained 66 passing tests; the suite on main has since grown to 115 with the mocked-transport Chargebee live-validation tests (test13), published as Change B and merged in PR #4. None of the suite's tests is itself a live API test; separately, the experimental adapter those tests exercise was validated live for retrieval and quote generation on a Chargebee test site in Phase 3/4 (live commit not validated — see research/chargebee-live-v1/).
 
 Evidence quality differs by provider and should remain explicit:
 
-- **Chargebee:** limited historical live test-site observations were made in a prior cycle for some scenarios (see research/EVIDENCE.md, including its Phase 2A correction note); this is not a validation of the current adapters, and no live testing was performed in the most recent cycles.
+- **Chargebee:** limited historical live test-site observations were made in a prior cycle for some scenarios (see research/EVIDENCE.md, including its Phase 2A correction note); those observations are not a validation of any adapter. In the most recent cycles (Phase 3/4), the experimental Chargebee live adapter was additionally validated live — retrieval and quote generation only — against a real test site; live commit was not validated.
 - **Stripe / Paddle / Zuora:** documentation-backed simulator/reference-adapter research; not represented as live API validation.
 
 One Chargebee scenario — cancellation under an enabled Contract Terms feature — remains `UNVERIFIED` because the available test site did not have that feature enabled.
