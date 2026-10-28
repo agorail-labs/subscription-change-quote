@@ -780,6 +780,162 @@ test("Test 13-rec4 (PR #4 review): a complete ACTUAL response is recorded with t
   assert.equal(store.get(quote.id)?.commit_receipt, receipt);
 });
 
+test("Test 13-rec5 (PR #4 final review, Fix A): post-commit re-read OMITS subscription_items entirely — INDETERMINATE, no receipt, recurring is never a verified 0", async () => {
+  const fake = new FakeChargebee();
+  const store = new QuoteStore();
+  let updateApplied = false;
+  const omitItems: HttpTransport = async (req) => {
+    const res = await fake.transport(req);
+    if (req.method === "POST" && req.url.includes("/update_for_items")) updateApplied = true;
+    if (updateApplied && req.method === "GET" && req.url.includes("/subscriptions/") && res.json) {
+      const j = structuredClone(res.json) as any;
+      delete j.subscription.subscription_items; // the member is ABSENT from the re-read — not an empty list, not a zero
+      return { ...res, json: j };
+    }
+    return res;
+  };
+  const client = new ChargebeeClient({ site: "scq-test", apiKey: "test_key_redacted" }, omitItems);
+  const adapter = new ChargebeeLiveAdapter(client, store, { liveCommitEnabled: true });
+  const quote = await adapter.createChangeQuote("cb_live_test_1", qtyProposal());
+  await assert.rejects(
+    () => adapter.commitChangeQuote(quote.id),
+    (e: unknown) => e instanceof SCQError && e.code === "PROVIDER_ERROR" && (e as any).details?.indeterminate === true,
+    "an absent post-commit item collection is UNDETERMINED — the pre-fix `?? []` default summed it vacuously to recurringAmount = 0 and recorded a receipt against that invented zero",
+  );
+  assert.equal(fake.mutationCount, 1, "the mutation itself was issued (the refusal is about verifiability)");
+  assert.equal(store.get(quote.id)?.commit_receipt, undefined, "no receipt may carry a recurring figure derived from an absent collection");
+  assert.notEqual(store.get(quote.id)?.status, "COMMITTED");
+});
+
+test("Test 13-rec6 (PR #4 final review, Fix A): an item with a stated amount of exactly 0 in a complete, intended-matching set is a DETERMINED zero — receipt records it", async () => {
+  const fake = new FakeChargebee({
+    id: "cb_live_zero_1",
+    items: [
+      { item_price_id: "seat-basic-monthly", item_type: "plan", quantity: 100, unit_price: 1000, amount: 100000, free_quantity: 0 },
+      { item_price_id: "onoff-addon-monthly", item_type: "addon", quantity: 1, unit_price: 500, amount: 500, free_quantity: 0 },
+    ],
+  });
+  const store = new QuoteStore();
+  let updateApplied = false;
+  const zeroAddon: HttpTransport = async (req) => {
+    const res = await fake.transport(req);
+    if (req.method === "POST" && req.url.includes("/update_for_items")) updateApplied = true;
+    if (updateApplied && req.method === "GET" && req.url.includes("/subscriptions/") && res.json) {
+      const j = structuredClone(res.json) as any;
+      // The provider re-read states the addon's amount as literally 0
+      // (e.g. fully discounted in the new term). IDs and quantities are
+      // untouched: the observed set is complete and matches the intent.
+      for (const it of j.subscription.subscription_items) if (it.item_price_id === "onoff-addon-monthly") it.amount = 0;
+      return { ...res, json: j };
+    }
+    return res;
+  };
+  const client = new ChargebeeClient({ site: "scq-test", apiKey: "test_key_redacted" }, zeroAddon);
+  const adapter = new ChargebeeLiveAdapter(client, store, { liveCommitEnabled: true });
+  const quote = await adapter.createChangeQuote("cb_live_zero_1", qtyProposal());
+  assert.equal(quote.commercialEffect.recurring?.resultingAmount, 120500, "quote: 120000 per-unit plan + the flat_fee addon at its fixed 500");
+  const receipt = await adapter.commitChangeQuote(quote.id);
+  assert.equal(receipt.status, "COMMITTED", "an explicitly stated 0 must not be refused as if it were missing data");
+  assert.equal(receipt.committedEffect.recurring?.resultingAmount, 120000, "committed recurring = 120000 + the addon's explicitly stated 0 — a determined zero, included in the sum");
+  assert.equal(receipt.committedEffect.immediate?.net, 20000);
+  assert.equal(store.get(quote.id)?.commit_receipt, receipt);
+});
+
+test("Test 13-rec7 (PR #4 final review, Fix B): update returns HTTP 200 success-shaped but the provider SILENTLY IGNORED the change — INDETERMINATE, no receipt", async () => {
+  const fake = new FakeChargebee();
+  const store = new QuoteStore();
+  const silentIgnore: HttpTransport = async (req) => {
+    if (req.method === "POST" && req.url.includes("/update_for_items")) {
+      // A 200 with plausible financials that EXACTLY satisfy the
+      // envelope (20000, matching the estimate) — but the provider
+      // never applied anything: its stored state is untouched.
+      return { status: 200, headers: {}, json: { subscription: structuredClone(fake.sub), unbilled_charges: [{ amount: 20000 }] } };
+    }
+    return fake.transport(req);
+  };
+  const client = new ChargebeeClient({ site: "scq-test", apiKey: "test_key_redacted" }, silentIgnore);
+  const adapter = new ChargebeeLiveAdapter(client, store, { liveCommitEnabled: true });
+  const quote = await adapter.createChangeQuote("cb_live_test_1", qtyProposal());
+  await assert.rejects(
+    () => adapter.commitChangeQuote(quote.id),
+    (e: unknown) => e instanceof SCQError && e.code === "PROVIDER_ERROR" && (e as any).details?.indeterminate === true && Array.isArray((e as any).details?.itemSetMismatches),
+    "the re-read shows quantity 100, not the intended 120 — financial agreement cannot substitute for the item set actually landing",
+  );
+  assert.equal(fake.mutationCount, 0, "the provider in fact never mutated — a COMMITTED receipt here would have been a fabrication");
+  assert.equal(store.get(quote.id)?.commit_receipt, undefined);
+  assert.notEqual(store.get(quote.id)?.status, "COMMITTED");
+});
+
+test("Test 13-rec8 (PR #4 final review, Fix B): update partially applies — re-read quantity is 110, not the intended 120 — INDETERMINATE, no receipt", async () => {
+  const fake = new FakeChargebee();
+  const store = new QuoteStore();
+  let updateApplied = false;
+  const partialApply: HttpTransport = async (req) => {
+    const res = await fake.transport(req);
+    if (req.method === "POST" && req.url.includes("/update_for_items")) updateApplied = true;
+    if (updateApplied && req.method === "GET" && req.url.includes("/subscriptions/") && res.json) {
+      const j = structuredClone(res.json) as any;
+      for (const it of j.subscription.subscription_items) if (it.item_price_id === "seat-basic-monthly") { it.quantity = 110; it.amount = 110000; }
+      return { ...res, json: j };
+    }
+    return res;
+  };
+  const client = new ChargebeeClient({ site: "scq-test", apiKey: "test_key_redacted" }, partialApply);
+  const adapter = new ChargebeeLiveAdapter(client, store, { liveCommitEnabled: true });
+  const quote = await adapter.createChangeQuote("cb_live_test_1", qtyProposal());
+  await assert.rejects(
+    () => adapter.commitChangeQuote(quote.id),
+    (e: unknown) => e instanceof SCQError && e.code === "PROVIDER_ERROR" && (e as any).details?.indeterminate === true && (e as any).details?.itemSetMismatches?.some((m: string) => m.includes("quantity mismatch")),
+    "a partially applied change (110 of 120) must not be silently accepted as the intended commit",
+  );
+  assert.equal(fake.mutationCount, 1);
+  assert.equal(store.get(quote.id)?.commit_receipt, undefined);
+  assert.notEqual(store.get(quote.id)?.status, "COMMITTED");
+});
+
+test("Test 13-rec9 (PR #4 final review, Fix B): re-read shows an EXTRA item, and (separately) a DUPLICATED entry — both INDETERMINATE, no receipt", async () => {
+  const run = async (doctor: (items: any[]) => void) => {
+    const fake = new FakeChargebee();
+    const store = new QuoteStore();
+    let updateApplied = false;
+    const transport: HttpTransport = async (req) => {
+      const res = await fake.transport(req);
+      if (req.method === "POST" && req.url.includes("/update_for_items")) updateApplied = true;
+      if (updateApplied && req.method === "GET" && req.url.includes("/subscriptions/") && res.json) {
+        const j = structuredClone(res.json) as any;
+        doctor(j.subscription.subscription_items);
+        return { ...res, json: j };
+      }
+      return res;
+    };
+    const client = new ChargebeeClient({ site: "scq-test", apiKey: "test_key_redacted" }, transport);
+    const adapter = new ChargebeeLiveAdapter(client, store, { liveCommitEnabled: true });
+    const quote = await adapter.createChangeQuote("cb_live_test_1", qtyProposal());
+    await assert.rejects(
+      () => adapter.commitChangeQuote(quote.id),
+      (e: unknown) => e instanceof SCQError && e.code === "PROVIDER_ERROR" && (e as any).details?.indeterminate === true && Array.isArray((e as any).details?.itemSetMismatches),
+    );
+    assert.equal(store.get(quote.id)?.commit_receipt, undefined);
+    assert.notEqual(store.get(quote.id)?.status, "COMMITTED");
+  };
+  await run((items) => { items.push({ item_price_id: "perunit-addon-monthly", item_type: "addon", quantity: 3, unit_price: 1000, amount: 3000, free_quantity: 0 }); });
+  await run((items) => { items.push({ ...items[0] }); });
+});
+
+test("Test 13-rec10 (PR #4 final review, Fix B positive control): re-read matches the intended set exactly — the COMMITTED receipt records as before", async () => {
+  const fake = new FakeChargebee();
+  const store = new QuoteStore();
+  const adapter = makeAdapter(fake, { store });
+  const quote = await adapter.createChangeQuote("cb_live_test_1", qtyProposal());
+  const receipt = await adapter.commitChangeQuote(quote.id);
+  assert.equal(receipt.status, "COMMITTED");
+  assert.equal(receipt.committedEffect.recurring?.resultingAmount, 120000, "actual post-commit recurring from the verified item set");
+  assert.equal(receipt.committedEffect.immediate?.net, 20000, "actual immediate from the update response");
+  assert.deepEqual(receipt.reconciliation, { status: "OK" });
+  assert.equal(store.get(quote.id)?.commit_receipt, receipt);
+  assert.equal(fake.mutationCount, 1);
+});
+
 // ---------- T01–T14 (mocked transport; classifications in TEST-RESULTS.md) ----------
 
 test("T01 (SIMULATED_PASS): initial subscription read produces an accurate normalized snapshot", async () => {

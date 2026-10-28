@@ -129,6 +129,22 @@
 //       lost-response commits no longer yield receipts in this
 //       adapter (state landing is verified and reported in the
 //       error). Live commit remains disabled throughout.
+//     * PR #4 FINAL REVIEW FIXES (2026-10-28, mocked — no live
+//       calls): (c) an ABSENT post-commit subscription_items member
+//       (or an explicitly empty collection, or an incomplete item
+//       entry) makes the committed recurring dimension UNDETERMINED
+//       — the earlier `?? []` default summed an absent collection
+//       vacuously to a verified-looking recurringAmount of 0.
+//       Explicitly observed zeros are preserved: an item whose
+//       stated amount is literally 0 contributes a legitimate 0.
+//       (d) A COMMITTED receipt is issued ONLY after the re-read
+//       post-commit item set is verified to establish the intended
+//       target set (same item_price_id multiset, equal quantities)
+//       AND the actual financial outcome is determined. A provider
+//       response of HTTP 200 that silently ignores or partially
+//       applies the requested item change therefore yields an
+//       indeterminate refusal and no receipt, even when the
+//       financial figures would satisfy the envelope.
 //   - SCHEDULED CHANGES / MANDATORY ADDONS (Phase 2A recovery audit):
 //     a forward update_for_items call can delete or override a
 //     subscription's pre-existing scheduled changes (documented
@@ -345,6 +361,52 @@ function statedItemsAreComplete(stated: StatedItem[], targetItems: Array<{ itemP
     if (targetQty.get(s.item_price_id) !== s.quantity) return false; // missing/extra item, or quantity mismatch
   }
   return seen.size === targetQty.size;
+}
+
+/**
+ * Compares an ACTUAL provider item list (a re-read subscription's
+ * items) against the intended target item set and returns
+ * human-readable mismatch descriptions — item ids and quantities
+ * only, never payloads. An empty result means the actual set
+ * establishes the intended set EXACTLY: the same item_price_id
+ * multiset (no missing item, no extra item, no duplicate entry)
+ * with equal quantities per item. Used post-commit (PR #4 final
+ * review, Fix B) to verify that a successful update_for_items
+ * response actually landed the intended mutation before any
+ * COMMITTED receipt is issued, and in the lost-response path to
+ * decide whether the intended set landed. Incomplete actual entries
+ * (missing id or quantity) are mismatches, never silently skipped.
+ */
+function itemSetMismatches(
+  actual: Array<{ item_price_id?: unknown; quantity?: unknown }>,
+  targetItems: Array<{ itemPriceId: string; quantity: number }>,
+): string[] {
+  const mismatches: string[] = [];
+  const targetQty = new Map<string, number>();
+  for (const t of targetItems) targetQty.set(t.itemPriceId, t.quantity);
+  const actualCount = new Map<string, number>();
+  const actualQty = new Map<string, number>();
+  for (const a of actual) {
+    if (typeof a.item_price_id !== "string" || typeof a.quantity !== "number") {
+      mismatches.push("an actual item entry is incomplete (missing item_price_id or quantity)");
+      continue;
+    }
+    actualCount.set(a.item_price_id, (actualCount.get(a.item_price_id) ?? 0) + 1);
+    actualQty.set(a.item_price_id, a.quantity);
+  }
+  for (const [id, count] of actualCount) {
+    if (count > 1) mismatches.push(`duplicate entries for item ${id} (×${count})`);
+  }
+  for (const [id, qty] of targetQty) {
+    if (!actualCount.has(id)) { mismatches.push(`missing item ${id} (intended quantity ${qty})`); continue; }
+    if (actualCount.get(id) === 1 && actualQty.get(id) !== qty) {
+      mismatches.push(`quantity mismatch for item ${id}: intended ${qty}, actual ${actualQty.get(id)}`);
+    }
+  }
+  for (const [id, qty] of actualQty) {
+    if (!targetQty.has(id)) mismatches.push(`extra item ${id} (actual quantity ${qty})`);
+  }
+  return mismatches;
 }
 
 /**
@@ -762,8 +824,7 @@ export class ChargebeeLiveAdapter implements SubscriptionProvider {
         // protocol-defect proposal addendum; live commit remains
         // disabled regardless.)
         const after = await this.readSubscription(validated.subscription_id);
-        const actualItems = (after.subscription_items ?? []).map((i) => ({ itemPriceId: i.item_price_id, quantity: i.quantity }));
-        const landed = JSON.stringify(actualItems) === JSON.stringify(input.items);
+        const landed = itemSetMismatches(after.subscription_items ?? [], input.items).length === 0;
         if (!landed) {
           throw new SCQError("PROVIDER_ERROR", "Commit outcome is INDETERMINATE: the mutating request's response was lost and provider state does not show the intended change. No second mutation was issued. Reconcile manually before any retry.", { indeterminate: true, reconciled: false });
         }
@@ -784,6 +845,20 @@ export class ChargebeeLiveAdapter implements SubscriptionProvider {
     // recording a receipt whose reconciliation could read OK against
     // unverified numbers.
     const after = await this.readSubscription(validated.subscription_id);
+    // Fix B (PR #4 final review): verify the ACTUAL post-commit item
+    // set establishes the intended mutation BEFORE any receipt. A
+    // provider can return HTTP 200 while silently ignoring or
+    // partially applying the requested item change, and the financial
+    // figures cannot detect that on their own (figures computed on
+    // the WRONG item set can still satisfy the envelope). The re-read
+    // item IDs and quantities are therefore compared against the
+    // quote's intended target set; any missing, extra, duplicated,
+    // or quantity-mismatched item makes the outcome INDETERMINATE
+    // with no COMMITTED receipt, even if the envelope would pass.
+    const itemMismatches = itemSetMismatches(after.subscription_items ?? [], input.items);
+    if (itemMismatches.length > 0) {
+      throw new SCQError("PROVIDER_ERROR", `Commit outcome is INDETERMINATE: the mutating call returned success, but the re-read provider state does NOT establish the intended item set (${itemMismatches.join("; ")}). No COMMITTED receipt was recorded — a change that was silently ignored or partially applied must not be reported as a verified commit even if the financial figures would pass. Reconcile manually from provider state before any retry.`, { indeterminate: true, reconciled: false, itemSetMismatches: itemMismatches });
+    }
     const { effect: committedEffect, undetermined } = this.committedEffectFromState(validated.quoted_effect, after, updateJson);
     if (undetermined.length > 0) {
       throw new SCQError("PROVIDER_ERROR", `Commit outcome is INDETERMINATE: the mutating call returned, but the ACTUAL financial outcome cannot be verified from provider data (${undetermined.join("; ")}). The pre-mutation estimate was NOT substituted for the actual outcome and no receipt was recorded. The mutation itself may have landed — reconcile manually from provider state before any retry.`, { indeterminate: true, reconciled: false, undeterminedDimensions: undetermined });
@@ -797,7 +872,15 @@ export class ChargebeeLiveAdapter implements SubscriptionProvider {
    *     provider-stated amounts. Any item without a stated amount
    *     makes the dimension UNDETERMINED (never reconstructed as
    *     unit_price × quantity — unjustified for flat_fee and unproven
-   *     in general).
+   *     in general). An ABSENT subscription_items member — or an
+   *     explicitly empty collection, which cannot represent this
+   *     adapter's never-empty intended item set — is likewise
+   *     UNDETERMINED, never a verified zero (PR #4 final review,
+   *     Fix A): the previous `?? []` default let an absent collection
+   *     sum vacuously to recurringAmount = 0. Only explicitly
+   *     observed values are summed: an item whose stated amount is
+   *     literally 0 contributes a legitimate 0, and a verified sum
+   *     of 0 is a determined zero.
    *   - immediate: the update response's invoice total, or the sum of
    *     its unbilled_charges member when present and complete (a
    *     present member states its total, including a genuine 0). With
@@ -812,11 +895,22 @@ export class ChargebeeLiveAdapter implements SubscriptionProvider {
    */
   private committedEffectFromState(quoted: CommercialEffect, after: CbSubscription, updateJson?: any): { effect: CommercialEffect; undetermined: string[] } {
     const undetermined: string[] = [];
-    const items = after.subscription_items ?? [];
-    const recurringAmount = items.every((i) => typeof i.amount === "number")
-      ? items.reduce((s, i) => s + (i.amount as number), 0)
-      : undefined;
-    if (recurringAmount === undefined) undetermined.push("recurring (a post-commit subscription item carries no stated amount)");
+    // Fix A (PR #4 final review): the post-commit items MEMBER itself
+    // is evidence. Absent member, an explicitly empty collection, or
+    // any incomplete entry (missing item_price_id, quantity, or a
+    // stated amount) makes recurring UNDETERMINED — none of them may
+    // collapse into a sum that reads as a verified 0.
+    const rawItems = after.subscription_items;
+    let recurringAmount: number | undefined;
+    if (!Array.isArray(rawItems)) {
+      undetermined.push("recurring (the post-commit subscription response carries no subscription_items member — an absent collection is undetermined, never a verified zero)");
+    } else if (rawItems.length === 0) {
+      undetermined.push("recurring (the post-commit subscription_items collection is empty, but the intended item set is never empty — the resulting amount cannot be verified)");
+    } else if (rawItems.every((i) => typeof i.item_price_id === "string" && typeof i.quantity === "number" && typeof i.amount === "number")) {
+      recurringAmount = rawItems.reduce((s, i) => s + (i.amount as number), 0);
+    } else {
+      undetermined.push("recurring (a post-commit subscription item is incomplete — missing item_price_id, quantity, or a stated amount)");
+    }
     const invoiceTotal = updateJson?.invoice?.total;
     const unbilledMember = updateJson?.unbilled_charges as Array<{ amount?: number }> | undefined;
     const unbilledTotal = Array.isArray(unbilledMember) && unbilledMember.every((u) => typeof u.amount === "number")
