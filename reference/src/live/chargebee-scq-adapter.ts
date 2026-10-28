@@ -111,6 +111,24 @@
 //       bounded dimension — it refuses first, at quote time and again
 //       at commit revalidation time. (Protocol gap, recorded for
 //       future spec work; the frozen engine is NOT modified here.)
+//     * PR #4 REVIEW FIXES (2026-10-28, mocked — no live calls):
+//       (a) a provider-stated subscription_estimate item list is used
+//       as the recurring result ONLY after verifying it is the ENTIRE
+//       intended item set (same items, no duplicates, matching
+//       quantities, stated amount on every item) — a partial stated
+//       list is never summed as the result; (b) the committed effect
+//       is built from ACTUALS ONLY (the update response plus the
+//       re-read post-commit state) — the pre-mutation estimate never
+//       supplies committed figures, and an undeterminable actual
+//       outcome (incomplete update response, post-commit items
+//       without stated amounts, or a lost update response) fails
+//       closed as INDETERMINATE with NO receipt recorded, because the
+//       frozen receipt type cannot represent "committed but
+//       financially unverified" and a missing resultingAmount fed to
+//       reconciliation could read as a misleading OK. A consequence:
+//       lost-response commits no longer yield receipts in this
+//       adapter (state landing is verified and reported in the
+//       error). Live commit remains disabled throughout.
 //   - SCHEDULED CHANGES / MANDATORY ADDONS (Phase 2A recovery audit):
 //     a forward update_for_items call can delete or override a
 //     subscription's pre-existing scheduled changes (documented
@@ -297,6 +315,38 @@ function itemRecurringContribution(
   return undefined;
 }
 
+type StatedItem = { item_price_id: string; quantity: number; unit_price?: number; amount?: number };
+
+/**
+ * Verifies that a provider-stated subscription_estimate item list
+ * represents the ENTIRE intended item set (PR #4 review fix): the
+ * same item_price_id multiset as the intended target items — no
+ * missing item, no extra item, no duplicate entry — with matching
+ * quantities per item and a numeric stated `amount` on EVERY item.
+ * Only a list passing this check may be summed as the complete
+ * resulting recurring amount. A nonempty list that fails it is a
+ * PARTIAL view of the result (the provider may state only the items
+ * it repriced): its partial sum must never be reported as the
+ * resulting amount, so the caller falls through to the per-item
+ * pricing-model computation instead.
+ */
+function statedItemsAreComplete(stated: StatedItem[], targetItems: Array<{ itemPriceId: string; quantity: number }>): boolean {
+  if (stated.length === 0 || stated.length !== targetItems.length) return false;
+  const targetQty = new Map<string, number>();
+  for (const t of targetItems) {
+    if (targetQty.has(t.itemPriceId)) return false; // the intended set itself must not carry duplicates
+    targetQty.set(t.itemPriceId, t.quantity);
+  }
+  const seen = new Set<string>();
+  for (const s of stated) {
+    if (typeof s.amount !== "number") return false;
+    if (seen.has(s.item_price_id)) return false; // duplicate stated entry
+    seen.add(s.item_price_id);
+    if (targetQty.get(s.item_price_id) !== s.quantity) return false; // missing/extra item, or quantity mismatch
+  }
+  return seen.size === targetQty.size;
+}
+
 /**
  * Interprets a Chargebee update-estimate response into an SCQ
  * CommercialEffect with per-dimension provenance. Sources are kept
@@ -316,15 +366,22 @@ function itemRecurringContribution(
  *     newly incurred UNBILLED obligation — under this adapter's commit
  *     parameters (invoice_immediately=false) it is NOT invoiced at
  *     commit, NOT a payment due at commit, and NOT cash collected; it
- *     is invoiced at the next billing cycle. Sourced from
+ *     is invoiced at the next billing cycle. The ESTIMATE itself
+ *     incurs nothing: this obligation would be incurred ONLY upon a
+ *     successful commit that actually applies the change. An
+ *     estimate-only run (like the Phase 3 live experiment) creates
+ *     no obligation and no mutation. Sourced from
  *     invoice_estimate.total, it is the provider's estimate of the
  *     total of the invoice that WOULD be issued for the change — an
  *     estimated invoice total, still not a payment or a collection.
  *   - recurring: subscription_estimate.subscription_items amounts when
- *     the provider states them; else a per-item computation in which
- *     every item's contribution must be justified (see
- *     itemRecurringContribution). Any unjustifiable item => recurring
- *     ABSENT. next_invoice_estimate is NEVER used for recurring.
+ *     the provider states them AND the stated list verifies as the
+ *     ENTIRE intended item set (see statedItemsAreComplete — a
+ *     partial stated list is never summed as the result); else a
+ *     per-item computation in which every item's contribution must be
+ *     justified (see itemRecurringContribution). Any unjustifiable
+ *     item => recurring ABSENT. next_invoice_estimate is NEVER used
+ *     for recurring.
  *   - previousAmount: the sum of the CURRENT subscription items'
  *     provider-stated amounts, when all are present.
  */
@@ -374,16 +431,24 @@ export function interpretChargebeeEstimate(
   }
 
   // --- recurring ---
-  const subEstItems = estimate?.subscription_estimate?.subscription_items as Array<{ item_price_id: string; quantity: number; unit_price?: number; amount?: number }> | undefined;
+  const subEstItems = estimate?.subscription_estimate?.subscription_items as StatedItem[] | undefined;
   let resulting: number | undefined;
-  if (Array.isArray(subEstItems) && subEstItems.length > 0 && subEstItems.every((i) => typeof i.amount === "number")) {
-    // Provider-stated path: EVERY item carries its own stated amount.
-    // An item with only a unit_price is NOT summed as unit_price ×
+  // A stated list that is present but fails completeness verification
+  // is recorded in the computed path's provenance when that path also
+  // cannot determine the amount — a partial stated sum is never used.
+  const statedUnverified = Array.isArray(subEstItems) && subEstItems.length > 0 && !statedItemsAreComplete(subEstItems, ctx.targetItems)
+    ? " (a provider-stated item list was present but did NOT verify as the complete intended item set — its partial sum was not used)"
+    : "";
+  if (Array.isArray(subEstItems) && statedItemsAreComplete(subEstItems, ctx.targetItems)) {
+    // Provider-stated path: the stated list verifies as the ENTIRE
+    // intended item set (same items, no duplicates, matching
+    // quantities) and EVERY item carries its own stated amount. An
+    // item with only a unit_price is NOT summed as unit_price ×
     // quantity here — that multiplication is justified only per
     // pricing model (a flat_fee item would be overstated), so such a
     // payload falls through to the per-item computation below.
     resulting = subEstItems.reduce((s, i) => s + (i.amount as number), 0);
-    provenance.recurring = "subscription_estimate.subscription_items[].amount (provider-stated)";
+    provenance.recurring = "subscription_estimate.subscription_items[].amount (provider-stated; verified complete against the intended item set)";
   } else {
     const currentById = new Map(ctx.currentItems.map((i) => [i.itemPriceId, i]));
     let sum = 0;
@@ -395,9 +460,9 @@ export function interpretChargebeeEstimate(
     }
     if (ok) {
       resulting = sum;
-      provenance.recurring = "computed per item: unchanged items at provider-stated amount; flat_fee at fixed price (quantity never multiplied); per_unit at (quantity − free_quantity) × unit price — all terms from the subscription payload and item-price metadata";
+      provenance.recurring = "computed per item: unchanged items at provider-stated amount; flat_fee at fixed price (quantity never multiplied); per_unit at (quantity − free_quantity) × unit price — all terms from the subscription payload and item-price metadata" + statedUnverified;
     } else {
-      provenance.recurring = "absent: no fully provider-stated subscription_estimate item amounts, and at least one target item's contribution cannot be justified from its pricing model/terms";
+      provenance.recurring = "absent: no complete verified provider-stated subscription_estimate item list, and at least one target item's contribution cannot be justified from its pricing model/terms" + statedUnverified;
     }
   }
   const previous = ctx.currentItems.every((i) => typeof i.amount === "number")
@@ -684,59 +749,87 @@ export class ChargebeeLiveAdapter implements SubscriptionProvider {
       updateJson = json;
     } catch (e) {
       if (e instanceof ChargebeeHttpError && e.indeterminate) {
-        // Lost-response path: DO NOT re-issue the mutation. Reconcile by
-        // re-reading provider state. If the intended item set is exactly
-        // present, the mutation landed — record the receipt from actual
-        // state. Otherwise fail closed as indeterminate.
+        // Lost-response path: DO NOT re-issue the mutation. Re-read
+        // provider state to establish whether the intended item set
+        // landed — but do NOT convert that into a receipt. Without the
+        // update response, the ACTUAL immediate financial outcome is
+        // unverifiable (a subscription re-read carries no unbilled-
+        // charge actuals), and the pre-mutation estimate may never be
+        // substituted for it (PR #4 review fix). The frozen receipt
+        // type has no "committed but financially unverified" state,
+        // so the only honest outcome is an indeterminate refusal:
+        // no receipt is recorded. (Limitation recorded in the
+        // protocol-defect proposal addendum; live commit remains
+        // disabled regardless.)
         const after = await this.readSubscription(validated.subscription_id);
         const actualItems = (after.subscription_items ?? []).map((i) => ({ itemPriceId: i.item_price_id, quantity: i.quantity }));
         const landed = JSON.stringify(actualItems) === JSON.stringify(input.items);
         if (!landed) {
           throw new SCQError("PROVIDER_ERROR", "Commit outcome is INDETERMINATE: the mutating request's response was lost and provider state does not show the intended change. No second mutation was issued. Reconcile manually before any retry.", { indeterminate: true, reconciled: false });
         }
-        const committedEffect = this.committedEffectFromState(validated.quoted_effect, after, revalidated);
-        return this.recordReceipt(validated, snapshotFrom(after), committedEffect, proposal);
+        const { undetermined } = this.committedEffectFromState(validated.quoted_effect, after);
+        throw new SCQError("PROVIDER_ERROR", `Commit outcome is INDETERMINATE: the mutating request's response was lost. Provider state shows the intended item set DID land (exactly one mutating call was made; no second mutation was issued), but the ACTUAL financial outcome cannot be verified from provider data (${undetermined.join("; ")}), and the pre-mutation estimate is never substituted for an actual. No receipt was recorded. Reconcile manually from provider records before any retry.`, { indeterminate: true, reconciled: false, undeterminedDimensions: undetermined, intendedItemsLanded: true });
       }
       throw this.toSCQ(e, validated.subscription_id);
     }
 
-    // Post-commit reconciliation (§6.11): committedEffect is derived from
-    // ACTUAL post-commit state (re-read) plus the invoice/unbilled total
-    // the mutating call itself returned — not from the pre-mutation
-    // preview — so a concurrent write landing in the TOCTOU window is
-    // reported as VIOLATED, never silently absorbed.
+    // Post-commit reconciliation (§6.11): committedEffect is derived
+    // ONLY from actuals — the invoice/unbilled figures the mutating
+    // call itself returned, plus the re-read post-commit state — never
+    // from the pre-mutation preview — so a concurrent write landing in
+    // the TOCTOU window is reported as VIOLATED, never silently
+    // absorbed. If any actual financial dimension is UNDETERMINED
+    // (incomplete update response, post-commit items without stated
+    // amounts), the commit fails closed as INDETERMINATE instead of
+    // recording a receipt whose reconciliation could read OK against
+    // unverified numbers.
     const after = await this.readSubscription(validated.subscription_id);
-    const committedEffect = this.committedEffectFromState(validated.quoted_effect, after, revalidated, updateJson);
+    const { effect: committedEffect, undetermined } = this.committedEffectFromState(validated.quoted_effect, after, updateJson);
+    if (undetermined.length > 0) {
+      throw new SCQError("PROVIDER_ERROR", `Commit outcome is INDETERMINATE: the mutating call returned, but the ACTUAL financial outcome cannot be verified from provider data (${undetermined.join("; ")}). The pre-mutation estimate was NOT substituted for the actual outcome and no receipt was recorded. The mutation itself may have landed — reconcile manually from provider state before any retry.`, { indeterminate: true, reconciled: false, undeterminedDimensions: undetermined });
+    }
     return this.recordReceipt(validated, snapshotFrom(after), committedEffect, proposal);
   }
 
-  private committedEffectFromState(quoted: CommercialEffect, after: CbSubscription, fallback: CommercialEffect, updateJson?: any): CommercialEffect {
+  /**
+   * Builds the committed effect from ACTUALS ONLY (PR #4 review fix):
+   *   - recurring: the re-read post-commit subscription items'
+   *     provider-stated amounts. Any item without a stated amount
+   *     makes the dimension UNDETERMINED (never reconstructed as
+   *     unit_price × quantity — unjustified for flat_fee and unproven
+   *     in general).
+   *   - immediate: the update response's invoice total, or the sum of
+   *     its unbilled_charges member when present and complete (a
+   *     present member states its total, including a genuine 0). With
+   *     no update response (lost-response path) the immediate outcome
+   *     is UNDETERMINED — a subscription re-read cannot supply it.
+   * The pre-mutation estimate is NEVER an input here: an unavailable
+   * actual outcome is reported via `undetermined`, and the caller
+   * fails closed rather than recording a receipt against unverified
+   * numbers. (A missing resultingAmount must never reach
+   * reconcileCommittedEffect, whose frozen comparison would treat it
+   * as 0 and could report a misleading OK.)
+   */
+  private committedEffectFromState(quoted: CommercialEffect, after: CbSubscription, updateJson?: any): { effect: CommercialEffect; undetermined: string[] } {
+    const undetermined: string[] = [];
     const items = after.subscription_items ?? [];
-    // Recurring from provider-stated item amounts ONLY. An item without
-    // a stated amount is never reconstructed as unit_price × quantity
-    // (unjustified for flat_fee and unproven in general): the dimension
-    // is then left absent rather than fabricated. (The frozen snapshot/
-    // effect types force a number in some sibling paths — see the
-    // protocol-defect proposal — but this reconciliation input does
-    // not have to invent one.)
     const recurringAmount = items.every((i) => typeof i.amount === "number")
       ? items.reduce((s, i) => s + (i.amount as number), 0)
       : undefined;
+    if (recurringAmount === undefined) undetermined.push("recurring (a post-commit subscription item carries no stated amount)");
     const invoiceTotal = updateJson?.invoice?.total;
     const unbilledMember = updateJson?.unbilled_charges as Array<{ amount?: number }> | undefined;
-    // A present unbilled_charges member states the committed unbilled
-    // total — including a genuine 0 (empty array). An element without a
-    // numeric amount makes the member unusable, never a 0.
     const unbilledTotal = Array.isArray(unbilledMember) && unbilledMember.every((u) => typeof u.amount === "number")
       ? unbilledMember.reduce((s, u) => s + (u.amount as number), 0)
       : undefined;
-    const net = typeof invoiceTotal === "number" ? invoiceTotal : unbilledTotal !== undefined ? unbilledTotal : fallback.immediate?.net;
+    const net = typeof invoiceTotal === "number" ? invoiceTotal : unbilledTotal;
+    if (net === undefined) undetermined.push("immediate (no actual update response, or it carried neither an invoice total nor a complete unbilled_charges member)");
     const effect: CommercialEffect = {
       recurring: { ...(recurringAmount !== undefined ? { resultingAmount: recurringAmount } : {}), currency: after.currency_code ?? quoted.recurring?.currency ?? "USD", ...(quoted.recurring?.previousAmount !== undefined ? { previousAmount: quoted.recurring.previousAmount } : {}) },
       effectiveAt: quoted.effectiveAt,
     };
     if (net !== undefined && net !== 0) effect.immediate = { charge: net > 0 ? net : undefined, credit: net < 0 ? -net : undefined, net };
-    return effect;
+    return { effect, undetermined };
   }
 
   private recordReceipt(validated: StoredQuote, snap: SubscriptionSnapshot, committedEffect: CommercialEffect, proposal: SubscriptionChangeProposal): SubscriptionChangeReceipt {

@@ -81,6 +81,8 @@ class FakeChargebee {
   estimateExtraNet = 0;
   /** Estimate response shape: "live" (sparse, as captured) | "empty" (no financial members) | "noEstimate" (no estimate member at all) | "unbilledMissingAmount" (an unbilled element without amount) | "creditNotesAbsent" (unbilled present, credit_note_estimates member absent) | "statedZero" (both members present and empty — a provider-stated zero). */
   estimateShape: "live" | "empty" | "noEstimate" | "unbilledMissingAmount" | "creditNotesAbsent" | "statedZero" = "live";
+  /** Update response shape: "full" (subscription + unbilled_charges member) | "noFinancials" (subscription ONLY — no invoice, no unbilled_charges member: an incomplete post-update response). The mutation itself still applies. */
+  updateShape: "full" | "noFinancials" = "full";
   /** One-shot hook fired inside the mutating call, after the adapter's final preview — the TOCTOU window. */
   beforeUpdate: (() => void) | null = null;
   private idem = new Map<string, { paramsHash: string; response: HttpResponse; at: number }>();
@@ -230,7 +232,9 @@ class FakeChargebee {
       const newRec = this.sub.subscription_items.reduce((s, i) => s + contribution(i), 0);
       this.sub.resource_version += 1;
       this.mutationCount++;
-      const res = jsonRes(200, { subscription: structuredClone(this.sub), unbilled_charges: newRec - oldRec !== 0 ? [{ amount: newRec - oldRec }] : [] });
+      const res = this.updateShape === "noFinancials"
+        ? jsonRes(200, { subscription: structuredClone(this.sub) })
+        : jsonRes(200, { subscription: structuredClone(this.sub), unbilled_charges: newRec - oldRec !== 0 ? [{ amount: newRec - oldRec }] : [] });
       if (key) this.idem.set(key, { paramsHash, response: res, at: this.fakeNowMs });
       return res;
     }
@@ -575,6 +579,207 @@ test("Test 13-zero1 (unknown-vs-zero): a provider-STATED zero (both members pres
   assert.equal(fake.mutationCount, 0);
 });
 
+// ---------- PR #4 review fixes: stated-items completeness + committed-actuals honesty ----------
+// Fix 1: a provider-stated subscription_estimate item list may be
+// summed as the complete resulting recurring amount ONLY after it
+// verifies as the ENTIRE intended item set (same items, no
+// duplicates, matching quantities, stated amount on every item). A
+// partial stated list must fall through to the pricing-model
+// computation — never be reported as the result.
+// Fix 2: the committed effect is built from ACTUALS ONLY. An
+// undeterminable actual outcome fails closed as INDETERMINATE with
+// no receipt recorded; the pre-mutation estimate never supplies
+// committed figures.
+
+const FIX1_CTX = {
+  currency: "USD",
+  currentItems: DEMO_CURRENT,
+  targetItems: [{ itemPriceId: "flat-plan-monthly", quantity: 1 }, { itemPriceId: "perunit-addon-monthly", quantity: 21 }],
+  priceInfo: PRICE_INFO,
+};
+// The pricing-model computation for FIX1_CTX yields 80900 (flat 59900
+// once + per-unit 21 x 1000). Every corrupted stated list below has a
+// partial sum DIFFERENT from 80900, so a pass proves the partial sum
+// was not used.
+
+test("Test 13-fix11a (PR #4 review): stated item list MISSING the addon is not summed as the complete recurring amount", () => {
+  const r = interpretChargebeeEstimate(
+    { subscription_estimate: { subscription_items: [{ item_price_id: "flat-plan-monthly", quantity: 1, unit_price: 59900, amount: 59900 }] }, unbilled_charge_estimates: [], credit_note_estimates: [] },
+    FIX1_CTX,
+  );
+  assert.notEqual(r.effect.recurring?.resultingAmount, 59900, "the partial stated sum (plan only) must not be reported as the resulting amount");
+  assert.equal(r.effect.recurring?.resultingAmount, 80900, "falls through to the verified per-item computation");
+});
+
+test("Test 13-fix11b (PR #4 review): stated item list with a DUPLICATE item entry is not summed as the complete recurring amount", () => {
+  const r = interpretChargebeeEstimate(
+    {
+      subscription_estimate: {
+        subscription_items: [
+          { item_price_id: "flat-plan-monthly", quantity: 1, unit_price: 59900, amount: 59900 },
+          { item_price_id: "perunit-addon-monthly", quantity: 21, unit_price: 1000, amount: 21000 },
+          { item_price_id: "perunit-addon-monthly", quantity: 21, unit_price: 1000, amount: 21000 },
+        ],
+      },
+      unbilled_charge_estimates: [], credit_note_estimates: [],
+    },
+    FIX1_CTX,
+  );
+  assert.notEqual(r.effect.recurring?.resultingAmount, 101900, "the duplicated stated sum must not be reported");
+  assert.equal(r.effect.recurring?.resultingAmount, 80900);
+});
+
+test("Test 13-fix11c (PR #4 review): stated item list with a MISMATCHED quantity is not summed as the complete recurring amount", () => {
+  const r = interpretChargebeeEstimate(
+    {
+      subscription_estimate: {
+        subscription_items: [
+          { item_price_id: "flat-plan-monthly", quantity: 1, unit_price: 59900, amount: 59900 },
+          { item_price_id: "perunit-addon-monthly", quantity: 20, unit_price: 1000, amount: 20000 }, // intended: 21
+        ],
+      },
+      unbilled_charge_estimates: [], credit_note_estimates: [],
+    },
+    FIX1_CTX,
+  );
+  assert.notEqual(r.effect.recurring?.resultingAmount, 79900, "the quantity-mismatched stated sum must not be reported");
+  assert.equal(r.effect.recurring?.resultingAmount, 80900);
+});
+
+test("Test 13-fix11d (PR #4 review): stated item list that is a PARTIAL SUBSET (addon only) is not summed as the complete recurring amount", () => {
+  const r = interpretChargebeeEstimate(
+    { subscription_estimate: { subscription_items: [{ item_price_id: "perunit-addon-monthly", quantity: 21, unit_price: 1000, amount: 21000 }] }, unbilled_charge_estimates: [], credit_note_estimates: [] },
+    FIX1_CTX,
+  );
+  assert.notEqual(r.effect.recurring?.resultingAmount, 21000, "the subset stated sum must not be reported");
+  assert.equal(r.effect.recurring?.resultingAmount, 80900);
+});
+
+test("Test 13-fix11e (PR #4 review, adapter level): an estimate whose stated list omits an intended item does not produce the partial sum in the quote", async () => {
+  const fake = new FakeChargebee({
+    id: "cb_live_mixed_2",
+    items: [
+      { item_price_id: "seat-basic-monthly", item_type: "plan", quantity: 100, unit_price: 1000, amount: 100000, free_quantity: 0 },
+      { item_price_id: "onoff-addon-monthly", item_type: "addon", quantity: 1, unit_price: 500, amount: 500, free_quantity: 0 },
+    ],
+  });
+  // Override ONLY the estimate response: its stated item list omits
+  // the on/off addon entirely (a partial provider view).
+  const partial: HttpTransport = async (req) => {
+    if (req.method === "POST" && req.url.includes("/estimates/")) {
+      return {
+        status: 200, headers: {},
+        json: {
+          estimate: {
+            object: "estimate",
+            subscription_estimate: { id: "cb_live_mixed_2", status: "active", currency_code: "USD", subscription_items: [{ item_price_id: "seat-basic-monthly", quantity: 120, unit_price: 1000, amount: 120000 }] },
+            unbilled_charge_estimates: [{ amount: 20000 }],
+            credit_note_estimates: [],
+          },
+        },
+      };
+    }
+    return fake.transport(req);
+  };
+  const client = new ChargebeeClient({ site: "scq-test", apiKey: "test_key_redacted" }, partial);
+  const adapter = new ChargebeeLiveAdapter(client, new QuoteStore(), { liveCommitEnabled: true });
+  const quote = await adapter.createChangeQuote("cb_live_mixed_2", qtyProposal());
+  assert.notEqual(quote.commercialEffect.recurring?.resultingAmount, 120000, "the partial stated sum (plan only) must not become the quote's recurring amount");
+  assert.equal(quote.commercialEffect.recurring?.resultingAmount, 120500, "computed per item instead: 120000 per-unit + the unchanged on/off addon at its observed 500");
+});
+
+test("Test 13-rec1 (PR #4 review): incomplete post-update response (no invoice, no unbilled_charges) — commit fails INDETERMINATE and records NO receipt", async () => {
+  const fake = new FakeChargebee();
+  fake.updateShape = "noFinancials"; // the update applies, but its response carries no financial members at all
+  const store = new QuoteStore();
+  const adapter = makeAdapter(fake, { store });
+  const quote = await adapter.createChangeQuote("cb_live_test_1", qtyProposal());
+  await assert.rejects(
+    () => adapter.commitChangeQuote(quote.id),
+    (e: unknown) => e instanceof SCQError && e.code === "PROVIDER_ERROR" && (e as any).details?.indeterminate === true,
+    "the ACTUAL immediate outcome is unavailable in the response — it must never be replaced by the pre-mutation estimate and reconciled as OK",
+  );
+  assert.equal(fake.mutationCount, 1, "the mutation itself was issued (the refusal is about verification, not prevention)");
+  assert.equal(store.get(quote.id)?.commit_receipt, undefined, "no receipt may be recorded for an unverified outcome");
+  assert.notEqual(store.get(quote.id)?.status, "COMMITTED");
+});
+
+test("Test 13-rec2 (PR #4 review): lost response; re-read shows the intended items but WITHOUT determinable amounts — INDETERMINATE, no OK receipt", async () => {
+  const fake = new FakeChargebee();
+  const store = new QuoteStore();
+  let updateApplied = false;
+  const lossyStrip: HttpTransport = async (req) => {
+    if (req.method === "POST" && req.url.includes("/update_for_items")) {
+      await fake.transport(req); // the mutation lands at the provider
+      updateApplied = true;
+      throw new Error("socket timeout"); // ...but its response is lost
+    }
+    const res = await fake.transport(req);
+    if (updateApplied && req.method === "GET" && req.url.includes("/subscriptions/") && res.json) {
+      const j = structuredClone(res.json) as any;
+      for (const it of j.subscription.subscription_items) delete it.amount; // post-commit state without determinable amounts
+      return { ...res, json: j };
+    }
+    return res;
+  };
+  const client = new ChargebeeClient({ site: "scq-test", apiKey: "test_key_redacted" }, lossyStrip);
+  const adapter = new ChargebeeLiveAdapter(client, store, { liveCommitEnabled: true });
+  const quote = await adapter.createChangeQuote("cb_live_test_1", qtyProposal());
+  await assert.rejects(
+    () => adapter.commitChangeQuote(quote.id),
+    (e: unknown) => e instanceof SCQError && e.code === "PROVIDER_ERROR" && (e as any).details?.indeterminate === true,
+    "landed-but-unverifiable must fail closed: neither the recurring (amounts stripped) nor the immediate (no response) actual is determinable",
+  );
+  assert.equal(fake.mutationCount, 1, "exactly one mutation; no blind retry");
+  assert.equal(store.get(quote.id)?.commit_receipt, undefined, "no receipt — a missing resultingAmount must never reach reconciliation as an OK");
+  assert.notEqual(store.get(quote.id)?.status, "COMMITTED");
+});
+
+test("Test 13-rec3 (PR #4 review): lost response and provider state does NOT show the intended change — the existing indeterminate refusal is preserved", async () => {
+  const fake = new FakeChargebee();
+  const store = new QuoteStore();
+  const dropUpdate: HttpTransport = async (req) => {
+    if (req.method === "POST" && req.url.includes("/update_for_items")) throw new Error("connection reset before send"); // never applied
+    return fake.transport(req);
+  };
+  const client = new ChargebeeClient({ site: "scq-test", apiKey: "test_key_redacted" }, dropUpdate);
+  const adapter = new ChargebeeLiveAdapter(client, store, { liveCommitEnabled: true });
+  const quote = await adapter.createChangeQuote("cb_live_test_1", qtyProposal());
+  await assert.rejects(
+    () => adapter.commitChangeQuote(quote.id),
+    (e: unknown) => e instanceof SCQError && e.code === "PROVIDER_ERROR" && (e as any).details?.indeterminate === true && String(e.message).includes("INDETERMINATE"),
+  );
+  assert.equal(fake.mutationCount, 0, "the mutation never landed and was never re-issued");
+  assert.equal(store.get(quote.id)?.commit_receipt, undefined);
+});
+
+test("Test 13-rec4 (PR #4 review): a complete ACTUAL response is recorded with the ACTUAL figures — not the estimate's — and reconciliation reports the difference", async () => {
+  const fake = new FakeChargebee();
+  const store = new QuoteStore();
+  // The provider's actual update response reports an unbilled total of
+  // 25000, although the pre-mutation estimate said 20000.
+  const rewrite: HttpTransport = async (req) => {
+    const res = await fake.transport(req);
+    if (req.method === "POST" && req.url.includes("/update_for_items") && res.json) {
+      const j = structuredClone(res.json) as any;
+      j.unbilled_charges = [{ amount: 25000 }];
+      return { ...res, json: j };
+    }
+    return res;
+  };
+  const client = new ChargebeeClient({ site: "scq-test", apiKey: "test_key_redacted" }, rewrite);
+  const adapter = new ChargebeeLiveAdapter(client, store, { liveCommitEnabled: true });
+  const quote = await adapter.createChangeQuote("cb_live_test_1", qtyProposal());
+  assert.equal(quote.commercialEffect.immediate?.net, 20000, "the quote carries the estimate, as expected");
+  const receipt = await adapter.commitChangeQuote(quote.id);
+  assert.equal(receipt.status, "COMMITTED");
+  assert.equal(receipt.committedEffect.immediate?.net, 25000, "the receipt carries the ACTUAL figure from the update response — not the estimate's 20000");
+  assert.equal(receipt.committedEffect.recurring?.resultingAmount, 120000, "recurring comes from the re-read post-commit state");
+  assert.equal(receipt.quotedEffect.immediate?.net, 20000);
+  assert.equal(receipt.reconciliation.status, "VIOLATED", "actual 25000 exceeds the zero-tolerance envelope vs quoted 20000 — reported honestly, not absorbed");
+  assert.equal(store.get(quote.id)?.commit_receipt, receipt);
+});
+
 // ---------- T01–T14 (mocked transport; classifications in TEST-RESULTS.md) ----------
 
 test("T01 (SIMULATED_PASS): initial subscription read produces an accurate normalized snapshot", async () => {
@@ -650,8 +855,17 @@ test("T06 (SIMULATED_PASS): commit repeated with same quote ID — no duplicate 
   assert.equal(fake.mutationCount, 1);
 });
 
-test("T07 (SIMULATED_PASS): provider processes commit, response is lost — recover by reconciliation, never a blind second mutation", async () => {
+test("T07 (SIMULATED_PASS): provider processes commit, response is lost — the outcome is INDETERMINATE and NO receipt is recorded (PR #4 review behavior)", async () => {
+  // Behavior changed in the PR #4 review round. Previously the adapter
+  // recovered a receipt from the re-read state plus the PRE-MUTATION
+  // ESTIMATE — i.e. it reported an actual financial outcome it had not
+  // verified. Now: the re-read verifies the intended item set landed,
+  // but without the update response the ACTUAL immediate outcome is
+  // unverifiable, the estimate is never substituted for it, and the
+  // frozen receipt type cannot represent "committed but unverified" —
+  // so the commit fails closed as INDETERMINATE and records nothing.
   const fake = new FakeChargebee();
+  const store = new QuoteStore();
   let loseOnce = true;
   const lossy: HttpTransport = async (req) => {
     const res = await fake.transport(req); // server applies the mutation
@@ -659,15 +873,19 @@ test("T07 (SIMULATED_PASS): provider processes commit, response is lost — reco
     return res;
   };
   const client = new ChargebeeClient({ site: "scq-test", apiKey: "test_key_redacted" }, lossy);
-  const adapter = new ChargebeeLiveAdapter(client, new QuoteStore(), { liveCommitEnabled: true });
+  const adapter = new ChargebeeLiveAdapter(client, store, { liveCommitEnabled: true });
   const quote = await adapter.createChangeQuote("cb_live_test_1", qtyProposal());
-  const receipt = await adapter.commitChangeQuote(quote.id);
-  assert.equal(receipt.status, "COMMITTED", "state reconciliation found the intended change landed");
-  assert.equal(receipt.resultingSnapshot.items[0].quantity, 120);
-  assert.equal(fake.mutationCount, 1, "exactly one provider mutation despite the lost response");
-  const again = await adapter.commitChangeQuote(quote.id);
-  assert.deepEqual(again, receipt);
-  assert.equal(fake.mutationCount, 1);
+  await assert.rejects(
+    () => adapter.commitChangeQuote(quote.id),
+    (e: unknown) => e instanceof SCQError && e.code === "PROVIDER_ERROR" && (e as any).details?.indeterminate === true && (e as any).details?.intendedItemsLanded === true,
+    "the response was lost; state shows the change landed, but the actual financial outcome is unverifiable — no receipt may be fabricated from the estimate",
+  );
+  assert.equal(fake.mutationCount, 1, "exactly one provider mutation despite the lost response — never a blind second mutation");
+  assert.equal(fake.sub.subscription_items[0].quantity, 120, "the mutation DID land at the provider (the refusal is about verifiability, not about pretending otherwise)");
+  assert.equal(store.get(quote.id)?.commit_receipt, undefined, "no receipt was recorded for an unverified outcome");
+  assert.notEqual(store.get(quote.id)?.status, "COMMITTED");
+  await assert.rejects(() => adapter.commitChangeQuote(quote.id), (e: unknown) => e instanceof SCQError);
+  assert.equal(fake.mutationCount, 1, "a repeated attempt still performs no second mutation");
 });
 
 test("T08+T09 (SIMULATED_PASS): concurrent change between final preview and commit — TOCTOU lands, reconciliation reports VIOLATED, no rollback is claimed", async () => {

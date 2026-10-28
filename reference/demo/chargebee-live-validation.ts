@@ -28,7 +28,10 @@
  *     case here) it is a newly incurred UNBILLED obligation — not an
  *     issued invoice, not a payment due now, not cash collected; this
  *     adapter commits with invoice_immediately=false, so such charges
- *     are invoiced at the next billing cycle.
+ *     are invoiced at the next billing cycle. The estimate itself
+ *     incurs NOTHING: the obligation would be incurred only upon a
+ *     successful commit. This driver never commits, so a run of this
+ *     driver creates no obligation and no mutation.
  *
  * No credentials, authorization headers, or provider payloads are printed.
  */
