@@ -61,7 +61,7 @@ test("Test 1 (Stripe, REVALIDATE): 100->120 seats immediate — quote doesn't mu
   assert.equal(receipt.committedEffect.provenance?.committedSource, "provider_actual");
 });
 
-test("Test 1 (Paddle, REVALIDATE): 100->120 seats immediate — quote doesn't mutate, commit does, committedEffect is the re-derived figure", async () => {
+test("Test 1 (Paddle, REVALIDATE): 100->120 seats immediate — quote doesn't mutate, commit does, quotedEffect figures === committedEffect figures with zero elapsed time", async () => {
   const { sim, sub } = freshPaddleFixture();
   const adapter = new PaddleAdapter(sim, new QuoteStore());
 
@@ -96,9 +96,19 @@ test("Test 1 (Paddle, REVALIDATE): 100->120 seats immediate — quote doesn't mu
   assert.equal(receipt.guaranteeMode, "REVALIDATE");
   assert.equal(receipt.consistencyGuarantee, "BEST_EFFORT", "Paddle must never claim ATOMIC");
   assert.equal(receipt.resultingSnapshot.items[0].quantity, 120);
-  // No time elapsed between quote and commit in this test, so the re-preview
-  // should agree with the original quote — quotedEffect and committedEffect
-  // may differ under REVALIDATE in general (see Test 6), but are not
-  // REQUIRED to differ; here they coincide because nothing changed.
-  assert.deepEqual(receipt.committedEffect, receipt.quotedEffect, "with zero elapsed time, REVALIDATE's re-derived figure matches the quote");
+  // No time elapsed between quote and commit in this test, so the
+  // post-commit actuals should agree with the original quote —
+  // quotedEffect and committedEffect figures may differ under
+  // REVALIDATE in general (see Test 6), but are not REQUIRED to
+  // differ; here they coincide because nothing changed.
+  // PR-4 DISCLOSED EXPECTATION CHANGE (v0.6.2 Paddle migration):
+  // this previously asserted whole-effect deepEqual(committedEffect,
+  // quotedEffect). Whole-object equality is no longer the contract —
+  // a committed effect carries committed provenance (CORE-2: here,
+  // provider_actual figures established from the bound transaction
+  // read back post-commit) that a quote-side effect never asserts.
+  // The zero-elapsed-time FIGURES still match exactly; assert those.
+  assert.deepEqual(receipt.committedEffect.immediate, receipt.quotedEffect.immediate, "with zero elapsed time, the committed incurred figure matches the quote");
+  assert.deepEqual(receipt.committedEffect.recurring, receipt.quotedEffect.recurring);
+  assert.equal(receipt.committedEffect.provenance?.committedSource, "provider_actual");
 });
