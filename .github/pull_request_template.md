@@ -33,6 +33,6 @@ Closes #
 
 ## Checklist
 
-- [ ] `cd reference && npm test` passes locally (66 tests)
+- [ ] `cd reference && npm test` passes locally (115 tests)
 - [ ] No new provider name introduced in `reference/src/core/types.ts` (provider-specific logic stays in `reference/src/adapters/*`)
 - [ ] Docs updated if behavior, evidence level, or scope changed

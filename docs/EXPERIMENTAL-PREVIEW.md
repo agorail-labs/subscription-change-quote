@@ -17,14 +17,14 @@ The specification distinguishes:
 
 - [Normative SCQ v0.6.1 specification](../spec/scq-v0.6.1-spec.md).
 - [Security considerations](../spec/security-considerations.md).
-- [Draft conformance map](../conformance/conformance.md) and automated research test suite (**66 cases** in this branch's suite; the live-validation experiment's 18 additional mocked-transport Chargebee cases belong to the unpublished Change B and bring the combined branch to 84; no test in the suite is a live API test).
+- [Draft conformance map](../conformance/conformance.md) and automated research test suite (**115 cases** on main: 66 simulator/engine cases plus test13's 49 mocked-transport cases for the experimental Chargebee live adapter, merged as Change B in PR #4; no test in the suite is a live API test — the live runs are recorded as research evidence, not executed by the suite).
 - [Developer quickstart](QUICKSTART.md) using an in-memory, Stripe-shaped example.
 - Simulator-backed reference adapters shaped after Stripe, Paddle, Zuora and Chargebee; TypeScript ESM and declaration exports and a local tarball consumer test.
 - [Research evidence and limitations](../research/EVIDENCE.md).
 
 ## Critical limitations
 
-**No reference adapter calls a live billing provider.** Prior research included *limited* real Chargebee test-site observations, but this release does not ship a Chargebee production API integration. The Stripe, Paddle and Zuora models were documentation-backed simulations only.
+**The simulator-backed reference adapters never call a live billing provider.** Prior research included *limited* real Chargebee test-site observations (historical, prior cycle). The repository also ships an **experimental** Chargebee live adapter (Change B, merged in PR #4) that was exercised against a real Chargebee **test site** for retrieval and quote generation only (read/estimate); its commit path is disabled by default and has **not** been live-validated, and it is a validation tool, not a Chargebee production API integration. The Stripe, Paddle and Zuora models were documentation-backed simulations only.
 
 No provider-backed atomic compare-and-swap on commit is claimed. Reconciliation may discover a problem **after** a mutation; it cannot automatically roll one back. Some term consequences are unknown, and the protocol does not authorize spending or contractual changes.
 

@@ -60,10 +60,22 @@ normative diff from v0.6.
 ## Evidence levels — read this before trusting any capability claim
 
 This research explicitly separates what was **observed against a real provider** from what was
-**modeled in a simulator**. Only one provider has any live API observations in this project,
-and those are LIMITED HISTORICAL observations from a prior research cycle (v0.5-LIVE) against
-one test site — not validation performed by, or of, the current adapters. See
-`research/EVIDENCE.md` for exactly what was and was not observed.
+**modeled in a simulator**. Only one provider (Chargebee) has any live API observations in
+this project, and they come in two distinct kinds that must not be conflated:
+
+- **Limited historical observations** — a prior research cycle (v0.5-LIVE, Experiments 1–2)
+  observed a real Chargebee test site directly. Those observations are historical evidence
+  about the provider, not validation of any adapter in this repository.
+- **Live-validated retrieval and quote generation (Phase 3/4, 2026-10-27/28)** — the
+  experimental Chargebee live adapter in this repository was exercised end-to-end against a
+  real Chargebee **test site**: subscription retrieval (**L-GET: LIVE_PASS**) and SCQ quote
+  generation from non-mutating update estimates (**L-QUOTE: LIVE_PASS**), including
+  live-verified refusal of quantity changes on `flat_fee` items. **Live commit has NOT been
+  validated (L-COMMIT: BLOCKED)** — the commit path is mock-tested only and is disabled by
+  default. See `research/chargebee-live-v1/evidence/PHASE3-EVIDENCE-SUMMARY.md` and
+  `research/chargebee-live-v1/TEST-RESULTS.md` for the full record.
+
+See `research/EVIDENCE.md` for exactly what was and was not observed.
 
 ```text
 LIVE_API_VALIDATED           — observed against a real provider test-site API
@@ -77,7 +89,7 @@ UNVERIFIED                   — intentionally left open; SCQ reports UNKNOWN ra
 
 | Provider | Evidence level |
 |---|---|
-| **Chargebee** | **Limited historical live test-site observations** (prior cycle only), plus simulator |
+| **Chargebee** | **Limited historical live test-site observations** (prior cycle), plus simulator; **plus live-validated retrieval and quote generation** via the experimental live adapter (Phase 3/4, test site) — live commit **not** validated |
 | Stripe | Documentation-backed simulation only |
 | Paddle | Documentation-backed simulation only |
 | Zuora | Documentation-backed simulation only |
@@ -94,7 +106,7 @@ examples/                   Concrete normalized proposal/quote/receipt/failure e
 conformance/                Draft conformance suite — maps tests to normative rules
 research/                   Evidence register and full multi-cycle research findings
 standards/                  Fit analysis against ACP and UCP, and a discussion-draft pre-SEP
-reference/                  TypeScript reference implementation and full test suite (66 tests)
+reference/                  TypeScript reference implementation and full test suite (115 tests)
 ```
 
 - [`spec/scq-v0.6.1-spec.md`](spec/scq-v0.6.1-spec.md) — the normative specification. Start here
@@ -112,7 +124,8 @@ reference/                  TypeScript reference implementation and full test su
   Universal Commerce Protocol (UCP), a recommended publication path, and a **discussion-draft**
   ACP pre-SEP write-up (see note below).
 - [`reference/`](reference/) — the TypeScript reference implementation (provider-neutral core
-  types and engine, plus four reference adapters) and its full test suite.
+  types and engine, plus four simulator-backed reference adapters and the experimental
+  Chargebee live adapter) and its full test suite.
 
 ## About `standards/ACP-PRE-SEP.md`
 
@@ -147,7 +160,7 @@ npm install
 npm test
 ```
 
-Compiles with `tsc` and runs the full suite (66 tests) via Node's built-in test runner. No
+Compiles with `tsc` and runs the full suite (115 tests) via Node's built-in test runner. No
 external test framework dependency.
 
 ## Community and feedback
