@@ -4,8 +4,13 @@
 **Applies to:** `spec/scq-v0.6.1-spec.md` as published at commit
 `79200fa4cbcf955c618428c0fca74fd2abce7c9d` (main) — the published spec
 file is **unchanged** by this package (see "Freeze-guard status").
-**Prepared in:** Phase 2B, branch `experiment/chargebee-live-validation-v1`
-(local only; not pushed, not published).
+**Prepared in:** Phase 2B; submitted for review in Change A, branch
+`review/change-a-evidence-spec-corrections`.
+**Status: PENDING APPLICATION.** These errata are **not yet applied** to
+`spec/scq-v0.6.1-spec.md`. The published spec file is unchanged by this
+package; in-spec application is a separate later change under the
+process in §7 (the `protocol-change-approved` mechanism) or a future
+versioned release.
 **Supersedes as a proposal vehicle:** `research/chargebee-live-v1/ERRATA-PROPOSAL.md`
 (Phase 2A). Items E-1, E-3, E-2, and E-5 of that proposal are resolved
 here as errata ER-1…ER-4 with exact replacement wording. Item E-4
