@@ -29,7 +29,7 @@ enforced by `Test 13-classifications` inside the suite itself.
 | T04 | Out-of-band change after quote (resource_version bump) → QUOTE_STALE, no mutation | SIMULATED_PASS | BLOCKED |
 | T05 | Estimate drift outside the subscription fingerprint (balances/tax-style) → envelope enforced against last pre-mutation preview → QUOTE_DRIFTED, no mutation | SIMULATED_PASS | BLOCKED |
 | T06 | Commit repeated with same quote ID → identical historical receipt, still 1 mutation | SIMULATED_PASS | BLOCKED |
-| T07 | Mutation applied, response lost (transport throw) → indeterminate → reconcile-by-read → recovered receipt, exactly 1 mutation, no blind retry | SIMULATED_PASS | BLOCKED |
+| T07 | Mutation applied, response lost (transport throw) → indeterminate → reconcile-by-read → recovered receipt, exactly 1 mutation, no blind retry **(BEHAVIOR CHANGED in the PR #4 review round: the recovered receipt substituted the pre-mutation estimate for the unverifiable actual outcome; the adapter now fails closed as INDETERMINATE and records NO receipt — see the PR #4 review addendum)** | SIMULATED_PASS | BLOCKED |
 | T08 | Concurrent reprice lands between final preview and commit → commit proceeds (BEST_EFFORT), outcome detected via post-commit state | SIMULATED_PASS (combined with T09) | BLOCKED |
 | T09 | Committed effect exceeds envelope → receipt returned as COMMITTED with `reconciliation: VIOLATED`; no exception pretending no mutation; no rollback claimed | SIMULATED_PASS (combined with T08) | BLOCKED |
 | T10 | Unsupported combined change (multi-change; CANCEL on the live adapter) → UNSUPPORTED_CHANGE before any estimate or mutation | SIMULATED_PASS | BLOCKED |
@@ -64,6 +64,12 @@ driver (`reference/demo/chargebee-live-validation.ts`) correctly reports
 `BLOCKED — CREDENTIALS NOT AVAILABLE` and exits without claiming any result.
 Documentation observations are in API-CONTRACT-AUDIT.md; prior-cycle live observations
 remain recorded, as historical evidence only, in `research/EVIDENCE.md`.
+
+*(Phase 1 record, preserved as written. SUPERSEDED for the
+read/estimate scope by the Phase 3 addendum below: a later,
+separately approved run DID exercise the live read/estimate paths —
+L-GET LIVE_PASS, L-QUOTE LIVE_PASS, flat_fee refusal live-verified,
+L-COMMIT still BLOCKED.)*
 
 ## Approval needed — proposed live mutations NOT executed
 
@@ -109,8 +115,8 @@ the full run report also exists outside the repo at
 `~/workspace/scq-live-validation-evidence/PHASE3-RUN-2026-10-27.md`.
 
 What changed and why (all findings live-verified on the test site
-`arjunsamplecompany-test`, demo subscription
-`cbdemo__XpbKpmKUbu8d2cPS`):
+`<test-site>`, demo subscription
+`<subscription-id>`):
 
 - **L-GET: LIVE_PASS** (unchanged from the first live run — the
   adapter's snapshot matched the raw API).
@@ -145,7 +151,10 @@ What changed and why (all findings live-verified on the test site
   figure: a **newly incurred unbilled obligation** — not an issued
   invoice, not a payment due at commit, not cash collected; the
   adapter commits with `invoice_immediately=false`, so such charges
-  are invoiced at the next billing cycle.
+  are invoiced at the next billing cycle. The estimate itself
+  incurred nothing: this obligation would be incurred only upon a
+  successful commit, and the completed live experiment was
+  estimate-only — it caused no mutation and no obligation.
 - **L-REFUSAL (flat_fee plan quantity 1→21, through the adapter):
   LIVE-verified refusal** — UNSUPPORTED_CHANGE before any estimate
   call; the raw provider validation error was reproduced separately
@@ -230,3 +239,88 @@ CLAIM-CORRECTION-MATRIX.md §A/§C for the per-assertion record):
 | Test 11 file | 10 tests, all passing with corrected assertions (EXACT refused for every Chargebee action; DATE/update-TERM_END refused; evergreen CANCEL termEffect-only EXACT) |
 | `npm run smoke:pack` | re-run in Phase 2A — see PUBLICATION-READINESS.md for the recorded result |
 | Live rows | unchanged: all BLOCKED, no credentials, no live calls in Phase 2A either |
+
+## PR #4 review addendum (2026-10-28) — stated-items completeness, committed-actuals honesty
+
+An independent review of draft PR #4 requested five corrections.
+This addendum records the two code changes and the new tests; the
+others (identifier redaction, reproduction docs, obligation-timing
+wording) are recorded in the files they touch. **No live API calls
+were made in this round** — all new tests are mocked.
+
+### Fix 1 — stated-items completeness (quote-time recurring)
+
+`interpretChargebeeEstimate` previously summed ANY nonempty
+`subscription_estimate.subscription_items` list carrying numeric
+amounts as the complete resulting recurring amount. A partial
+provider-stated list (only the repriced items, for example) would
+have been reported as the full result. Now a stated list is used
+only after verifying it is the ENTIRE intended item set: same
+`item_price_id` multiset as the intended target items (no missing,
+no extra, no duplicate), matching quantities per item, and a
+numeric stated amount on every item. A list failing verification
+falls through to the per-item pricing-model computation; if that
+cannot determine the amount either, recurring is ABSENT and the
+quote fails closed (`QUOTE_NOT_DETERMINISTIC`), as before.
+
+New tests (mocked, `reference/tests/test13-chargebee-http.test.ts`):
+13-fix11a (stated list missing the addon), 13-fix11b (duplicate
+stated entry), 13-fix11c (quantity mismatch), 13-fix11d (stated
+list is a partial subset), 13-fix11e (adapter level: estimate whose
+stated list omits an intended item). Each asserts the partial
+stated sum is NOT reported as `resultingAmount` and that the
+verified computation (80900 / 120500 in the fixtures) is used
+instead. **Spot-check:** all five FAIL against the pre-fix code
+(scratch worktree at the pre-fix commit, new test file only).
+
+### Fix 2 — committed effect from ACTUALS only (post-commit honesty)
+
+`committedEffectFromState` previously fell back to the pre-mutation
+revalidated estimate when the update response carried neither an
+invoice total nor an unbilled total — an unavailable ACTUAL outcome
+was replaced by the estimate, and reconciliation could then report
+OK against unverified numbers. Now:
+
+- committed immediate comes ONLY from the update response (invoice
+  total, or a complete `unbilled_charges` member actually returned);
+- committed recurring comes ONLY from the re-read post-commit
+  subscription items' stated amounts (any item without one makes
+  the dimension UNDETERMINED — never reconstructed);
+- if either actual dimension is undetermined,
+  `commitChangeQuote` fails closed with an indeterminate
+  `PROVIDER_ERROR` and records NO receipt (a missing
+  `resultingAmount` never reaches `reconcileCommittedEffect`, whose
+  frozen comparison would treat it as 0 and could report a
+  misleading OK);
+- in the lost-response path the item-set landing is still verified
+  by re-read (and reported in the error), but no receipt is
+  recorded: without the update response the actual immediate
+  outcome is unverifiable. **This changes T07's mocked behavior**
+  (row updated above): previously "recovered receipt"; now
+  indeterminate refusal, store shows no committed receipt, exactly
+  one provider mutation, no blind retry. The underlying limitation —
+  the frozen receipt type cannot represent "committed but
+  financially unverified" — is recorded as an addendum in the
+  protocol-defect proposal.
+
+New tests (mocked): 13-rec1 (incomplete post-update response →
+indeterminate, no receipt), 13-rec2 (lost response; landed items
+without determinable amounts → indeterminate, no OK receipt),
+13-rec3 (lost response; change did not land → existing refusal
+preserved), 13-rec4 (complete actual response: receipt carries the
+ACTUAL figures — 25000, not the estimate's 20000 — and
+reconciliation reports VIOLATED against the zero-tolerance
+envelope). **Spot-check:** 13-rec1, 13-rec2, and the updated T07
+FAIL against the pre-fix code; 13-rec3 (preservation) and 13-rec4
+(positive control) pass there, as designed.
+
+### Totals after this round
+
+| Suite | Result |
+|---|---|
+| Full clean build (`rm -rf dist node_modules`, `npm ci`, `npm test`) | **109 pass / 0 fail** (66 baseline + 43 test13) |
+| test13 file | 43 tests (34 pre-existing incl. the updated T07 + 9 new) |
+| `npm run smoke:pack` | OK |
+| Provider-neutrality scan | clean |
+| Freeze guard (frozen files vs merged main) | 0 differing lines |
+| Live rows | unchanged: L-GET LIVE_PASS, L-QUOTE LIVE_PASS, flat_fee refusal live-verified (Phase 3), L-COMMIT BLOCKED — no live calls in this round |

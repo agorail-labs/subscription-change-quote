@@ -4,8 +4,8 @@
 - **Branch / commits:** `review/change-b-live-validation-tooling` —
   rebase `8fe298f` onto merged main `cde8faa`; repair `45498d4`;
   fixtures/regressions `2d3465c`; results addendum `cdb51bb`.
-- **Environment:** Chargebee **test** site `arjunsamplecompany-test`;
-  synthetic demo subscription `cbdemo__XpbKpmKUbu8d2cPS`. Credentials
+- **Environment:** Chargebee **test** site `<test-site>`;
+  synthetic demo subscription `<subscription-id>`. Credentials
   were env-only and are not recorded here or anywhere in this repo.
 - **Scope of live calls:** GET subscription, GET item prices,
   POST `/estimates/update_subscription_for_items` (documented
@@ -16,6 +16,15 @@
   `~/workspace/scq-live-validation-evidence/PHASE3-RUN-2026-10-27.md`;
   this file is the in-repo summary so the classifications in
   TEST-RESULTS.md are inspectable from the repo alone.
+- **Identifier redaction (PR #4 review round, 2026-10-28):** the
+  actual test-site name, subscription id, and generated quote id
+  that appeared in the first version of this summary are replaced
+  by the placeholders `<test-site>`, `<subscription-id>`, and
+  `<quote-id>`. Demo catalog item-price SKUs
+  (`cbdemo_business-plan-price`, `cbdemo_vision-pro-addon-price`)
+  are retained — they are catalog identifiers, not account
+  identifiers. (The branch's earlier git history still contains
+  the original values; history was not rewritten.)
 
 ## Correction to the Oct 27 interim conclusion (explicit)
 
@@ -86,7 +95,7 @@ Findings (evidence source: LIVE for every row):
 - **Test ID:** T02-live. **Endpoint:** POST
   `/estimates/update_subscription_for_items`. **Source:** LIVE.
 - **Scenario B — addon `cbdemo_vision-pro-addon-price` quantity
-  1→21: QUOTE CREATED** (`scq_cblive_cf039fc8fef82714`),
+  1→21: QUOTE CREATED** (`<quote-id>`),
   guaranteeMode REVALIDATE; coverage immediate REVALIDATE /
   recurring REVALIDATE / termEffect UNKNOWN / effectiveAt REVALIDATE
   (no EXACT anywhere).
@@ -98,7 +107,11 @@ Findings (evidence source: LIVE for every row):
     20 × 9263 — proration is time-dependent). It is NOT an issued
     invoice, NOT a payment due at commit, and NOT cash collected;
     the adapter commits with `invoice_immediately=false`, so such
-    charges are invoiced at the next billing cycle.
+    charges are invoiced at the next billing cycle. The estimate
+    itself incurred NOTHING: this obligation would be incurred
+    only upon a successful commit, and the completed live
+    experiment was estimate-only — it caused no mutation and no
+    obligation.
   - `recurring {previousAmount 60900, resultingAmount 80900}` ←
     per-item, pricing-model-justified: unchanged flat_fee plan at
     its provider-stated amount 59900 (once — quantity never
