@@ -17,7 +17,7 @@ The specification distinguishes:
 
 - [Normative SCQ v0.6.1 specification](../spec/scq-v0.6.1-spec.md).
 - [Security considerations](../spec/security-considerations.md).
-- [Draft conformance map](../conformance/conformance.md) and automated research test suite (**84 cases**: 66 baseline + 18 mocked-transport Chargebee tests from the live-validation experiment; no test in the suite is a live API test).
+- [Draft conformance map](../conformance/conformance.md) and automated research test suite (**66 cases** in this branch's suite; the live-validation experiment's 18 additional mocked-transport Chargebee cases belong to the unpublished Change B and bring the combined branch to 84; no test in the suite is a live API test).
 - [Developer quickstart](QUICKSTART.md) using an in-memory, Stripe-shaped example.
 - Simulator-backed reference adapters shaped after Stripe, Paddle, Zuora and Chargebee; TypeScript ESM and declaration exports and a local tarball consumer test.
 - [Research evidence and limitations](../research/EVIDENCE.md).

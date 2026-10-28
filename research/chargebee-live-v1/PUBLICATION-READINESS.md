@@ -25,6 +25,14 @@ remains unpublished (`private: true`) and nothing here changes that.
 | Neutrality check | No neutrality script exists in `reference/package.json` (scripts: build/test/demo/demo:commit/smoke:pack), so a grep-based scan was run and is documented below |
 | Secrets scan | No credentials. The only `apiKey` literals in the tree are the pre-existing `test_key_redacted` placeholders in test13's fake-transport setup (not a credential; file unchanged by Phase 2A) |
 
+> **Count attribution (PR #3 review fix):** every count in the table
+> above is for the **combined branch** named in this report's header
+> (66 baseline + test13's 18 = 84, including the test13-only and
+> live-demo rows — test13 and the live adapter belong to the pending
+> Change B). **Change A**, into which this record is copied, contains
+> only the 66-test suite; Change A's public docs state 66 for this
+> change and attribute 84 explicitly to the combined branch / Change B.
+
 ### Neutrality scan (grep-based, documented per Phase 2A Task 7)
 
 Scope scanned: `spec/`, `conformance/`, `README.md`, `docs/`,
@@ -70,7 +78,8 @@ frozen spec is untouched.
    reasoning retracted. No behavior change.
 3. `reference/tests/test11-chargebee.test.ts` — assertions rewritten
    per CLAIM-CORRECTION-MATRIX §C (11a, 11b, 11c, 11d, 11e, 11g, 11h,
-   11i title, 11j). Suite total unchanged (84).
+   11i title, 11j). Suite total unchanged (84 on the combined branch;
+   Change A's suite is 66).
 4. `reference/src/live/chargebee-scq-adapter.ts`,
    `reference/src/store/quote-store.ts` — comments only (IMMEDIATE-only
    rationale, durability limits, scheduled-change/mandatory-addon
@@ -79,8 +88,9 @@ frozen spec is untouched.
    `CONTRIBUTING.md`, `docs/EXPERIMENTAL-PREVIEW.md`,
    `.github/pull_request_template.md`, `standards/ACP-PRE-SEP.md`,
    `standards/STANDARDS-RECOMMENDATION.md` — repository published /
-   Discussions enabled / limited-historical-evidence labels / 84-test
-   counts.
+   Discussions enabled / limited-historical-evidence labels / test
+   counts (84 on the combined branch; stated as 66 for Change A after
+   the PR #3 review fix).
 6. `conformance/conformance.md` — Chargebee rows updated to the
    corrected tests; counts updated; Phase 2A note added.
 7. `research/EVIDENCE.md` — summary row tempered + Phase 2A correction

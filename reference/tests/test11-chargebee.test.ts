@@ -58,7 +58,7 @@ test("Test 11a (Phase 2A CORRECTED): Chargebee maps cleanly to getSubscription/c
     recurringFinancialEffect: "REVALIDATE",
     termEffect: "UNKNOWN",
     effectiveAt: "REVALIDATE",
-  }, "Phase 2A corrected coverage: REVALIDATE financials, UNKNOWN term, REVALIDATE effectiveAt — matching the live adapter's posture");
+  }, "Phase 2A corrected coverage: REVALIDATE financials, UNKNOWN term, REVALIDATE effectiveAt — matching the experimental live adapter's posture (unpublished Change B)");
 
   const afterQuote = await adapter.getSubscription(sub.id);
   assert.equal(afterQuote.items[0].quantity, 100, "quote must not mutate subscription");
@@ -161,7 +161,8 @@ test("Test 11d (Phase 2A CORRECTED): effectiveIntent DATE and TERM_END are REFUS
   // Create-a-ramp, Early Access), and the future-scheduling path that
   // IS documented on the update endpoint (change_option=specific_date)
   // is deprecated for scheduling. DATE is now refused before any
-  // preview or mutation, like the live adapter (T14).
+  // preview or mutation, like the experimental live adapter in the
+  // unpublished Change B (its mocked-transport test T14).
   await assert.rejects(
     () =>
       adapter.createChangeQuote(sub.id, {
@@ -388,7 +389,7 @@ test("Test 11h (v0.6 CORRECTED, Phase 2A RE-CORRECTED): capability discovery can
   console.log("[Test 11h] Chargebee capability discovery after Phase 2A: coarse REVALIDATE/UNKNOWN everywhere; quote-level divergence survives on termEffect alone (evergreen EXACT, committed-term UNKNOWN) — neither level overstates what enforcement can back.");
 });
 
-test("Test 11i: the Chargebee SIMULATOR exposes no native version field — the adapter falls back to a synthetic content-hash fingerprint (the real API's documented resource_version is a millisecond timestamp used by the live adapter for detection, not a CAS precondition — see API-CONTRACT-AUDIT.md A5)", async () => {
+test("Test 11i: the Chargebee SIMULATOR exposes no native version field — the adapter falls back to a synthetic content-hash fingerprint (the real API's documented resource_version is a millisecond timestamp used by the experimental live adapter (unpublished Change B) for detection, not a CAS precondition — see API-CONTRACT-AUDIT.md A5)", async () => {
   const { sim, sub } = freshChargebeeFixture();
   const adapter = new ChargebeeAdapter(sim, new QuoteStore());
 

@@ -86,10 +86,16 @@ examples change.
 documentation; it is the required parameter of Create-a-ramp. No
 estimate-pinning or replay mechanism is documented for the
 estimate→update pair. After the Phase 2A correction, no Chargebee
-adapter in this repository claims EXACT on any dimension (financial
-dimensions REVALIDATE; termEffect UNKNOWN; effectiveAt REVALIDATE), so
-the published mechanism list and the reference implementation
-disagreed. One historical live case in which an estimate and a commit
+adapter in this repository claims EXACT for any financial dimension or
+for `effectiveAt` (both REVALIDATE), and `termEffect` is UNKNOWN at the
+coarse capability level and for committed-term CANCEL quotes. The
+single remaining quote-level EXACT anywhere in the Chargebee coverage
+is evergreen CANCEL's `termEffect` (Test 11g) — and overall EXACT is
+still refused for every Chargebee action, because an overall EXACT
+request requires every dimension to be EXACT and the financial
+dimensions are REVALIDATE. So the published mechanism list (which
+attributed a financial-pinning mechanism to Chargebee) and the
+reference implementation disagreed. One historical live case in which an estimate and a commit
 agreed ($840, `research/EVIDENCE.md` item 1) is a single observation,
 not a guarantee mechanism, and is not cited as one here.
 
@@ -198,8 +204,9 @@ implementation overclaim).
 
 **Evidence:** `reference/src/store/quote-store.ts` is a volatile
 in-process `Map` (its header states this limit explicitly since
-Phase 2A); test13 T13 demonstrates fail-closed-after-restart behavior
-in the live-shaped adapter, not replay. Chargebee's documented native
+Phase 2A); test13 T13 (in the unpublished Change B — not a test in
+this change) demonstrates fail-closed-after-restart behavior in the
+live-shaped adapter, not replay. Chargebee's documented native
 idempotency (`chargebee-idempotency-key`) replays for 30 minutes,
 returns 422 on same-key/different-parameters, 409 while in flight, and
 caches 5xx responses under the key — useful within its window, never
@@ -239,7 +246,7 @@ carries exactly one of these four classifications:
 | Capability | Classification | Basis |
 |---|---|---|
 | IMMEDIATE via `update_for_items` / `cancel_for_items` — simulator-backed adapter | **Supported and tested** | Test 11 suite (simulator); advertised in `supportedEffectiveIntents` |
-| IMMEDIATE via the experimental live adapter | **Supported and tested** | Mocked-transport tests (test13 T01–T03); live execution BLOCKED (no credentials) — the label covers the tested mocked behavior, not a live claim |
+| IMMEDIATE via the experimental live adapter (unpublished Change B — not part of this change) | **Supported and tested** (within Change B) | Mocked-transport tests (test13 T01–T03) in the unpublished Change B; live execution BLOCKED (no credentials) — the label covers the tested mocked behavior, not a live claim |
 | TERM_END for CANCEL via `cancel_for_items` `end_of_term=true` — simulator-backed adapter only | **Documented but deprecated** | Documented on that endpoint; deprecated-adjacent in current docs; historically observed in the limited v0.5-LIVE research; retained under this label, financial coverage REVALIDATE |
 | TERM_END for update-backed actions (CHANGE_QUANTITY / CHANGE_PLAN / CHANGE_CADENCE) via `update_for_items` | **Unsupported by the current adapter** | Mechanism is documented but deprecated; the simulator never modeled `end_of_term` as the distinct boolean the endpoint takes; refused with `UNSUPPORTED_CHANGE` |
 | DATE via `update_for_items` (`change_option=specific_date` / `changes_scheduled_at`) | **Unsupported by the current adapter** | Documented-but-deprecated scheduling paths; refused by both adapters; DATE via `effective_from`-on-update is NOT ESTABLISHED (ER-2) |

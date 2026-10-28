@@ -94,7 +94,7 @@ examples/                   Concrete normalized proposal/quote/receipt/failure e
 conformance/                Draft conformance suite — maps tests to normative rules
 research/                   Evidence register and full multi-cycle research findings
 standards/                  Fit analysis against ACP and UCP, and a discussion-draft pre-SEP
-reference/                  TypeScript reference implementation and full test suite (84 tests)
+reference/                  TypeScript reference implementation and full test suite (66 tests)
 ```
 
 - [`spec/scq-v0.6.1-spec.md`](spec/scq-v0.6.1-spec.md) — the normative specification. Start here
@@ -147,7 +147,7 @@ npm install
 npm test
 ```
 
-Compiles with `tsc` and runs the full suite (84 tests: 66 baseline + 18 mocked-transport live-shaped tests) via Node's built-in test runner. No
+Compiles with `tsc` and runs the full suite (66 tests) via Node's built-in test runner. No
 external test framework dependency.
 
 ## Community and feedback

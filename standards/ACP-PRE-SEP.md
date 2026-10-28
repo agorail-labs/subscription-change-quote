@@ -405,7 +405,7 @@ The model has been exercised across four different provider shapes:
 - Zuora
 - Chargebee
 
-The v0.6.1 hardening report contained 66 passing tests; the suite has since grown to 84 with the mocked-transport Chargebee live-validation tests (none of them a live API test).
+The v0.6.1 hardening report contained 66 passing tests; the suite on the unpublished combined validation branch has since grown to 84 with the mocked-transport Chargebee live-validation tests (those tests are pending publication as the separate Change B; the suite in this change is 66; none of them is a live API test).
 
 Evidence quality differs by provider and should remain explicit:
 

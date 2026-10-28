@@ -19,6 +19,13 @@ ERRATA-PROPOSAL.md. Language discipline applied throughout: undocumented
 `effective_from` financial pinning is **NOT ESTABLISHED**; no row claims
 proof that no equivalent mechanism exists anywhere.
 
+**Branch note (PR #3 review fix):** this matrix records the Phase 2A
+audit on the unpublished combined branch. References below to test13
+and to `reference/src/live/*` describe the experimental live adapter
+and its mocked-transport tests, which belong to the pending Change B —
+they are **not** files or tests in Change A, and no test13 case is
+executed by Change A's suite (66 tests).
+
 Evidence shorthand: DOCS = current official docs at
 apidocs.chargebee.com, re-read 2026-10-27 (Phase 1 audit + Phase 2A
 recovery audit); HIST = limited historical live research, prior
@@ -148,13 +155,14 @@ behavior only.
 - **Original wording:** as titled at 5dbb9c7.
 - **Evidence/source:** C-01/C-04/C-05.
 - **Verdict:** not established (11a/11c/11d claims); supported behavior with wrong failing dimension (11b/11j setups).
-- **Correction applied:** 11a rewritten (REVALIDATE end-to-end + EXACT refusal + elapsed-time QUOTE_DRIFTED demonstration); 11b failing dimension → `immediateFinancialEffect`; 11c → REVALIDATE TERM_END cancel; 11d rewritten as DATE/update-TERM_END refusal + capability/enforcement agreement + no-mutation; 11j → REVALIDATE setup (TOCTOU assertions unchanged). Test 12's Chargebee references are engine-level only (12h) or name Chargebee in comments — no Chargebee capability assertion; no change needed. Test 13 (live adapter) already encoded the corrected posture (REVALIDATE/UNKNOWN, IMMEDIATE-only, T14 refusal) — no assertion change; it is the reference the simulator was aligned to.
+- **Correction applied:** 11a rewritten (REVALIDATE end-to-end + EXACT refusal + elapsed-time QUOTE_DRIFTED demonstration); 11b failing dimension → `immediateFinancialEffect`; 11c → REVALIDATE TERM_END cancel; 11d rewritten as DATE/update-TERM_END refusal + capability/enforcement agreement + no-mutation; 11j → REVALIDATE setup (TOCTOU assertions unchanged). Test 12's Chargebee references are engine-level only (12h) or name Chargebee in comments — no Chargebee capability assertion; no change needed. Test 13 (the experimental live adapter's mocked-transport suite — part of the unpublished Change B, not of Change A) already encoded the corrected posture (REVALIDATE/UNKNOWN, IMMEDIATE-only, T14 refusal) — no assertion change; it is the reference the simulator was aligned to.
 
 ### C-18 — Test counts in docs ("66 tests")
 - **Location:** README.md:94,147; conformance/conformance.md:3; docs/EXPERIMENTAL-PREVIEW.md; .github/pull_request_template.md; standards/ACP-PRE-SEP.md:408 (at 5dbb9c7).
 - **Original wording:** suite described as 66 tests (stale after Phase 1 added test13's 18).
 - **Verdict:** contradicted by the suite itself (84 at 5dbb9c7 and after Phase 2A).
 - **Correction applied:** all updated to 84 (66 baseline + 18 mocked-transport), with "no test in the suite is a live API test" stated where counts are advertised. Historical cycle reports inside research-findings.md keep their original counts (history, not current advertising).
+- **Review-fix clarification (Change A, PR #3):** the 84 count is the **combined branch's** suite (66 + test13's 18). Change A does not contain test13 (it is the pending Change B), so Change A's own suite is **66 tests**, and Change A's public docs (README, PR template, conformance map, preview, pre-SEP) now state 66 for this change and attribute 84 explicitly to the combined branch / Change B.
 
 ## D. Specification (frozen — errata only, NO text changed)
 
@@ -206,6 +214,10 @@ behavior only.
 - **Verdict:** supported (HIST, EVIDENCE item 8). No correction. Its evidence-level sentence in ACP-PRE-SEP §"evidence" list ("live test-site API validation was performed for the testable scenarios") was reworded per C-25 to "limited historical live test-site observations … not a validation of the current adapters".
 
 ### C-27 — Live adapter claims (reference/src/live/*) — audited, retained
+
+> Scope note: `reference/src/live/*` is **not in Change A** — it is the
+> experimental live adapter belonging to the pending Change B. This
+> entry records its Phase 2A audit on the combined branch.
 - **Claims:** REVALIDATE/REVALIDATE/UNKNOWN/REVALIDATE coverage; IMMEDIATE-only with TERM_END/DATE refused; BEST_EFFORT; `replace_items_list=true` + full list; `invoice_immediately=false`; quote-derived native idempotency key; lost-response reconcile-by-read; restart fail-closed (T13).
 - **Evidence/source:** DOCS (audit A1-A9; recovery audit for the scheduled-change/mandatory-addon caveats).
 - **Verdict:** supported as DOCUMENTATION_SUPPORTED + SIMULATED (mocked transport). Live behavior: BLOCKED (no credentials in either run) — no LIVE_* label is used for this adapter anywhere, enforced by Test 13-classifications.

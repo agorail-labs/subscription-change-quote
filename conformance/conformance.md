@@ -1,9 +1,10 @@
 # SCQ v0.6.1 — Draft Conformance Suite
 
-This document maps the existing test suite (`tests/*.test.ts`, 84 executed test cases across 12
-files, all passing as of the Phase 2A correction — 66 baseline cases plus 18 mocked-transport
-cases in `test13-chargebee-http.test.ts`; no case in the suite is a live API test) onto the
-normative rules in `scq-v0.6.1-spec.md` §6.
+This document maps the existing test suite (`tests/*.test.ts`, 66 executed test cases across 11
+files, all passing as of the Phase 2A correction; no case in the suite is a live API test) onto
+the normative rules in `scq-v0.6.1-spec.md` §6. (The unpublished combined branch adds the
+experimental live adapter's 18 mocked-transport cases in `test13-chargebee-http.test.ts` —
+84 cases there; test13 belongs to the pending Change B and is not executed by this change.)
 
 > **Phase 2B note (2026-10-27):** the dated v0.6.1 errata package
 > (`spec/ERRATA-v0.6.1.md`, entries ER-1…ER-4) corrects the spec's
@@ -20,7 +21,9 @@ normative rules in `scq-v0.6.1-spec.md` §6.
 > **Phase 2A note (2026-10-27):** the Chargebee rows below were updated for the
 > claim corrections in `research/chargebee-live-v1/CLAIM-CORRECTION-MATRIX.md`:
 > the simulator-backed Chargebee adapter now reports REVALIDATE financial
-> coverage (EXACT refused), UNKNOWN termEffect, REVALIDATE effectiveAt, and
+> coverage (EXACT refused), UNKNOWN termEffect at the coarse level (the one
+> quote-level exception — evergreen CANCEL `termEffect` EXACT — is covered in
+> §6.5/§6.9), REVALIDATE effectiveAt, and
 > refuses DATE (all actions) and TERM_END (update-backed actions). Tests 11a,
 > 11b, 11d, 11g, 11h, and 11j were rewritten accordingly; their pre-correction
 > assertions are preserved in git history at commit 5dbb9c7. It is
@@ -45,7 +48,7 @@ npm ci
 npm test
 ```
 
-Compiles via `tsc` then runs `node --test dist/tests/*.test.js`. All 84 test cases currently
+Compiles via `tsc` then runs `node --test dist/tests/*.test.js`. All 66 test cases currently
 pass. There is no separate "conformance" npm script — this document is a curated view over the
 same suite, not a different one.
 
@@ -103,7 +106,9 @@ file — the gap being closed was in AUTOMATED verification, not in an actual de
 **Phase 2A change:** Chargebee previously appeared in this row as an EXACT-capable provider
 whose only EXACT-refusal was termEffect. After the correction, NO Chargebee action in the
 simulator-backed adapter backs an overall EXACT request; refusals name
-`immediateFinancialEffect` first. The live adapter (test13, T11) refuses identically.
+`immediateFinancialEffect` first. The experimental live adapter in the
+unpublished Change B refuses identically in its mocked-transport tests (test13, T11);
+test13 is not part of this change.
 
 **Coverage: full (all 4 providers), including the v0.6-added committed-term CANCEL refusal.**
 
@@ -140,7 +145,7 @@ Low-priority given the shared-type structure, noted for completeness.**
 | Stripe | Test 10a: `effectiveIntent: {type:"DATE"}` refused with `UNSUPPORTED_CHANGE` |
 | Paddle | Test 10b: same |
 | Zuora | Test 10d: `DATE` honored (native future-dating) |
-| Chargebee | Test 11d (Phase 2A CORRECTED): `DATE` REFUSED, and `TERM_END` refused for update-backed actions — the previously claimed `effective_from`-on-update mechanism is not established in current docs; documented scheduling paths are deprecated toward Early-Access Ramps, which no adapter here implements. `TERM_END` remains honored for CANCEL only (separate endpoint, deprecated-but-documented, historically observed). Live adapter: T14 refuses both. |
+| Chargebee | Test 11d (Phase 2A CORRECTED): `DATE` REFUSED, and `TERM_END` refused for update-backed actions — the previously claimed `effective_from`-on-update mechanism is not established in current docs; documented scheduling paths are deprecated toward Early-Access Ramps, which no adapter here implements. `TERM_END` remains honored for CANCEL only (separate endpoint, deprecated-but-documented, historically observed). Experimental live adapter (unpublished Change B): its mocked-transport test T14 refuses both — not part of this change. |
 
 **Coverage: full for the DATE-refusal / DATE-acceptance split (DATE is now refused by
 Stripe, Paddle, AND Chargebee, and honored only by Zuora). GAP: no test explicitly
@@ -177,7 +182,7 @@ recorded as unresolved (see below).
 
 | Test |
 |---|
-| Test 11g (v0.6 CORRECTED): asserts `UNSUPPORTED_CHANGE`/`termEffect` failing-dimension on an overall EXACT request, and `guaranteeCoverage.termEffect === "UNKNOWN"` on a REVALIDATE quote against a committed-term fixture |
+| Test 11g (v0.6 CORRECTED, Phase 2A re-corrected): asserts `UNSUPPORTED_CHANGE` with `failingDimension: "immediateFinancialEffect"` on an overall EXACT request against a committed-term fixture (the financial dimensions are REVALIDATE and fail first — the refusal does NOT name `termEffect`), and, as a separate assertion, `guaranteeCoverage.termEffect === "UNKNOWN"` on a REVALIDATE quote against the same committed-term fixture |
 | Test 11h (v0.6 CORRECTED): cross-checks the same across both evergreen and committed-term fixtures |
 
 **Coverage: full — and these two tests previously asserted the OPPOSITE (that committed-term
@@ -199,8 +204,9 @@ live deployment persists quote, request identity, outcome, and receipt durably, 
 reconciles provider state after an indeterminate outcome before attempting any further
 mutation. The reference implementation's in-memory `QuoteStore` does NOT establish the
 rule across crashes — after a restart adapters fail closed (safe, but not replay
-conformance), and test13 T13 demonstrates exactly that fail-closed behavior rather than
-replay. Provider-native idempotency is not indefinite: Chargebee's documented native
+conformance); that fail-closed behavior (rather than replay) is what the experimental
+live adapter's mocked-transport test demonstrates in the unpublished Change B
+(test13 T13) — no test in this change executes it. Provider-native idempotency is not indefinite: Chargebee's documented native
 window is 30 minutes. Nothing in this suite's passing replay tests should be read as
 evidence of durable exactly-once behavior.
 
@@ -271,12 +277,14 @@ continuity with the prior cycle's record.
 - **G-4 (CLOSED, v0.6.1)**: Paddle now has dedicated multi-change positive (Test 12i) and
   negative (Test 12j) tests, matching Stripe/Zuora/Chargebee.
 - **G-5 (NEW, v0.6.1; partially narrowed since)**: Idempotent commit replay (§6.10) is exercised
-  end-to-end through Stripe and Paddle, and through the live-shaped Chargebee adapter
-  (test13 T06, mocked transport) — but not through Zuora or the simulator-backed Chargebee
-  adapter. The underlying mechanism is shared engine/store code identical across all adapters,
+  end-to-end through Stripe and Paddle, and — on the unpublished combined branch only —
+  through the live-shaped Chargebee adapter (test13 T06, mocked transport; test13 belongs
+  to the pending Change B and is not executed by this change) — but not through Zuora or
+  the simulator-backed Chargebee adapter. The underlying mechanism is shared engine/store
+  code identical across all adapters,
   so this remains analogous in shape to the now-closed G-4, not a known per-provider behavioral
   difference. Separately, replay's durability limit (in-memory store; restart fails closed)
-  is exercised by test13 T13.
+  is exercised by test13 T13 in the unpublished Change B.
 - **G-6 (NEW, v0.6.1)**: No test drives an actual `reconciliation: {status:"VIOLATED"}` result
   through a real adapter's end-to-end `commitChangeQuote` call (only through the isolated engine
   function, Test 12b). Doing so requires a TOCTOU-style concurrent-write injection targeting the

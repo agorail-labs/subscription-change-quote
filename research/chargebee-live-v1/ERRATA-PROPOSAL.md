@@ -32,9 +32,12 @@ Phase 2A recovery audit.
   As written, §4.1 names a mechanism for Chargebee EXACT that the
   documented contract does not establish, and implies a Chargebee
   adapter can back EXACT the way Zuora's `effectiveDate` backs it.
-  After Phase 2A no Chargebee adapter in this repo claims EXACT on
-  any dimension, so the spec's mechanism list and the reference
-  implementation now disagree.
+  After Phase 2A no Chargebee adapter in this repo claims EXACT for
+  any financial dimension (the one remaining quote-level EXACT is
+  evergreen CANCEL's `termEffect`, which no pinning mechanism backs;
+  overall EXACT is refused for every action because the financial
+  dimensions are REVALIDATE), so the spec's mechanism list and the
+  reference implementation now disagree.
 - **Proposed revision (for the spec-revision cycle to wordsmith):**
   remove Chargebee from the pinning-mechanism list in §4.1; add a
   note that Chargebee's documented estimate→update pair has no

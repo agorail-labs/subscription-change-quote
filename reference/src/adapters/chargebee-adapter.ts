@@ -60,7 +60,8 @@ const OFFERING_TO_ITEM_PRICE: Record<string, string> = {
  *   or replay mechanism is documented for the estimate->update pair, and
  *   `effective_from` is NOT a documented `update_for_items` parameter
  *   (it is the required parameter of Create-a-ramp). This adapter now
- *   matches the live adapter's posture (REVALIDATE / REVALIDATE). One
+ *   matches the posture of the experimental live adapter in the
+ *   unpublished Change B (REVALIDATE / REVALIDATE). One
  *   historical live case where estimate and commit agreed ($840,
  *   research/EVIDENCE.md item 1) is a single observation, not a
  *   guarantee mechanism. NOTE the language discipline: undocumented
@@ -174,7 +175,8 @@ function quoteLevelCancelTermCoverage(sub: ChargebeeSubscription): "EXACT" | "UN
  * remains BEST_EFFORT). Note the documented replacement caveats the
  * simulator does not model: `replace_items_list` defaults to false
  * (additive) on the real API, and mandatory addons behave specially
- * (see API-CONTRACT-AUDIT.md A9 and the live adapter). CANCEL is a
+ * (see API-CONTRACT-AUDIT.md A9 and the experimental live adapter in
+ * the unpublished Change B). CANCEL is a
  * distinct endpoint (`cancel_for_items`) that cannot be combined with
  * an update_for_items call in the same request — bundling CANCEL with
  * anything else is UNSUPPORTED.

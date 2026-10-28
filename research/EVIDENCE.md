@@ -108,7 +108,7 @@ The model also shows that a stronger version field improves stale-state detectio
 
 ## Protocol-level evidence
 
-The v0.6 freeze candidate had 54 passing tests. The subsequent v0.6.1 hardening cycle reported **66 passing tests** (that cycle's count), adding coverage for reconciliation, expiration, quote-level commit idempotency, direct partial-execution enforcement, and Paddle multi-change behavior. The Chargebee live-validation experiment later added 18 mocked-transport tests (84 total); none of the 84 is a live API test.
+The v0.6 freeze candidate had 54 passing tests. The subsequent v0.6.1 hardening cycle reported **66 passing tests** (that cycle's count), adding coverage for reconciliation, expiration, quote-level commit idempotency, direct partial-execution enforcement, and Paddle multi-change behavior. The Chargebee live-validation experiment later added 18 mocked-transport tests on the unpublished combined branch (84 total there; the suite in Change A remains 66); none of those tests is a live API test.
 
 The test suite is strongest as evidence that the normalized contract is internally coherent across the four adapter models. It is not a substitute for live integration testing on every provider.
 
