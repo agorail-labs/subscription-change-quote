@@ -8,8 +8,7 @@ implementation, and test suite are not being actively redesigned while feedback 
 - **Open an [Issue](../../issues)** for a specific, actionable problem: a bug in the reference
   implementation, a factual error in the spec or research documents, a conformance-suite gap, or
   a concrete proposed change.
-- **Use [Discussions](../../discussions)** for open-ended questions, architectural feedback, or
-  the standards conversation, including the discussion-draft ACP pre-SEP topic. A published thread or accepted standards submission is not implied.
+- **Use [Discussions](../../discussions)**, once enabled, for open-ended questions, integration experience, architectural feedback, and the draft ACP pre-SEP topic. No accepted standard or existing external standards discussion is implied.
 
 Feedback is triaged as issues first. The protocol itself will not change in response to a single
 comment or discussion post — any actual change to `spec/`, `reference/src/`, or
