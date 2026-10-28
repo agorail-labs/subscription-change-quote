@@ -3,20 +3,21 @@
 **Errata package date: 2026-10-27** (America/Los_Angeles)
 **Applies to:** `spec/scq-v0.6.1-spec.md` as published at commit
 `79200fa4cbcf955c618428c0fca74fd2abce7c9d` (main) — the published spec
-file is **unchanged** by this package (see "Freeze-guard status").
+file is **unchanged** by this package itself (see "Freeze-guard
+status" and the application status below).
 **Prepared in:** Phase 2B; submitted for review in Change A, branch
 `review/change-a-evidence-spec-corrections` (Change A merged as PR #3).
-**Status: PENDING APPLICATION — application prepared, not yet applied.**
-The exact in-spec application of ER-1…ER-4 (including the §5
-revision-history entry) is prepared on branch
-`review/errata-application-v0.6.1` as a narrow PR, with a
+**Status: APPLICATION VIA PR #6.** The exact in-spec application of
+ER-1…ER-4 (including the §5 revision-history entry) is carried by
+pull request #6 (branch `review/errata-application-v0.6.1`), with a
 machine-checkable zero-obligation-change proof
-(`research/errata-application/NORMATIVE-DIFF-PROOF.md`). These errata
-are **not yet applied** to the published `spec/scq-v0.6.1-spec.md` on
-main: application takes effect only when that PR is labeled
-`protocol-change-approved` (the process in §7) and merged, neither of
-which has occurred. Until then the published spec file remains
-unchanged.
+(`research/errata-application/NORMATIVE-DIFF-PROOF.md`). PR #6 is the
+application vehicle for this package, under the
+`protocol-change-approved` process in §7: once that PR is merged,
+these errata stand applied to `spec/scq-v0.6.1-spec.md`, the
+specification (including its §8c revision entry) is authoritative,
+and this package remains as the historical record of what was
+corrected and why.
 **Supersedes as a proposal vehicle:** `research/chargebee-live-v1/ERRATA-PROPOSAL.md`
 (Phase 2A). Items E-1, E-3, E-2, and E-5 of that proposal are resolved
 here as errata ER-1…ER-4 with exact replacement wording. Item E-4
