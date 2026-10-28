@@ -1,73 +1,85 @@
-# Reproduction
+# Reproduction — Chargebee implementation validation (live adapter work)
 
-## Environment
+How to reproduce the findings in this directory: the Chargebee SCQ
+adapter, its mocked test suite, and the classifications recorded in
+TEST-RESULTS.md and `evidence/PHASE3-EVIDENCE-SUMMARY.md`.
 
-- Node.js ≥ 20, npm, TypeScript (repo-pinned via `reference/package-lock.json`).
-- **No Chargebee account, credentials, or network access to Chargebee is required**
-  for everything except the explicitly BLOCKED live rows.
+> **Current state (updated 2026-10-28, PR #4 review round).** The
+> work lives on branch `review/change-b-live-validation-tooling`
+> (draft PR #4 against `main`). An earlier version of this file
+> described the Phase 1 setup (branch
+> `experiment/chargebee-live-validation-v1`, 84 tests, no live
+> evidence) — that text is superseded; the current facts are below.
 
-## Steps
+## Setup
 
-```bash
-git clone https://github.com/arjun2075/subscription-change-quote
-cd subscription-change-quote
-git checkout experiment/chargebee-live-validation-v1   # local branch of this experiment
-# (baseline for comparison: main @ 79200fa4cbcf955c618428c0fca74fd2abce7c9d)
-
+```
+git clone <this repository>
+git checkout review/change-b-live-validation-tooling
 cd reference
 npm ci
-
-# Full suite: baseline 66 + new 18 = 84 tests, all passing, no credentials needed
 npm test
-
-# New tests only
-npx tsc -p tsconfig.json && node --test dist/tests/test13-chargebee-http.test.js
-
-# Package smoke (publishes nothing)
-npm run smoke:pack
-
-# Live driver without credentials: must print the BLOCKED line and claim nothing
-node dist/demo/chargebee-live-validation.js
-# -> BLOCKED — CREDENTIALS NOT AVAILABLE (missing: CHARGEBEE_SITE, CHARGEBEE_API_KEY)
 ```
 
-## Verifying the safety gates
+Environment: Node.js ≥ 20, npm, TypeScript (repo-pinned via
+`reference/package-lock.json`).
 
-```bash
-# 1. Tests pass with live credentials explicitly absent:
-env -u CHARGEBEE_SITE -u CHARGEBEE_API_KEY -u CHARGEBEE_TEST_SUBSCRIPTION_ID npm test
+Baseline: `main` at the merge of Change A (PR #3). The branch adds
+the live adapter (`reference/src/live/`), its test file
+(`reference/tests/test13-chargebee-http.test.ts`), the demo driver
+(`reference/demo/chargebee-live-validation.ts`), and this research
+directory. The frozen protocol files (spec, core types, engine) are
+byte-identical to `main`.
 
-# 2. Live mutation is disabled by default (also covered by Test 13-gate):
-grep -n "SCQ_LIVE_COMMIT_ENABLED" src/live/chargebee-http.ts demo/chargebee-live-validation.ts
+## Expected results (verified 2026-10-28, clean build)
 
-# 3. No normative changes in the experiment diff:
-git diff main -- spec/                     # must be empty (normative spec is frozen;
-                                           # Phase 2A also left spec/ untouched — Chargebee
-                                           # attribution fixes are proposals in
-                                           # research/chargebee-live-v1/ERRATA-PROPOSAL.md)
-git diff main --stat                       # reference/src/live/, reference/demo/,
-                                           # reference/tests/test13-* (Phase 1), plus the
-                                           # Phase 2A correction files listed in
-                                           # PUBLICATION-READINESS.md
-
-# 4. No secrets / PII in tracked files:
-git grep -nEi "test_[a-z0-9]{16,}|live_[a-z0-9]{16,}|api[_-]?key\s*[:=]\s*['\"][^'\"]{8,}" -- . ':!research/chargebee-live-v1/*' || echo "clean"
-```
-
-## Per-test evidence map
-
-| Evidence | Location |
+| Check | Expected |
 |---|---|
-| Baseline + final counts | TEST-RESULTS.md |
-| Doc claim → endpoint → evidence level | API-CONTRACT-AUDIT.md (docs re-read 2026-10-27; Chargebee docs change — re-read before citing) |
-| T01–T14 implementations | `reference/tests/test13-chargebee-http.test.ts` (fake transport is in-file and deterministic; fixed clock 2026-08-01, fixed prices 1000/1500 minor units) |
-| Live adapter behavior | `reference/src/live/chargebee-http.ts`, `reference/src/live/chargebee-scq-adapter.ts` |
-| Sanitized fixtures / run metadata | `research/chargebee-live-v1/evidence/` (gitignored; see its README) |
-| Historical (prior-cycle) live observations | `research/EVIDENCE.md` — **not** produced by this run |
+| `npm test` (after `rm -rf dist node_modules && npm ci`) | **109 tests, 109 pass / 0 fail** (66 baseline suite + 43 test13) |
+| test13 alone (`node --test dist/tests/test13-chargebee-http.test.js`) | 43 pass / 0 fail |
+| `npm run smoke:pack` | OK — protocol simulation package faithful |
+| Provider-neutrality scan (`.github/workflows/ci.yml`) | clean under `reference/src/core` |
+| Freeze guard | 0 differing lines in the three frozen files vs `main` |
+| Demo driver, no credentials | prints `BLOCKED — CREDENTIALS NOT AVAILABLE` and exits without claiming any result |
 
-## Expected results
+All 43 test13 tests run against a mocked transport; no credentials
+are needed and no network calls are made. Mocked results are
+classified SIMULATED_PASS only — never live.
 
-- `npm test`: 84 pass, 0 fail (unchanged total after the Phase 2A claim corrections — assertions changed in Test 11, no tests added or removed).
-- test13 alone: 18 pass, 0 fail.
-- Demo without credentials: BLOCKED line, exit 0, no other claims.
-- Any LIVE_* classification anywhere in this package would be a defect: report it.
+## Live classifications (Phase 3, 2026-10-27 — separate approval, test site only)
+
+These were produced by a separately approved live run, NOT by
+`npm test`, and are recorded with sanitized evidence in
+`evidence/PHASE3-EVIDENCE-SUMMARY.md` (identifiers redacted to
+placeholders):
+
+| Live row | Classification |
+|---|---|
+| L-GET (snapshot via real GET) | LIVE_PASS |
+| L-QUOTE (estimate → quote, per-unit addon quantity change) | LIVE_PASS |
+| flat_fee quantity change | refused pre-call by the adapter (UNSUPPORTED_CHANGE); provider rejection live-verified in the Phase 3 isolation matrix |
+| L-COMMIT | BLOCKED — live commit disabled by design (`SCQ_LIVE_COMMIT_ENABLED` defaults to false); never exercised |
+
+To re-run the live read/estimate path (requires the maintainer's
+own test-site credentials and explicit approval; estimate-only):
+
+```
+cd reference
+CHARGEBEE_SITE=<your-test-site> CHARGEBEE_API_KEY=<test-site-key> npx tsx demo/chargebee-live-validation.ts
+# SCQ_LIVE_COMMIT_ENABLED stays unset/false — the driver never commits.
+```
+
+Do not point the driver at a production site. The live experiment
+to date was estimate-only: it caused no mutation and incurred no
+obligation (see the obligation-timing note in
+`evidence/PHASE3-EVIDENCE-SUMMARY.md`).
+
+## Historical note
+
+Phase 1 (2026-10-27) ran on branch
+`experiment/chargebee-live-validation-v1` with 84 tests and all live
+rows BLOCKED (no credentials). That branch is retained for history;
+Phase 2B split it into Change A (merged as PR #3) and this Change B
+branch. Phase 1 statements in this directory that say "all live
+BLOCKED" describe that run and are superseded for the read/estimate
+scope by the Phase 3 classifications above.

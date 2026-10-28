@@ -1,5 +1,20 @@
 # SCQ Live Chargebee Validation v1 — Validation Plan
 
+> **SUPERSEDED IN PART (2026-10-28, PR #4 review round).** This is
+> the Phase 1 plan, preserved as written. Its scope statements —
+> local-only branch, no credentials, all live rows BLOCKED —
+> describe Phase 1 only. The work has since been split and
+> published for review (this branch:
+> `review/change-b-live-validation-tooling`, draft PR #4), and a
+> separately approved Phase 3 run exercised the live read/estimate
+> paths on a test site: **L-GET LIVE_PASS, L-QUOTE LIVE_PASS,
+> flat_fee quantity refusal live-verified, L-COMMIT still
+> BLOCKED** (see `evidence/PHASE3-EVIDENCE-SUMMARY.md` and the
+> Phase 3 addendum in TEST-RESULTS.md). The plan's safety
+> constraints (test site only, commit disabled by default, no
+> production access, no live mutation without separate approval)
+> remain in force.
+
 - **Repository:** subscription-change-quote, base `main`
 - **Baseline commit (verified HEAD before work began):** `79200fa4cbcf955c618428c0fca74fd2abce7c9d` — matches the mission's reference starting commit exactly.
 - **Working branch (local only, never pushed):** `experiment/chargebee-live-validation-v1`

@@ -16,6 +16,11 @@ Rules for anything placed here:
 In this run the directory is empty of fixtures by design: all live cases were
 BLOCKED — CREDENTIALS NOT AVAILABLE, and mocked-transport fixtures are preserved
 in-file in `reference/tests/test13-chargebee-http.test.ts` where they are executable.
+*(The "in this run / BLOCKED" statements describe Phase 1. Phase 3
+later produced the summary below; account identifiers in it were
+redacted to placeholders — `<test-site>`, `<subscription-id>`,
+`<quote-id>` — in the PR #4 review round, 2026-10-28; catalog
+item-price SKUs are retained.)*
 
 **Exception (Phase 3, 2026-10-27):** `PHASE3-EVIDENCE-SUMMARY.md` in this
 directory IS tracked (see the `.gitignore` exception). It is a sanitized,

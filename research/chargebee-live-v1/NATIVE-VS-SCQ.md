@@ -138,7 +138,11 @@ Some value is demonstrated (B1–B5), but current claims exceed the evidence in 
 ranked ways (LIMITATIONS-AND-GAPS.md D-1…D-7): the simulator adapter's EXACT financial
 coverage for Chargebee is not supported by the current documented contract; TERM_END/
 DATE support rests on deprecated or early-access mechanisms; and no live evidence was
-added by this run (all live cases BLOCKED). Narrowing the Chargebee claims to what the
+added by this run (all live cases BLOCKED). *(Phase 1 statement.
+Phase 3 (2026-10-27) later added live READ/ESTIMATE evidence only
+— L-GET and L-QUOTE LIVE_PASS; no commit was ever exercised live,
+so the NARROW_SCOPE recommendation and the commit-side reasoning
+are unchanged.)* Narrowing the Chargebee claims to what the
 live adapter honestly reports — REVALIDATE financials, UNKNOWN term, IMMEDIATE-only
 until Ramps is implemented and validated — matches the evidence. PROCEED_TO_SECOND_
 PROVIDER would be premature until D-1/D-2 are resolved, because a second provider

@@ -116,3 +116,11 @@ future SCQ work cites the update page's (stronger) deprecation.
 - **This run added zero live evidence**: all live rows are BLOCKED by design
   (no credentials). Any future claim upgrade requires the approved live experiment in
   TEST-RESULTS.md.
+  *(Phase 1 statement, preserved. SUPERSEDED for the read/estimate
+  scope by Phase 3 (2026-10-27): L-GET and L-QUOTE are LIVE_PASS
+  and the flat_fee quantity refusal is live-verified — see
+  `evidence/PHASE3-EVIDENCE-SUMMARY.md`. L-COMMIT remains BLOCKED
+  and no live commit evidence exists. The other gaps in this
+  document — durability, atomicity, reconciliation-prevention,
+  Ramps/scheduled changes, second-provider portability — are
+  unaffected.)*
