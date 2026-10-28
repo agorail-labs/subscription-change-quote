@@ -5,12 +5,18 @@
 `79200fa4cbcf955c618428c0fca74fd2abce7c9d` (main) — the published spec
 file is **unchanged** by this package (see "Freeze-guard status").
 **Prepared in:** Phase 2B; submitted for review in Change A, branch
-`review/change-a-evidence-spec-corrections`.
-**Status: PENDING APPLICATION.** These errata are **not yet applied** to
-`spec/scq-v0.6.1-spec.md`. The published spec file is unchanged by this
-package; in-spec application is a separate later change under the
-process in §7 (the `protocol-change-approved` mechanism) or a future
-versioned release.
+`review/change-a-evidence-spec-corrections` (Change A merged as PR #3).
+**Status: PENDING APPLICATION — application prepared, not yet applied.**
+The exact in-spec application of ER-1…ER-4 (including the §5
+revision-history entry) is prepared on branch
+`review/errata-application-v0.6.1` as a narrow PR, with a
+machine-checkable zero-obligation-change proof
+(`research/errata-application/NORMATIVE-DIFF-PROOF.md`). These errata
+are **not yet applied** to the published `spec/scq-v0.6.1-spec.md` on
+main: application takes effect only when that PR is labeled
+`protocol-change-approved` (the process in §7) and merged, neither of
+which has occurred. Until then the published spec file remains
+unchanged.
 **Supersedes as a proposal vehicle:** `research/chargebee-live-v1/ERRATA-PROPOSAL.md`
 (Phase 2A). Items E-1, E-3, E-2, and E-5 of that proposal are resolved
 here as errata ER-1…ER-4 with exact replacement wording. Item E-4

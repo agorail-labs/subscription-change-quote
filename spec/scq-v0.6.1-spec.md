@@ -94,8 +94,8 @@ silently substitute a different intent (e.g. silently treating a rejected `DATE`
 could not distinguish "run this now" from "schedule this for a specific future instant" from
 "defer this to whenever the current term happens to end" — three semantically and mechanically
 different requests that, on Zuora and Chargebee, invoke different native code paths
-(`effectiveDate` vs `end_of_term=true` boolean vs `effective_from` timestamp on Chargebee
-specifically). v0.5 additionally had a duplicate, inconsistently-populated `effectivePolicy`
+(`effectiveDate` on Zuora; historically an `end_of_term=true` boolean on Chargebee). v0.5
+additionally had a duplicate, inconsistently-populated `effectivePolicy`
 field on some `ChangeSpec` variants. v0.6 unifies both into one required, closed-union field.
 
 ### 3.2 `ChangeSpec`
@@ -274,8 +274,8 @@ adjustment applied by the provider as a step separate from the pinned computatio
 cycles' prose ("the commit is guaranteed to reproduce the quoted commercial effect exactly")
 was broader than what any adapter's mechanism actually backs, and could be misread by an
 integrator as a whole-invoice guarantee. This section replaces that prose with the corrected,
-narrower claim below. No adapter's actual EXACT mechanism changed — Stripe's, Zuora's, and
-Chargebee's `proration_date`/`effectiveDate`/`effective_from` pinning already only ever
+narrower claim below. No adapter's actual EXACT mechanism changed — Stripe's and Zuora's
+`proration_date`/`effectiveDate` pinning already only ever
 computed the specific dimensions `GuaranteeCoverage` models; this correction brings the WORDING
 in line with what those mechanisms have always actually done.
 
@@ -286,7 +286,7 @@ Mechanically, an adapter achieves this either by:
 - Pinning a wall-clock-dependent computation basis at quote time and replaying it verbatim at
   commit time (Stripe's `proration_date`), or
 - Having order/estimate math that is inherently a pure function of an explicit, caller-supplied
-  instant rather than ambient "now" (Zuora's `effectiveDate`, Chargebee's `effective_from`).
+  instant rather than ambient "now" (Zuora's `effectiveDate`).
 
 EXACT MUST be requested and enforced per the full `GuaranteeCoverage` (all four dimensions), not
 per financial dimension alone (this was a v0.3→v0.4 correction — see `research-findings.md`
@@ -465,6 +465,18 @@ termEffect: "UNKNOWN"`, not `"EXACT"`. This retracts a v0.5 simulator-only claim
   (b) the quote's `validUntil` has since passed (per the expiration rule above, this does not
   retroactively un-commit an already-committed quote).
 
+**Conformance note on 6.10 (errata, documentation only — the rule above is unchanged):** the
+idempotency rule presumes the implementation can retrieve the original receipt on a repeated
+commit, including after a process restart and after an indeterminate commit outcome (the
+mutation may have succeeded while its response was lost). A conforming live deployment
+therefore requires durable persistence of the quote, its request identity, its outcome, and its
+receipt, plus a safe recovery procedure that reconciles provider state after an indeterminate
+outcome before any further mutation is attempted. The reference implementation's in-memory
+`QuoteStore` does NOT establish this guarantee across crashes: after a restart it can only fail
+closed, which is safe but is not conformance with the replay requirement. Provider-native
+idempotency is not a substitute and is not indefinite: Chargebee's documented native idempotency
+window is 30 minutes.
+
 **6.11 (v0.6.1, NEW — post-commit reconciliation)** Every REVALIDATE commit MUST re-check
 `committedEffect` against the proposal's `acceptanceEnvelope` (using the SAME envelope the
 pre-mutation check used) immediately after the mutating call returns, and MUST surface the
@@ -523,6 +535,17 @@ No provider was added or removed in either diff. No change action was added or r
 either diff. v0.6.1's schema addition (`reconciliation`) is the only new wire-visible field;
 `commit_receipt` is an internal store-side cache, never serialized as part of any SCQ type.
 
+### 8c. Errata record (added by the labeled errata application; §8a/§8b tables unaltered)
+
+> **Errata 2026-10-27 (factual corrections only — no normative change):** §4.1 no longer
+> attributes an `effective_from` pinning mechanism to Chargebee (ER-1); §9 U-5 no longer
+> characterizes Chargebee DATE support as verified-once — DATE via `update_for_items` is NOT
+> ESTABLISHED in the current documented contract and `end_of_term` is deprecated-but-documented
+> (ER-2); §3.1's rationale examples are marked historical (ER-3); §6.10 gains a conformance note
+> documenting the durable-persistence presumption of the idempotency rule (ER-4). Full
+> before/after wording: `spec/ERRATA-v0.6.1.md`. No MUST/MUST NOT, type, definition, or
+> supported action changed.
+
 ---
 
 ## 9. Unresolved Issues (carried into external review)
@@ -554,12 +577,14 @@ list also duplicated in `research-findings.md`'s v0.6 and v0.6.1 sections.
   a bare rate-plan-swap order action does not reliably surface whether it interacts with
   contract-term/renewal-anchor structure without an explicit accompanying
   `TermsAndConditions` order action, which SCQ still does not model. **Unchanged by v0.6.1.**
-- **U-5 — Chargebee's `effective_from` vs `end_of_term` distinction is modeled** (via
-  `EffectiveIntent.DATE` vs `.TERM_END`), closing the v0.5-LIVE gap — but only ONE of the two
-  mechanisms (`end_of_term`) was independently re-verified against a fresh, isolated raw
-  request/response pair during v0.5-LIVE; `effective_from` was verified via the original
-  Experiment 2 pass only. Treat `DATE` support on Chargebee as verified-once, not
-  extensively-verified. **Unchanged by v0.6.1.**
+- **U-5 — Chargebee scheduling mechanisms.** `EffectiveIntent` models `TERM_END` and `DATE`
+  as distinct intents; the schema distinction is unchanged. `end_of_term` was independently
+  re-verified against a fresh, isolated raw request/response pair during v0.5-LIVE and is
+  now deprecated-but-documented in current Chargebee Product Catalog 2.0 documentation
+  (deprecated in favor of Ramps, Early Access). DATE via `update_for_items` is NOT
+  ESTABLISHED in the current documented contract: `effective_from` is not a documented
+  parameter of that endpoint, and the earlier characterization of DATE support as
+  verified-once is withdrawn. Both reference Chargebee adapters refuse DATE.
 - **U-6 (RESOLVED this cycle, was open since v0.6)** — `UNSUPPORTED_CHANGE_SET` previously had
   no test that triggered it end-to-end, since no adapter's real call construction risks the
   failure mode it guards against. **Closed by a direct unit test against
