@@ -207,5 +207,13 @@ test("Test 10h: single-change proposal behaves identically to the pre-v0.5 shape
   const receipt = await adapter.commitChangeQuote(quote.id);
   assert.equal(receipt.status, "COMMITTED");
   assert.equal(receipt.resultingSnapshot.items[0].quantity, 120);
-  assert.deepEqual(receipt.committedEffect, receipt.quotedEffect, "single-change zero-drift case still matches exactly");
+  // PR-3 DISCLOSED EXPECTATION CHANGE (v0.6.2 Stripe migration):
+  // whole-effect deepEqual(committedEffect, quotedEffect) is no
+  // longer the contract — a committed effect carries committed
+  // provenance (CORE-2: here, provider_actual figures read back
+  // post-commit) that a quote-side effect never asserts. The
+  // zero-drift FIGURES still match exactly; assert those.
+  assert.deepEqual(receipt.committedEffect.immediate, receipt.quotedEffect.immediate, "single-change zero-drift case: committed figures still match the quote exactly");
+  assert.deepEqual(receipt.committedEffect.recurring, receipt.quotedEffect.recurring);
+  assert.equal(receipt.committedEffect.provenance?.committedSource, "provider_actual");
 });
