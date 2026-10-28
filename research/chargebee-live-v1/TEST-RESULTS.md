@@ -324,3 +324,70 @@ FAIL against the pre-fix code; 13-rec3 (preservation) and 13-rec4
 | Provider-neutrality scan | clean |
 | Freeze guard (frozen files vs merged main) | 0 differing lines |
 | Live rows | unchanged: L-GET LIVE_PASS, L-QUOTE LIVE_PASS, flat_fee refusal live-verified (Phase 3), L-COMMIT BLOCKED — no live calls in this round |
+
+## PR #4 final review addendum (2026-10-28) — absent collection is not zero; receipts require a verified item set
+
+A final review of draft PR #4 at `3fad741` found two remaining
+post-commit correctness issues in the experimental live adapter.
+Both are fixed in this round. **No live API calls were made** — all
+new tests are mocked, and live commit remains disabled.
+
+### Fix A — an absent post-commit item collection is UNDETERMINED, never a verified zero
+
+`committedEffectFromState` read the re-read post-commit items via
+`after.subscription_items ?? []`. When the `subscription_items`
+member was ABSENT from the re-read response, the empty default made
+the stated-amount check vacuously true and produced
+`recurringAmount = 0` — an invented figure indistinguishable from a
+verified zero, which could then anchor a receipt's reconciliation.
+Now: an absent member, an explicitly empty collection (the intended
+item set is never empty), or any incomplete item entry (missing
+`item_price_id`, `quantity`, or a stated `amount`) makes the
+recurring dimension UNDETERMINED, and the commit fails closed as
+indeterminate with no receipt — the same mechanism as the other
+undetermined dimensions. Explicitly observed zeros are preserved:
+an item whose stated amount is literally 0 contributes 0, and a
+verified sum of 0 is a determined zero.
+
+### Fix B — a COMMITTED receipt requires the intended item set to be established
+
+The success path previously recorded a receipt after a 2xx update
+response plus a financial re-read, without ever verifying that the
+ACTUAL post-commit item IDs and quantities equal the quote's
+intended target set. A provider that returns HTTP 200 while
+silently ignoring or partially applying the requested change would
+have been reported as a verified COMMITTED — amounts computed on
+the wrong item set can still satisfy the financial envelope. Now,
+before any receipt is recorded, the re-read items are compared
+against the intended set (same `item_price_id` multiset — no
+missing, extra, or duplicated entries — with equal quantities per
+item, via a shared `itemSetMismatches` comparison also used by the
+lost-response landing check). Any mismatch ⇒ indeterminate
+`PROVIDER_ERROR` carrying the mismatch detail, and NO receipt —
+even if the envelope would pass.
+
+New tests (mocked): 13-rec5 (re-read omits `subscription_items`
+entirely → indeterminate, no receipt), 13-rec6 (an item with a
+stated amount of exactly 0 in a complete, matching set → receipt
+records the determined zero), 13-rec7 (update returns 200 with
+envelope-satisfying financials but the provider silently ignored
+the change → indeterminate, no receipt), 13-rec8 (partial apply:
+re-read quantity 110 of the intended 120 → indeterminate, no
+receipt), 13-rec9 (extra item; duplicated entry → indeterminate,
+no receipt), 13-rec10 (positive control: exact match → receipt
+records as before, reconciliation OK). **Spot-check:** 13-rec5,
+13-rec7, 13-rec8, and 13-rec9 FAIL against the pre-fix code
+(scratch worktree at `3fad741`, new test file only — 49 tests,
+45 pass / 4 fail there); 13-rec6 and 13-rec10 are preservation
+controls and pass on both, as designed.
+
+### Totals after this round
+
+| Suite | Result |
+|---|---|
+| Full clean build (`rm -rf dist node_modules`, `npm ci`, `npm test`) | **115 pass / 0 fail** (66 baseline + 49 test13) |
+| test13 file | 49 tests (43 pre-existing + 6 new) |
+| `npm run smoke:pack` | OK |
+| Provider-neutrality scan | clean |
+| Freeze guard (frozen files vs merged main) | 0 differing lines |
+| Live rows | unchanged: L-GET LIVE_PASS, L-QUOTE LIVE_PASS, flat_fee refusal live-verified (Phase 3), L-COMMIT BLOCKED — no live calls in this round |

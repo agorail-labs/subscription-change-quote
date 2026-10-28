@@ -35,14 +35,14 @@ byte-identical to `main`.
 
 | Check | Expected |
 |---|---|
-| `npm test` (after `rm -rf dist node_modules && npm ci`) | **109 tests, 109 pass / 0 fail** (66 baseline suite + 43 test13) |
-| test13 alone (`node --test dist/tests/test13-chargebee-http.test.js`) | 43 pass / 0 fail |
+| `npm test` (after `rm -rf dist node_modules && npm ci`) | **115 tests, 115 pass / 0 fail** (66 baseline suite + 49 test13) |
+| test13 alone (`node --test dist/tests/test13-chargebee-http.test.js`) | 49 pass / 0 fail |
 | `npm run smoke:pack` | OK — protocol simulation package faithful |
 | Provider-neutrality scan (`.github/workflows/ci.yml`) | clean under `reference/src/core` |
 | Freeze guard | 0 differing lines in the three frozen files vs `main` |
 | Demo driver, no credentials | prints `BLOCKED — CREDENTIALS NOT AVAILABLE` and exits without claiming any result |
 
-All 43 test13 tests run against a mocked transport; no credentials
+All 49 test13 tests run against a mocked transport; no credentials
 are needed and no network calls are made. Mocked results are
 classified SIMULATED_PASS only — never live.
 
