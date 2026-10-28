@@ -207,6 +207,16 @@ export type SubscriptionSnapshot = {
   billing: {
     currency: string;
     recurringAmount?: number;
+    /**
+     * v0.6.2 (CORE-7, additive): the determinacy state of
+     * `recurringAmount` — whether the figure is a determined value or
+     * was produced by a fallback computation whose result is not
+     * established. Absent on a legacy (v0.6.1) snapshot => the figure
+     * reads UNKNOWN under the v0.6.2 migration reading. No v0.6.1
+     * consumer reads this field; it exists so a number is never left
+     * to imply a determinacy its producer did not establish.
+     */
+    recurringAmountState?: DimensionState;
     cadence?: string;
     nextBillingAt?: string;
   };
@@ -272,11 +282,112 @@ export type SubscriptionChangeProposal = {
 } & GuaranteeFields;
 
 export type CommercialEffect = {
+  /**
+   * v0.6.2 DEFINITION (CORE-3 — this field previously had NO normative
+   * definition; see the v0.6.2 design, Topic 3): `immediate` is the net
+   * financial obligation the change itself incurs at its effective
+   * time — prorations, immediate charges/credits — whether or not an
+   * invoice has been issued, an amount is due, or cash has moved. It
+   * is NOT a next-invoice total and NOT an amount due: an amount due
+   * is net of customer balance/credits applied to a future invoice,
+   * and credits reduce amounts due without ever changing incurred
+   * obligations or prices, so amount-due and next-invoice figures
+   * must NEVER be carried in this field (or in `recurring`) — they
+   * belong in `providerMetadata` under the `nextInvoiceEstimate`
+   * convention. An invoiced total may populate this field ONLY
+   * insofar as it is this same incurred obligation in invoiced form;
+   * an invoice total aggregating other charges is not `immediate`.
+   * Cash collected is not modeled anywhere in SCQ.
+   */
   immediate?: { charge?: number; credit?: number; net?: number };
   recurring?: { previousAmount?: number; resultingAmount?: number; currency: string; cadence?: string };
   term?: { createsCommitment?: boolean | Unknown; commitmentUntil?: string | Unknown; autoRenew?: boolean };
   effectiveAt?: string;
+  /**
+   * v0.6.2 (CORE-1, additive): explicit per-dimension determinacy.
+   * Absent on a legacy (v0.6.1) payload => every dimension reads
+   * UNKNOWN for enforcement/reconciliation (see `determinacyOf` in
+   * scq-engine.ts and spec §10). v0.6.2-conforming adapters MUST emit
+   * this on every effect they produce. Dimension-level, matching the
+   * granularity the acceptance envelope bounds (immediate.net,
+   * recurring.resultingAmount); `term`/`effectiveAt` keep their
+   * existing coverage mechanisms (GuaranteeCoverage.termEffect
+   * already has an UNKNOWN state). A field present with value 0 under
+   * DETERMINED is a verified zero and MUST be emitted as
+   * present-with-0 — never re-encoded as absent.
+   */
+  determinacy?: {
+    immediateFinancialEffect: DimensionState;
+    recurringFinancialEffect: DimensionState;
+  };
+  /**
+   * v0.6.2 (CORE-2, additive): provenance for this effect's figures.
+   * A determinacy assertion is only as good as the provenance that
+   * backs it; reconciliation (in a later v0.6.2 step) reads
+   * `committedSource` to decide whether committed figures are
+   * reconcilable actuals at all.
+   */
+  provenance?: {
+    /** Adapter-recorded basis for the immediate figure (provider field(s) or computation). Free-form audit string. */
+    immediate?: string;
+    /** Same, for the recurring figure. */
+    recurring?: string;
+    /** Meaningful on committed effects: what the committed figures ARE. Absent => "unestablished" for reconciliation. */
+    committedSource?: CommittedFigureSource;
+    /**
+     * Findings-closure F2: the licensing citations for any
+     * NOT_APPLICABLE assertions on this effect, keyed by dimension.
+     * Each citation names the (action, dimension) pair in the
+     * applicability table that licenses the assertion, and its
+     * `action` must match the authoritative action of the proposal
+     * under evaluation. An assertion without a valid citation is
+     * unjustified — agreement between two effects asserting the
+     * same NOT_APPLICABLE is not proof of applicability.
+     */
+    applicabilityCitations?: Partial<Record<FinancialDimension, ApplicabilityCitation>>;
+  };
 };
+
+/**
+ * v0.6.2 (CORE-1): the determinacy state of one financial dimension
+ * of a CommercialEffect. The three states are mutually exclusive and
+ * exhaustive, with NO implicit conversions between them at any layer:
+ * a verified zero is DETERMINED with value 0; NOT_APPLICABLE is a
+ * claim that the dimension does not arise for the action (licensed
+ * only by the applicability table — see `ApplicabilityCitation`);
+ * UNKNOWN is the absence of an established value, and is also the
+ * reading of any dimension on a legacy payload that carries no
+ * determinacy record.
+ */
+export type DimensionState = "DETERMINED" | "NOT_APPLICABLE" | "UNKNOWN";
+
+/** The two financial dimensions a CommercialEffect's determinacy record covers. */
+export type FinancialDimension = "immediateFinancialEffect" | "recurringFinancialEffect";
+
+/**
+ * v0.6.2 (CORE-2 / findings-closure F2): a citation of the
+ * applicability-table entry that licenses a NOT_APPLICABLE assertion
+ * — the (action, dimension) pair relied upon.
+ */
+export type ApplicabilityCitation = { action: ChangeAction; dimension: FinancialDimension };
+
+/**
+ * v0.6.2 (CORE-2): what a committed effect's figures ARE, as recorded
+ * by the adapter that produced them. Only "provider_actual" (derived
+ * from provider state/actuals read after — or returned by — the
+ * mutating call) and "defined_equal_exact" (EXACT mode: committed :=
+ * quoted BY PROTOCOL DEFINITION) are reconcilable sources; a
+ * revalidated preview or a pre-mutation estimate is quote-side data
+ * and can never serve as the committed actual, and "unestablished"
+ * (also the reading when the field is absent) means no source could
+ * be established.
+ */
+export type CommittedFigureSource =
+  | "provider_actual"
+  | "revalidated_preview"
+  | "pre_mutation_estimate"
+  | "defined_equal_exact"
+  | "unestablished";
 
 /**
  * v0.4/v0.5, unchanged: per-dimension guarantee coverage. See file header
@@ -379,15 +490,83 @@ export type SubscriptionChangeQuote = {
  * succeeded within their stated tolerance when, because
  * `ConsistencyGuarantee: "BEST_EFFORT"` means a concurrent write could have
  * landed after the last pre-mutation check, that turned out not to be true.
+ *
+ * v0.6.2 (CORE-4): the union gains a third variant, `"UNVERIFIED"` — the
+ * reconciliation could not be established at all (committed figures of
+ * unestablished or quote-side provenance, or a dimension whose
+ * determinacy is UNKNOWN), which is a DIFFERENT claim from both "OK"
+ * (verified within envelope) and "VIOLATED" (verified outside it). An
+ * unverified commit must never be reported as OK, and must never be
+ * silently collapsed into VIOLATED either: the figures were never
+ * measured, so there is nothing to have violated. Widening this union
+ * is deliberately loud for exhaustive consumers (BC-5): a switch that
+ * handled only OK/VIOLATED fails to compile against the new variant
+ * rather than silently misclassifying unverified commits. This type
+ * is defined HERE, in types.ts, as the single canonical definition —
+ * scq-engine.ts re-exports it (the pre-v0.6.2 duplicate definition in
+ * the engine is removed so the two can never fork).
  */
 export type ReconciliationResult =
   | { status: "OK" }
-  | { status: "VIOLATED"; reason: string };
+  | { status: "VIOLATED"; reason: string }
+  | { status: "UNVERIFIED"; reason: string; undeterminedDimensions: string[] };
+
+/**
+ * v0.6.2 (CORE-5): the classification of a commit ATTEMPT's outcome.
+ * Receipts are recorded ONLY for the two COMMITTED_* classes; the two
+ * no-receipt classes (INDETERMINATE, CONFIRMED_NON_EXECUTION) surface
+ * in the thrown SCQError's `details.outcome` and in the store's
+ * per-quote outcome record (CORE-8). The distinction between
+ * INDETERMINATE (the mutation was dispatched but its landing is not
+ * established — NO blind retry; provider-state reconciliation first)
+ * and CONFIRMED_NON_EXECUTION (the mutation provably never took
+ * effect — safe to retry as a NEW quote) is normative and must never
+ * be collapsed: they carry opposite retry rules.
+ */
+export type MutationOutcome =
+  | "COMMITTED_AND_VERIFIED"
+  | "COMMITTED_UNVERIFIED"
+  | "INDETERMINATE"
+  | "CONFIRMED_NON_EXECUTION";
 
 export type SubscriptionChangeReceipt = {
   quoteId: string;
   subscriptionRef: string;
-  status: "COMMITTED";
+  /**
+   * v0.6.2 (CORE-8 / findings-closure F4): an optional receipt-level
+   * identifier, distinct from the quote id. When present, the store
+   * enforces its uniqueness across ALL recorded receipts: reusing a
+   * receiptId under a different identity (different quote,
+   * subscription, figures, or recorded outcome) is a
+   * CONFLICTING_RECEIPT_IDENTITY refusal. Absent on v0.6.1 receipts;
+   * the store's identity tuple reads it as null there.
+   */
+  receiptId?: string;
+  /**
+   * v0.6.2 (CORE-6, BREAKING — explicit compatibility change per the
+   * recorded design decision): widened from the single v0.6.1 literal
+   * so a commit whose landing is established but whose finances are
+   * NOT verified is distinguishable at the status level alone:
+   * "COMMITTED" iff `outcome` is COMMITTED_AND_VERIFIED,
+   * "COMMITTED_UNVERIFIED" iff `outcome` is COMMITTED_UNVERIFIED
+   * (in which case `reconciliation` is the UNVERIFIED variant). A
+   * consumer matching only `status === "COMMITTED"` must never be
+   * able to mistake an unverified commit for a verified one — that
+   * distinguishability is the point of the widening, and it
+   * deliberately breaks v0.6.1 consumers that assumed the single
+   * literal.
+   */
+  status: "COMMITTED" | "COMMITTED_UNVERIFIED";
+  /**
+   * v0.6.2 (CORE-6): the commit's outcome classification. Present on
+   * v0.6.2 receipts; COMMITTED_AND_VERIFIED iff reconciliation is OK
+   * or VIOLATED over established actuals, COMMITTED_UNVERIFIED iff
+   * reconciliation is UNVERIFIED. Receipts are recorded ONLY for
+   * these two outcome classes. Absent on v0.6.1 receipts, where it
+   * reads as COMMITTED_AND_VERIFIED (their status literal could
+   * express nothing else).
+   */
+  outcome?: MutationOutcome;
   resultingSnapshot: SubscriptionSnapshot;
   /** What was computed and shown to the caller at quote time. Never mutated after the quote is created; this is the historical/audit record of what was proposed and approved. */
   quotedEffect: CommercialEffect;
@@ -432,7 +611,19 @@ export type SubscriptionChangeReceipt = {
 export type SCQErrorCode =
   | "SUBSCRIPTION_NOT_FOUND" | "UNSUPPORTED_CHANGE" | "INVALID_PROPOSAL"
   | "QUOTE_NOT_DETERMINISTIC" | "QUOTE_EXPIRED" | "QUOTE_STALE"
-  | "CHANGE_CONFLICT" | "PROVIDER_ERROR" | "QUOTE_DRIFTED" | "UNSUPPORTED_CHANGE_SET";
+  | "CHANGE_CONFLICT" | "PROVIDER_ERROR" | "QUOTE_DRIFTED" | "UNSUPPORTED_CHANGE_SET"
+  /**
+   * v0.6.2 (CORE-8 / findings-closure F4): a receipt recording,
+   * verification, or recovery attempt whose receipt IDENTITY (the
+   * canonical tuple of receiptId, quoteId, subscriptionId, recorded
+   * outcome, recorded reconciliation status, and recorded committed
+   * figures) conflicts with the identity already recorded under that
+   * quote or receiptId — or a persisted record whose fields no
+   * longer match its recorded identity digest at recovery. The
+   * original record is always preserved; identity is never resolved
+   * by overwriting.
+   */
+  | "CONFLICTING_RECEIPT_IDENTITY";
 
 export class SCQError extends Error {
   constructor(public code: SCQErrorCode, message: string, public details?: unknown) { super(message); }
