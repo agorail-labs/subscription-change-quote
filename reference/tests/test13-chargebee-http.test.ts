@@ -79,8 +79,8 @@ class FakeChargebee {
   requests: Array<{ method: string; path: string; body: string; idempotencyKey?: string }> = [];
   /** Added to estimate nets only — models drift sources outside the subscription resource (balances/tax configuration), which the subscription fingerprint cannot see. */
   estimateExtraNet = 0;
-  /** Estimate response shape: "live" (sparse, as captured) | "empty" (no financial members) | "noEstimate" (no estimate member at all). */
-  estimateShape: "live" | "empty" | "noEstimate" = "live";
+  /** Estimate response shape: "live" (sparse, as captured) | "empty" (no financial members) | "noEstimate" (no estimate member at all) | "unbilledMissingAmount" (an unbilled element without amount) | "creditNotesAbsent" (unbilled present, credit_note_estimates member absent) | "statedZero" (both members present and empty — a provider-stated zero). */
+  estimateShape: "live" | "empty" | "noEstimate" | "unbilledMissingAmount" | "creditNotesAbsent" | "statedZero" = "live";
   /** One-shot hook fired inside the mutating call, after the adapter's final preview — the TOCTOU window. */
   beforeUpdate: (() => void) | null = null;
   private idem = new Map<string, { paramsHash: string; response: HttpResponse; at: number }>();
@@ -154,6 +154,21 @@ class FakeChargebee {
         if (meta?.pricing_model === "flat_fee" && items[i].quantity !== currentQty) {
           return jsonRes(400, { message: `subscription_items[quantity][${i}] : This param should not be sent for on_off addon type`, type: "invalid_request", api_error_code: "invalid_request", param: `subscription_items[quantity][${i}]`, error_code: "param_should_not_be_sent", http_status_code: 400 });
         }
+      }
+      if (this.estimateShape === "statedZero") {
+        // Both financial members present and EMPTY: the provider states
+        // a zero immediate effect. This is an actual zero, not an absence.
+        return jsonRes(200, { estimate: { created_at: Math.floor(this.fakeNowMs / 1000), object: "estimate", subscription_estimate: this.sparseSubEstimate(), unbilled_charge_estimates: [], credit_note_estimates: [] } });
+      }
+      if (this.estimateShape === "unbilledMissingAmount") {
+        // Incomplete provider result: an unbilled element with NO
+        // amount. The sum is undeterminable — it must never be read as 0.
+        return jsonRes(200, { estimate: { created_at: Math.floor(this.fakeNowMs / 1000), object: "estimate", subscription_estimate: this.sparseSubEstimate(), unbilled_charge_estimates: [{ quantity: 20, pricing_model: "per_unit", description: "Prorated Charges", object: "unbilled_charge" }], credit_note_estimates: [] } });
+      }
+      if (this.estimateShape === "creditNotesAbsent") {
+        // Unbilled total present, but the credit_note_estimates MEMBER
+        // is absent: the net cannot be finalized.
+        return jsonRes(200, { estimate: { created_at: Math.floor(this.fakeNowMs / 1000), object: "estimate", subscription_estimate: this.sparseSubEstimate(), unbilled_charge_estimates: [{ amount: 20000, pricing_model: "per_unit", object: "unbilled_charge" }] } });
       }
       if (this.estimateShape === "noEstimate") return jsonRes(200, {});
       if (this.estimateShape === "empty") {
@@ -489,6 +504,75 @@ test("Test 13-fix10 (Phase 3): commit revalidation with undeterminable financial
     "the frozen engine would treat the absent dimensions as 0; the adapter must refuse instead of feeding it absent values",
   );
   assert.equal(fake.mutationCount, 0, "no mutating call may fire when the envelope cannot be enforced");
+});
+
+// ---------- Final pre-PR checks: unknown-versus-zero negative coverage ----------
+// An UNKNOWN financial outcome (absent member, or a member element
+// missing its figure) must never silently pass an acceptance-envelope
+// check or reach mutation. A provider-STATED zero is a different thing
+// and must be accepted as zero. These tests pin that distinction.
+
+test("Test 13-neg1 (unknown-vs-zero): an unbilled-charge element WITHOUT an amount makes immediate unknown — the quote is refused, never zero-filled", async () => {
+  const fake = new FakeChargebee();
+  fake.estimateShape = "unbilledMissingAmount";
+  const adapter = makeAdapter(fake);
+  await assert.rejects(
+    () => adapter.createChangeQuote("cb_live_test_1", qtyProposal()),
+    (e: unknown) => e instanceof SCQError && e.code === "QUOTE_NOT_DETERMINISTIC",
+    "an incomplete provider result must fail closed: the element is not a 0 and the envelope cannot be enforced on an unknown immediate dimension",
+  );
+  assert.equal(fake.mutationCount, 0);
+});
+
+test("Test 13-neg2 (unknown-vs-zero): credit_note_estimates member ABSENT while a net would need it — the quote is refused", async () => {
+  const fake = new FakeChargebee();
+  fake.estimateShape = "creditNotesAbsent";
+  const adapter = makeAdapter(fake);
+  await assert.rejects(
+    () => adapter.createChangeQuote("cb_live_test_1", qtyProposal()),
+    (e: unknown) => e instanceof SCQError && e.code === "QUOTE_NOT_DETERMINISTIC",
+    "without the credit-note member the net is not final; quoting the gross as the net would fabricate a number",
+  );
+  assert.equal(fake.mutationCount, 0);
+  // Same rule at the interpretation layer, for the element-level case:
+  const r = interpretChargebeeEstimate(
+    { subscription_estimate: { id: "s", status: "active" }, unbilled_charge_estimates: [{ amount: 20000 }], credit_note_estimates: [{}] },
+    { currency: "USD", currentItems: [{ itemPriceId: "seat-basic-monthly", quantity: 100, unitPrice: 1000, amount: 100000, freeQuantity: 0 }], targetItems: [{ itemPriceId: "seat-basic-monthly", quantity: 120 }], priceInfo: new Map([["seat-basic-monthly", { itemPriceId: "seat-basic-monthly", pricingModel: "per_unit", price: 1000, freeQuantity: 0, itemType: "plan" }]]) },
+  );
+  assert.equal(r.effect.immediate, undefined, "a credit-note element without a total is not a 0 credit — immediate is absent");
+  assert.ok(r.provenance.immediate.startsWith("absent"));
+});
+
+test("Test 13-neg3 (unknown-vs-zero): commit revalidation turns unknown — commit refuses BEFORE any mutating transport call", async () => {
+  const fake = new FakeChargebee();
+  const adapter = makeAdapter(fake);
+  const quote = await adapter.createChangeQuote("cb_live_test_1", qtyProposal());
+  fake.estimateShape = "unbilledMissingAmount"; // revalidation estimate is incomplete
+  await assert.rejects(
+    () => adapter.commitChangeQuote(quote.id),
+    (e: unknown) => e instanceof SCQError && e.code === "QUOTE_NOT_DETERMINISTIC",
+  );
+  assert.equal(fake.mutationCount, 0, "no mutation may occur");
+  assert.equal(fake.requests.filter((r) => r.path.endsWith("/update_for_items")).length, 0, "the mutating endpoint must never be invoked when the envelope cannot be enforced");
+});
+
+test("Test 13-neg4 (unknown-vs-zero): subscription_estimate items with unit_price but NO amount are not summed as unit_price x quantity for a flat_fee item", () => {
+  const r = interpretChargebeeEstimate(
+    { subscription_estimate: { subscription_items: [{ item_price_id: "flat-plan-monthly", quantity: 21, unit_price: 59900 }] }, credit_note_estimates: [], unbilled_charge_estimates: [] },
+    { currency: "USD", currentItems: [DEMO_CURRENT[0]], targetItems: [{ itemPriceId: "flat-plan-monthly", quantity: 21 }], priceInfo: PRICE_INFO },
+  );
+  assert.equal(r.effect.recurring?.resultingAmount, 59900, "falls through to the pricing-model computation: flat_fee fixed price once — NOT 21 x 59900");
+  assert.notEqual(r.effect.recurring?.resultingAmount, 1258900);
+});
+
+test("Test 13-zero1 (unknown-vs-zero): a provider-STATED zero (both members present and empty) is accepted as an actual zero — the quote succeeds", async () => {
+  const fake = new FakeChargebee();
+  fake.estimateShape = "statedZero";
+  const adapter = makeAdapter(fake);
+  const quote = await adapter.createChangeQuote("cb_live_test_1", qtyProposal());
+  assert.equal(quote.commercialEffect.immediate?.net, 0, "empty unbilled array + present credit-note member = stated zero immediate, distinct from absent");
+  assert.equal(quote.commercialEffect.recurring?.resultingAmount, 120000, "recurring still comes from the justified per_unit computation");
+  assert.equal(fake.mutationCount, 0);
 });
 
 // ---------- T01–T14 (mocked transport; classifications in TEST-RESULTS.md) ----------
