@@ -31,6 +31,7 @@ jobs:
           set -e
           CHANGED=$(git diff --name-only "$BASE_SHA" "$HEAD_SHA" -- \
             spec/scq-v0.6.1-spec.md \
+            spec/scq-v0.6.2-spec.md \
             reference/src/core/types.ts \
             reference/src/core/scq-engine.ts)
 
