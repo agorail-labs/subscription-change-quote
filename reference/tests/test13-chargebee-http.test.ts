@@ -11,36 +11,65 @@ import {
   type HttpResponse,
   type HttpTransport,
 } from "../src/live/chargebee-http.js";
-import { ChargebeeLiveAdapter } from "../src/live/chargebee-scq-adapter.js";
+import { ChargebeeLiveAdapter, interpretChargebeeEstimate, type CbItemPriceInfo } from "../src/live/chargebee-scq-adapter.js";
 
 // Test 13 — SCQ Live Chargebee Validation (mocked transport).
 //
-// EVERY test in this file runs against a deterministic in-memory fake of
-// the documented Chargebee HTTP API shape. No network, no credentials.
-// Results backed by this file are therefore SIMULATED_PASS at best —
-// never LIVE_PASS. Live cases are BLOCKED in this environment (no
-// credentials were provided) and are recorded as such in
-// research/chargebee-live-v1/TEST-RESULTS.md.
+// EVERY test in this file runs against a deterministic in-memory fake.
+// No network, no credentials. Results backed by this file are therefore
+// SIMULATED_PASS at best — never LIVE_PASS. Live results exist
+// separately (Phase 3, 2026-10-27) and are recorded in
+// research/chargebee-live-v1/TEST-RESULTS.md with evidence in
+// ~/workspace/scq-live-validation-evidence/PHASE3-RUN-2026-10-27.md.
 //
-// The fake models the CURRENT documented contract (Product Catalog 2.0):
-//   GET  /subscriptions/{id}
-//   POST /estimates/update_subscription_for_items
-//   POST /subscriptions/{id}/update_for_items
-//   chargebee-idempotency-key with a 30-minute replay window, replayed
-//   header, 422 on parameter mismatch, 409-style conflict semantics.
-// It deliberately does NOT copy the simulator's (chargebee-sim.ts)
-// endpoint names or its `effective_from`-on-update assumption, both of
-// which the Phase 1 audit found do not match current documentation.
+// PHASE 3 REBUILD (2026-10-27): the previous fake accepted whatever the
+// client sent — including the client's own form encoding and a flat
+// `subscription_id` the real estimate endpoint does not read — and
+// always returned a rich estimate (subscription_items +
+// invoice_estimate). Both live bugs were therefore invisible. This fake
+// is rebuilt from the SANITIZED REAL wire shapes captured live:
+//   - POST /estimates/update_subscription_for_items REQUIRES
+//     subscription[id]; without it the fake returns the real 400
+//     ("subscription[id] : cannot be blank", param_required).
+//   - Item arrays are parsed in the documented FIELD-GROUPED format
+//     (subscription_items[item_price_id][i] / [quantity][i]).
+//   - A quantity that CHANGES a flat_fee item is rejected with the
+//     real server's validation error ("This param should not be sent
+//     for on_off addon type") — quantity is not a settable dimension
+//     of a flat_fee item (live isolation matrix, Phase 3).
+//   - Estimate responses use the observed SPARSE shapes: a priced
+//     per_unit change returns ONLY unbilled_charge_estimates + a
+//     subscription_estimate with NO subscription_items and NO
+//     next_invoice_estimate; an unchanged baseline returns ONLY
+//     next_invoice_estimate. Rich shapes appear only in the unit tests
+//     that exercise the interpretation function directly.
+//   - GET /item_prices/{id} serves pricing_model metadata.
+// The fake still models: GET /subscriptions/{id},
+// POST /subscriptions/{id}/update_for_items with
+// chargebee-idempotency-key (30-minute replay window, replayed header,
+// 422 on parameter mismatch).
 
-const PRICES: Record<string, number> = { "seat-basic-monthly": 1000, "seat-pro-monthly": 1500 };
+type ItemPriceMeta = { price: number; pricing_model: string; free_quantity: number; item_type: string };
+const ITEM_PRICES: Record<string, ItemPriceMeta> = {
+  "seat-basic-monthly": { price: 1000, pricing_model: "per_unit", free_quantity: 0, item_type: "plan" },
+  "seat-pro-monthly": { price: 1500, pricing_model: "per_unit", free_quantity: 0, item_type: "plan" },
+  "flat-plan-monthly": { price: 59900, pricing_model: "flat_fee", free_quantity: 0, item_type: "plan" },
+  "onoff-addon-monthly": { price: 500, pricing_model: "flat_fee", free_quantity: 0, item_type: "addon" },
+  "perunit-addon-monthly": { price: 1000, pricing_model: "per_unit", free_quantity: 0, item_type: "addon" },
+};
 const T0 = new Date("2026-08-01T00:00:00Z");
 
 type FakeSub = {
   id: string; status: string; currency_code: string; resource_version: number;
   current_term_start: number; current_term_end: number; next_billing_at: number;
   has_scheduled_changes: boolean; has_scheduled_advance_invoices: boolean;
-  subscription_items: Array<{ item_price_id: string; quantity: number; unit_price: number; amount: number }>;
+  subscription_items: Array<{ item_price_id: string; item_type: string; quantity: number; unit_price: number; amount: number; free_quantity?: number }>;
 };
+
+function contribution(item: { item_price_id: string; quantity: number; unit_price: number }): number {
+  const meta = ITEM_PRICES[item.item_price_id];
+  return meta?.pricing_model === "flat_fee" ? item.unit_price : item.unit_price * item.quantity;
+}
 
 class FakeChargebee {
   sub: FakeSub;
@@ -50,37 +79,39 @@ class FakeChargebee {
   requests: Array<{ method: string; path: string; body: string; idempotencyKey?: string }> = [];
   /** Added to estimate nets only — models drift sources outside the subscription resource (balances/tax configuration), which the subscription fingerprint cannot see. */
   estimateExtraNet = 0;
+  /** Estimate response shape: "live" (sparse, as captured) | "empty" (no financial members) | "noEstimate" (no estimate member at all). */
+  estimateShape: "live" | "empty" | "noEstimate" = "live";
   /** One-shot hook fired inside the mutating call, after the adapter's final preview — the TOCTOU window. */
   beforeUpdate: (() => void) | null = null;
   private idem = new Map<string, { paramsHash: string; response: HttpResponse; at: number }>();
   fakeNowMs = T0.getTime();
 
-  constructor(opts: { hasScheduledChanges?: boolean } = {}) {
+  constructor(opts: { hasScheduledChanges?: boolean; items?: FakeSub["subscription_items"]; id?: string } = {}) {
     const start = Math.floor(T0.getTime() / 1000);
     this.sub = {
-      id: "cb_live_test_1", status: "active", currency_code: "USD", resource_version: 1700000000000,
+      id: opts.id ?? "cb_live_test_1", status: "active", currency_code: "USD", resource_version: 1700000000000,
       current_term_start: start, current_term_end: start + 30 * 24 * 3600, next_billing_at: start + 30 * 24 * 3600,
       has_scheduled_changes: opts.hasScheduledChanges ?? false, has_scheduled_advance_invoices: false,
-      subscription_items: [{ item_price_id: "seat-basic-monthly", quantity: 100, unit_price: 1000, amount: 100000 }],
+      subscription_items: opts.items ?? [{ item_price_id: "seat-basic-monthly", item_type: "plan", quantity: 100, unit_price: 1000, amount: 100000, free_quantity: 0 }],
     };
   }
 
   debugMutate(fn: (s: FakeSub) => void): void { fn(this.sub); this.sub.resource_version += 1; }
 
-  private parseItems(body: URLSearchParams): Array<{ item_price_id: string; quantity: number }> {
-    const out: Array<{ item_price_id: string; quantity: number }> = [];
+  private parseItems(body: URLSearchParams): Array<{ item_price_id: string; quantity: number | null }> {
+    const out: Array<{ item_price_id: string; quantity: number | null }> = [];
     for (let i = 0; ; i++) {
       const p = body.get(`subscription_items[item_price_id][${i}]`);
       if (p === null) break;
-      out.push({ item_price_id: p, quantity: Number(body.get(`subscription_items[quantity][${i}]`) ?? 0) });
+      const q = body.get(`subscription_items[quantity][${i}]`);
+      out.push({ item_price_id: p, quantity: q === null ? null : Number(q) });
     }
     return out;
   }
 
-  private effectFor(items: Array<{ item_price_id: string; quantity: number }>) {
-    const oldRec = this.sub.subscription_items.reduce((s, i) => s + i.unit_price * i.quantity, 0);
-    const newRec = items.reduce((s, i) => s + (PRICES[i.item_price_id] ?? 0) * i.quantity, 0);
-    return { oldRec, newRec, net: newRec - oldRec };
+  private sparseSubEstimate() {
+    // The real shape: NO subscription_items member at all.
+    return { id: this.sub.id, status: this.sub.status, currency_code: this.sub.currency_code, next_billing_at: this.sub.next_billing_at, object: "subscription_estimate" };
   }
 
   transport: HttpTransport = async (req: HttpRequest): Promise<HttpResponse> => {
@@ -94,16 +125,71 @@ class FakeChargebee {
       this.readCount++;
       return jsonRes(200, { subscription: structuredClone(this.sub) });
     }
+    const ipMatch = path.match(/^\/item_prices\/(.+)$/);
+    if (req.method === "GET" && ipMatch) {
+      const meta = ITEM_PRICES[decodeURIComponent(ipMatch[1])];
+      if (!meta) return jsonRes(404, { api_error_code: "resource_not_found", message: "not found" });
+      return jsonRes(200, { item_price: { id: decodeURIComponent(ipMatch[1]), pricing_model: meta.pricing_model, price: meta.price, free_quantity: meta.free_quantity, item_type: meta.item_type, currency_code: "USD" } });
+    }
     if (req.method === "POST" && path === "/estimates/update_subscription_for_items") {
       this.estimateCount++;
+      // Real-server validation 1: subscription[id] is required (a flat
+      // subscription_id field does NOT satisfy it).
+      if (body.get("subscription[id]") !== this.sub.id) {
+        return jsonRes(400, { message: "subscription[id] : cannot be blank", type: "invalid_request", api_error_code: "invalid_request", param: "subscription[id]", error_code: "param_required", http_status_code: 400 });
+      }
       const items = this.parseItems(body);
-      const { newRec, net } = this.effectFor(items);
+      // Real-server validation 2: every listed item must carry a quantity.
+      for (let i = 0; i < items.length; i++) {
+        if (items[i].quantity === null) {
+          return jsonRes(400, { message: `subscription_items[quantity][${i}] : cannot be blank`, type: "invalid_request", api_error_code: "invalid_request", param: `subscription_items[quantity][${i}]`, error_code: "param_required", http_status_code: 400 });
+        }
+      }
+      // Real-server validation 3: a flat_fee item's quantity cannot be
+      // CHANGED (live-verified wording; quantity is not a settable
+      // dimension of a non-quantity-priced item).
+      for (let i = 0; i < items.length; i++) {
+        const meta = ITEM_PRICES[items[i].item_price_id];
+        const currentQty = this.sub.subscription_items.find((s) => s.item_price_id === items[i].item_price_id)?.quantity ?? 1;
+        if (meta?.pricing_model === "flat_fee" && items[i].quantity !== currentQty) {
+          return jsonRes(400, { message: `subscription_items[quantity][${i}] : This param should not be sent for on_off addon type`, type: "invalid_request", api_error_code: "invalid_request", param: `subscription_items[quantity][${i}]`, error_code: "param_should_not_be_sent", http_status_code: 400 });
+        }
+      }
+      if (this.estimateShape === "noEstimate") return jsonRes(200, {});
+      if (this.estimateShape === "empty") {
+        return jsonRes(200, { estimate: { created_at: Math.floor(this.fakeNowMs / 1000), object: "estimate", subscription_estimate: this.sparseSubEstimate() } });
+      }
+      // Sparse live shapes.
+      const pricedDelta = items.reduce((s, it) => {
+        const meta = ITEM_PRICES[it.item_price_id];
+        if (meta?.pricing_model !== "per_unit") return s;
+        const cur = this.sub.subscription_items.find((x) => x.item_price_id === it.item_price_id);
+        const unit = cur?.unit_price ?? meta.price;
+        return s + ((it.quantity ?? 0) - (cur?.quantity ?? 0)) * unit;
+      }, 0) + this.estimateExtraNet;
+      if (pricedDelta !== 0) {
+        // A priced change: ONLY unbilled charges + sparse subscription
+        // estimate. No invoice_estimate, no next_invoice_estimate.
+        return jsonRes(200, {
+          estimate: {
+            created_at: Math.floor(this.fakeNowMs / 1000), object: "estimate",
+            subscription_estimate: this.sparseSubEstimate(),
+            unbilled_charge_estimates: [{ amount: pricedDelta, unit_amount: Math.abs(pricedDelta), quantity: 1, pricing_model: "per_unit", description: "Prorated Charges", object: "unbilled_charge" }],
+            credit_note_estimates: [],
+          },
+        });
+      }
+      // No priced change: ONLY next_invoice_estimate (+ sparse sub est).
+      const total = this.sub.subscription_items.reduce((s, i) => s + contribution(i), 0);
       return jsonRes(200, {
         estimate: {
-          created_at: Math.floor(this.fakeNowMs / 1000),
-          subscription_estimate: { subscription_items: items.map((i) => ({ item_price_id: i.item_price_id, quantity: i.quantity, unit_price: PRICES[i.item_price_id], amount: (PRICES[i.item_price_id] ?? 0) * i.quantity })) },
-          invoice_estimate: { total: net + this.estimateExtraNet, sub_total: net + this.estimateExtraNet, currency_code: "USD" },
-          ...(newRec === 0 ? {} : {}),
+          created_at: Math.floor(this.fakeNowMs / 1000), object: "estimate",
+          subscription_estimate: this.sparseSubEstimate(),
+          next_invoice_estimate: {
+            recurring: true, date: this.sub.next_billing_at, sub_total: total, total, credits_applied: 0, amount_paid: 0, amount_due: total, object: "invoice_estimate",
+            line_items: this.sub.subscription_items.map((i) => ({ entity_id: i.item_price_id, quantity: i.quantity, unit_amount: i.unit_price, amount: contribution(i), pricing_model: ITEM_PRICES[i.item_price_id]?.pricing_model })),
+          },
+          credit_note_estimates: [],
         },
       });
     }
@@ -119,11 +205,17 @@ class FakeChargebee {
       }
       if (this.beforeUpdate) { const h = this.beforeUpdate; this.beforeUpdate = null; h(); }
       const items = this.parseItems(body);
-      const { net } = this.effectFor(items);
-      this.sub.subscription_items = items.map((i) => ({ item_price_id: i.item_price_id, quantity: i.quantity, unit_price: PRICES[i.item_price_id] ?? 0, amount: (PRICES[i.item_price_id] ?? 0) * i.quantity }));
+      const oldRec = this.sub.subscription_items.reduce((s, i) => s + contribution(i), 0);
+      this.sub.subscription_items = items.map((i) => {
+        const meta = ITEM_PRICES[i.item_price_id];
+        const unit = meta?.price ?? 0;
+        const qty = i.quantity ?? 0;
+        return { item_price_id: i.item_price_id, item_type: meta?.item_type ?? "plan", quantity: qty, unit_price: unit, amount: meta?.pricing_model === "flat_fee" ? unit : unit * qty, free_quantity: meta?.free_quantity };
+      });
+      const newRec = this.sub.subscription_items.reduce((s, i) => s + contribution(i), 0);
       this.sub.resource_version += 1;
       this.mutationCount++;
-      const res = jsonRes(200, { subscription: structuredClone(this.sub), unbilled_charges: net !== 0 ? [{ amount: net }] : [] });
+      const res = jsonRes(200, { subscription: structuredClone(this.sub), unbilled_charges: newRec - oldRec !== 0 ? [{ amount: newRec - oldRec }] : [] });
       if (key) this.idem.set(key, { paramsHash, response: res, at: this.fakeNowMs });
       return res;
     }
@@ -161,6 +253,43 @@ test("Test 13-http1: formEncode uses Chargebee bracket notation and the client s
   assert.ok(!/Basic\s+[A-Za-z0-9+/=]{8,}/.test(redacted));
 });
 
+test("Test 13-ser1 (Phase 3): formEncode produces the EXACT documented field-grouped serialization (independent literal expectation)", () => {
+  // Expected string written by hand from Chargebee's documented
+  // parameter format — NOT generated by the encoder under test.
+  const encoded = formEncode({
+    subscription: { id: "sub_123" },
+    subscription_items: [
+      { item_price_id: "plan-a", quantity: 21 },
+      { item_price_id: "addon-b", quantity: 1 },
+    ],
+    replace_items_list: true,
+    prorate: true,
+    invoice_immediately: false,
+    change_option: "immediately",
+  });
+  assert.equal(
+    encoded,
+    "subscription%5Bid%5D=sub_123" +
+    "&subscription_items%5Bitem_price_id%5D%5B0%5D=plan-a&subscription_items%5Bitem_price_id%5D%5B1%5D=addon-b" +
+    "&subscription_items%5Bquantity%5D%5B0%5D=21&subscription_items%5Bquantity%5D%5B1%5D=1" +
+    "&replace_items_list=true&prorate=true&invoice_immediately=false&change_option=immediately",
+  );
+});
+
+test("Test 13-ser2 (Phase 3): the estimate request carries subscription[id] (never a flat subscription_id) and grouped item fields", async () => {
+  const fake = new FakeChargebee();
+  const adapter = makeAdapter(fake);
+  await adapter.createChangeQuote("cb_live_test_1", qtyProposal());
+  const estReq = fake.requests.find((r) => r.path === "/estimates/update_subscription_for_items");
+  assert.ok(estReq, "an estimate request was made");
+  const body = new URLSearchParams(estReq!.body);
+  assert.equal(body.get("subscription[id]"), "cb_live_test_1", "the real endpoint reads ONLY the nested subscription[id]");
+  assert.equal(body.get("subscription_id"), null, "a flat subscription_id must not be sent (the endpoint ignores it and 400s)");
+  assert.equal(body.get("subscription_items[item_price_id][0]"), "seat-basic-monthly");
+  assert.equal(body.get("subscription_items[quantity][0]"), "120");
+  assert.ok(!estReq!.body.includes("subscription_items%5B0%5D"), "item-indexed shape subscription_items[0][...] must not be produced — the server silently ignores it");
+});
+
 test("Test 13-http2: missing credentials classify as BLOCKED — CREDENTIALS NOT AVAILABLE (never fabricated success)", () => {
   const st = chargebeeConfigFromEnv({});
   assert.equal(st.ok, false);
@@ -186,6 +315,182 @@ test("Test 13-http3 (SIMULATED): native idempotency — same key+params within 3
   assert.equal(fake.mutationCount, 2, "after the window the same key no longer protects — SCQ must not assume indefinite native replay");
 });
 
+// ---------- Phase 3 interpretation unit tests (independent fixtures) ----------
+
+const PRICE_INFO = new Map<string, CbItemPriceInfo>([
+  ["flat-plan-monthly", { itemPriceId: "flat-plan-monthly", pricingModel: "flat_fee", price: 59900, freeQuantity: 0, itemType: "plan" }],
+  ["perunit-addon-monthly", { itemPriceId: "perunit-addon-monthly", pricingModel: "per_unit", price: 10000, freeQuantity: 0, itemType: "addon" }],
+]);
+const DEMO_CURRENT = [
+  { itemPriceId: "flat-plan-monthly", quantity: 1, unitPrice: 59900, amount: 59900, freeQuantity: 0 },
+  { itemPriceId: "perunit-addon-monthly", quantity: 1, unitPrice: 1000, amount: 1000 },
+];
+
+test("Test 13-fix3 (Phase 3): only next_invoice_estimate present — its figures are NEVER mapped to immediate or recurring", () => {
+  // Fixture mirrors the live Oct 27 payload for the unchanged baseline:
+  // next-invoice total 59900 with amount_due 59600 (300 credits applied).
+  const estimate = {
+    subscription_estimate: { id: "s", status: "active", currency_code: "USD", next_billing_at: 1818007771 },
+    next_invoice_estimate: { total: 59900, sub_total: 59900, amount_due: 59600, credits_applied: 300, date: 1818007771, line_items: [{ entity_id: "flat-plan-monthly", quantity: 1, amount: 59900 }] },
+    credit_note_estimates: [],
+  };
+  const r = interpretChargebeeEstimate(estimate, {
+    currency: "USD",
+    currentItems: DEMO_CURRENT,
+    targetItems: [{ itemPriceId: "flat-plan-monthly", quantity: 1 }, { itemPriceId: "perunit-addon-monthly", quantity: 21 }],
+    priceInfo: PRICE_INFO,
+  });
+  assert.equal(r.effect.immediate, undefined, "no invoice_estimate and no unbilled charges => immediate is ABSENT, not the next-invoice amount_due");
+  assert.equal(r.effect.recurring?.resultingAmount, 80900, "recurring is computed per pricing model (flat 59900 + per-unit 21 x 1000), never copied from next_invoice total 59900");
+  assert.equal(r.effect.recurring?.previousAmount, 60900);
+  assert.ok(!JSON.stringify(r.effect).includes("59600"), "amount_due (net of credits) must not leak into the effect");
+  assert.deepEqual(r.nextInvoice, { total: 59900, amountDue: 59600, creditsApplied: 300, date: new Date(1818007771 * 1000).toISOString(), lineCount: 1 }, "next-invoice facts are preserved separately, with their date");
+});
+
+test("Test 13-fix4 (Phase 3): invoice_estimate absent — immediate comes from unbilled charges minus credit notes", () => {
+  const estimate = {
+    subscription_estimate: { subscription_items: [{ item_price_id: "seat-basic-monthly", quantity: 120, unit_price: 1000, amount: 120000 }] },
+    unbilled_charge_estimates: [{ amount: 20000 }],
+    credit_note_estimates: [{ total: 500 }],
+  };
+  const r = interpretChargebeeEstimate(estimate, {
+    currency: "USD",
+    currentItems: [{ itemPriceId: "seat-basic-monthly", quantity: 100, unitPrice: 1000, amount: 100000, freeQuantity: 0 }],
+    targetItems: [{ itemPriceId: "seat-basic-monthly", quantity: 120 }],
+    priceInfo: new Map([["seat-basic-monthly", { itemPriceId: "seat-basic-monthly", pricingModel: "per_unit", price: 1000, freeQuantity: 0, itemType: "plan" }]]),
+  });
+  assert.equal(r.effect.immediate?.net, 19500, "20000 unbilled − 500 credit notes");
+  assert.equal(r.effect.recurring?.resultingAmount, 120000, "provider-stated subscription_estimate items take precedence for recurring");
+});
+
+test("Test 13-fix5 (Phase 3): a flat_fee item's recurring contribution NEVER scales with quantity", () => {
+  // Provider-stated items path: amount is authoritative even at qty 21.
+  const stated = interpretChargebeeEstimate(
+    { subscription_estimate: { subscription_items: [{ item_price_id: "flat-plan-monthly", quantity: 21, unit_price: 59900, amount: 59900 }] }, credit_note_estimates: [] },
+    { currency: "USD", currentItems: [DEMO_CURRENT[0]], targetItems: [{ itemPriceId: "flat-plan-monthly", quantity: 21 }], priceInfo: PRICE_INFO },
+  );
+  assert.equal(stated.effect.recurring?.resultingAmount, 59900);
+  // Computed path: flat_fee contributes its fixed price once.
+  const computed = interpretChargebeeEstimate(
+    { subscription_estimate: { id: "s", status: "active" }, credit_note_estimates: [] },
+    { currency: "USD", currentItems: [DEMO_CURRENT[0]], targetItems: [{ itemPriceId: "flat-plan-monthly", quantity: 21 }], priceInfo: PRICE_INFO },
+  );
+  assert.equal(computed.effect.recurring?.resultingAmount, 59900, "flat_fee at quantity 21 is still 59900 — NOT 21 x 59900 = 1258900");
+  assert.notEqual(computed.effect.recurring?.resultingAmount, 1258900);
+});
+
+test("Test 13-fix6 (Phase 3): credits_applied reduces next-invoice amount_due only — immediate and recurring are unaffected", () => {
+  // Mirrors the live addon-change shape (unbilled proration present)
+  // combined with a next-invoice block carrying credits.
+  const estimate = {
+    subscription_estimate: { id: "s", status: "active", currency_code: "USD" },
+    unbilled_charge_estimates: [{ amount: 185260, quantity: 20, unit_amount: 9263, pricing_model: "per_unit" }],
+    credit_note_estimates: [],
+    next_invoice_estimate: { total: 59900, amount_due: 59600, credits_applied: 300, date: 1818007771, line_items: [{ entity_id: "flat-plan-monthly", quantity: 1, amount: 59900 }] },
+  };
+  const r = interpretChargebeeEstimate(estimate, {
+    currency: "USD",
+    currentItems: DEMO_CURRENT,
+    targetItems: [{ itemPriceId: "flat-plan-monthly", quantity: 1 }, { itemPriceId: "perunit-addon-monthly", quantity: 21 }],
+    priceInfo: PRICE_INFO,
+  });
+  assert.equal(r.effect.immediate?.net, 185260, "immediate is the prorated unbilled charge; the 300 of next-invoice credits do NOT reduce it");
+  assert.equal(r.effect.recurring?.resultingAmount, 80900, "recurring is the underlying price (59900 + 21000); credits never reduce the subscription price");
+  assert.equal(r.nextInvoice?.creditsApplied, 300);
+  assert.equal(r.nextInvoice?.amountDue, 59600);
+});
+
+test("Test 13-fix7 (Phase 3): per_unit terms incomplete — recurring is ABSENT rather than fabricated", () => {
+  const r = interpretChargebeeEstimate(
+    { subscription_estimate: { id: "s", status: "active" }, unbilled_charge_estimates: [{ amount: 5000 }], credit_note_estimates: [] },
+    {
+      currency: "USD",
+      // No unit price, no amount, no free_quantity anywhere: nothing
+      // justifies a quantity computation for the changed item.
+      currentItems: [{ itemPriceId: "perunit-addon-monthly", quantity: 5 }],
+      targetItems: [{ itemPriceId: "perunit-addon-monthly", quantity: 9 }],
+      priceInfo: new Map(),
+    },
+  );
+  assert.equal(r.effect.immediate?.net, 5000, "immediate is still provider-stated and kept");
+  assert.equal(r.effect.recurring, undefined, "recurring must be absent when its terms are unknown");
+  assert.ok(r.provenance.recurring.startsWith("absent"));
+});
+
+// ---------- Phase 3 adapter-level regressions ----------
+
+test("Test 13-fix2 (Phase 3): CHANGE_QUANTITY on a flat_fee item (plan or on/off addon) is refused BEFORE any provider estimate", async () => {
+  const flatFake = new FakeChargebee({
+    id: "cb_live_flat_1",
+    items: [
+      { item_price_id: "flat-plan-monthly", item_type: "plan", quantity: 1, unit_price: 59900, amount: 59900, free_quantity: 0 },
+      { item_price_id: "onoff-addon-monthly", item_type: "addon", quantity: 1, unit_price: 500, amount: 500, free_quantity: 0 },
+    ],
+  });
+  const adapter = makeAdapter(flatFake);
+  for (const itemId of ["flat-plan-monthly", "onoff-addon-monthly"]) {
+    await assert.rejects(
+      () => adapter.createChangeQuote("cb_live_flat_1", { changes: [{ action: "CHANGE_QUANTITY", itemId, quantity: 21 }], effectiveIntent: { type: "IMMEDIATE" }, acceptanceEnvelope: ENVELOPE0 }),
+      (e: unknown) => e instanceof SCQError && e.code === "UNSUPPORTED_CHANGE" && String(e.message).includes("flat_fee"),
+      `${itemId}: quantity is not a settable dimension of a flat_fee item`,
+    );
+  }
+  assert.equal(flatFake.estimateCount, 0, "refusal happens before the estimate call — the provider's 400 is never needed");
+  assert.equal(flatFake.mutationCount, 0);
+});
+
+test("Test 13-fix8 (Phase 3): an unchanged on/off (flat_fee) addon rides along at its CURRENT quantity; the per_unit change quotes normally", async () => {
+  const mixed = new FakeChargebee({
+    id: "cb_live_mixed_1",
+    items: [
+      { item_price_id: "seat-basic-monthly", item_type: "plan", quantity: 100, unit_price: 1000, amount: 100000, free_quantity: 0 },
+      { item_price_id: "onoff-addon-monthly", item_type: "addon", quantity: 1, unit_price: 500, amount: 500, free_quantity: 0 },
+    ],
+  });
+  const adapter = makeAdapter(mixed);
+  const quote = await adapter.createChangeQuote("cb_live_mixed_1", qtyProposal());
+  const estReq = mixed.requests.find((r) => r.path === "/estimates/update_subscription_for_items");
+  const body = new URLSearchParams(estReq!.body);
+  assert.equal(body.get("subscription_items[item_price_id][1]"), "onoff-addon-monthly");
+  assert.equal(body.get("subscription_items[quantity][1]"), "1", "the on/off addon is sent at its current quantity — never a changed one");
+  assert.equal(quote.commercialEffect.immediate?.net, 20000);
+  assert.equal(quote.commercialEffect.recurring?.resultingAmount, 120500, "120000 per-unit + the on/off addon at its observed 500");
+  assert.equal(quote.commercialEffect.recurring?.previousAmount, 100500);
+});
+
+test("Test 13-fix9 (Phase 3): an estimate with NO determinable financials fails closed — no quote, no invented numbers", async () => {
+  const fake = new FakeChargebee();
+  fake.estimateShape = "empty"; // subscription_estimate only; no invoice/unbilled/next-invoice members
+  const adapter = makeAdapter(fake);
+  await assert.rejects(
+    () => adapter.createChangeQuote("cb_live_test_1", qtyProposal()),
+    (e: unknown) => e instanceof SCQError && e.code === "QUOTE_NOT_DETERMINISTIC",
+    "recurring is computable here, but immediate is not — the envelope cannot be enforced, so the quote must be refused",
+  );
+  assert.equal(fake.mutationCount, 0);
+  const fake2 = new FakeChargebee();
+  fake2.estimateShape = "noEstimate"; // response without an estimate member at all
+  const adapter2 = makeAdapter(fake2);
+  await assert.rejects(
+    () => adapter2.createChangeQuote("cb_live_test_1", qtyProposal()),
+    (e: unknown) => e instanceof SCQError && e.code === "PROVIDER_ERROR",
+  );
+  assert.equal(fake2.mutationCount, 0);
+});
+
+test("Test 13-fix10 (Phase 3): commit revalidation with undeterminable financials refuses BEFORE mutation — absent is never compared as zero", async () => {
+  const fake = new FakeChargebee();
+  const adapter = makeAdapter(fake);
+  const quote = await adapter.createChangeQuote("cb_live_test_1", qtyProposal());
+  fake.estimateShape = "empty"; // the revalidation estimate loses every financial member
+  await assert.rejects(
+    () => adapter.commitChangeQuote(quote.id),
+    (e: unknown) => e instanceof SCQError && e.code === "QUOTE_NOT_DETERMINISTIC",
+    "the frozen engine would treat the absent dimensions as 0; the adapter must refuse instead of feeding it absent values",
+  );
+  assert.equal(fake.mutationCount, 0, "no mutating call may fire when the envelope cannot be enforced");
+});
+
 // ---------- T01–T14 (mocked transport; classifications in TEST-RESULTS.md) ----------
 
 test("T01 (SIMULATED_PASS): initial subscription read produces an accurate normalized snapshot", async () => {
@@ -208,8 +513,9 @@ test("T02 (SIMULATED_PASS): quote 100 -> 120 performs retrieve + estimate only; 
   assert.equal(fake.mutationCount, 0);
   assert.equal(after.version, before.version);
   assert.equal(after.items[0].quantity, 100);
-  assert.equal(quote.commercialEffect.immediate?.net, 20000);
-  assert.equal(quote.commercialEffect.recurring?.resultingAmount, 120000);
+  assert.equal(quote.commercialEffect.immediate?.net, 20000, "immediate comes from the unbilled-charge estimate (the live sparse shape), not an invoice_estimate");
+  assert.equal(quote.commercialEffect.recurring?.resultingAmount, 120000, "recurring is the justified per_unit computation (120 x 1000, free_quantity 0)");
+  assert.equal(quote.commercialEffect.recurring?.previousAmount, 100000);
   assert.equal(quote.guaranteeCoverage.immediateFinancialEffect, "REVALIDATE", "live adapter must not claim EXACT: no documented pinning mechanism exists");
   assert.equal(quote.guaranteeCoverage.termEffect, "UNKNOWN");
 });
@@ -286,14 +592,14 @@ test("T08+T09 (SIMULATED_PASS): concurrent change between final preview and comm
   const quote = await adapter.createChangeQuote("cb_live_test_1", qtyProposal());
   // Concurrent actor reprices the item inside the window between the
   // adapter's last pre-mutation preview and the mutating call itself.
-  fake.beforeUpdate = () => { PRICES["seat-basic-monthly"] = 2000; fake.sub.subscription_items[0].unit_price = 2000; };
+  fake.beforeUpdate = () => { ITEM_PRICES["seat-basic-monthly"].price = 2000; fake.sub.subscription_items[0].unit_price = 2000; };
   try {
     const receipt = await adapter.commitChangeQuote(quote.id);
     assert.equal(receipt.status, "COMMITTED", "the mutation DID occur — the receipt must not pretend otherwise");
     assert.equal(receipt.resultingSnapshot.items[0].quantity, 120);
     assert.equal(receipt.reconciliation.status, "VIOLATED", "committed effect (at the repriced rate) exceeds the zero-tolerance envelope and must be reported");
     assert.equal(receipt.consistencyGuarantee, "BEST_EFFORT", "never ATOMIC: no server-enforced CAS exists");
-  } finally { PRICES["seat-basic-monthly"] = 1000; }
+  } finally { ITEM_PRICES["seat-basic-monthly"].price = 1000; }
 });
 
 test("T10 (SIMULATED_PASS): unsupported combined change refused before any provider mutation — and before any estimate", async () => {
@@ -352,7 +658,7 @@ test("T13 (SIMULATED_PASS for the limitation): application restarts after commit
   assert.equal(fake.mutationCount, 1, "fail-closed: no blind re-mutation after restart — but note this is refusal, NOT exactly-once proof; a conforming live deployment requires a durable quote/receipt store (see LIMITATIONS-AND-GAPS.md)");
 });
 
-test("T14 (SIMULATED_PASS for reporting; live behavior BLOCKED): scheduled-change / Ramps compatibility reported honestly", async () => {
+test("T14 (SIMULATED_PASS for reporting; live scheduling behavior BLOCKED): scheduled-change / Ramps compatibility reported honestly", async () => {
   const fake = new FakeChargebee({ hasScheduledChanges: true });
   const adapter = makeAdapter(fake);
   const quote = await adapter.createChangeQuote("cb_live_test_1", qtyProposal());
@@ -384,15 +690,16 @@ test("Test 13-gate: live commit is disabled by default — quote + revalidation 
 test("Test 13-classifications: evidence classifications are not conflated — no mock-backed row may claim a live result", () => {
   const allowed = new Set(["LIVE_PASS", "LIVE_FAIL", "SIMULATED_PASS", "DOCUMENTATION_SUPPORTED", "BLOCKED", "UNVERIFIED"]);
   // Mirror of research/chargebee-live-v1/TEST-RESULTS.md. If a row is
-  // ever upgraded, this table and the document must change together —
-  // and a LIVE_* value requires credentials-backed evidence that does
-  // not exist in this environment.
+  // ever upgraded, this table and the document must change together.
+  // The LIVE_* rows below rest on the Phase 3 live run (2026-10-27,
+  // test site, credentials-backed) recorded in TEST-RESULTS.md with
+  // evidence in ~/workspace/scq-live-validation-evidence/.
   const results: Record<string, string> = {
     T01: "SIMULATED_PASS", T02: "SIMULATED_PASS", T03: "SIMULATED_PASS", T04: "SIMULATED_PASS",
     T05: "SIMULATED_PASS", T06: "SIMULATED_PASS", T07: "SIMULATED_PASS", T08: "SIMULATED_PASS",
     T09: "SIMULATED_PASS", T10: "SIMULATED_PASS", T11: "SIMULATED_PASS", T12: "SIMULATED_PASS",
     T13: "SIMULATED_PASS", T14: "SIMULATED_PASS",
-    "T01-live": "BLOCKED", "T02-live": "BLOCKED", "T03-live": "BLOCKED", "T14-live": "BLOCKED",
+    "T01-live": "LIVE_PASS", "T02-live": "LIVE_PASS", "T03-live": "BLOCKED", "T14-live": "BLOCKED",
   };
   for (const [id, cls] of Object.entries(results)) assert.ok(allowed.has(cls), `${id}: ${cls} is not an allowed classification`);
   for (const [id, cls] of Object.entries(results)) if (!id.endsWith("-live")) assert.ok(!cls.startsWith("LIVE_"), `${id} is mock-backed and must not claim ${cls}`);
