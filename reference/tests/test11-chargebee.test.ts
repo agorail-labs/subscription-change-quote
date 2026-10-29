@@ -66,7 +66,21 @@ test("Test 11a (Phase 2A CORRECTED): Chargebee maps cleanly to getSubscription/c
   const receipt = await adapter.commitChangeQuote(quote.id);
   assert.equal(receipt.status, "COMMITTED");
   assert.equal(receipt.resultingSnapshot.items[0].quantity, 120);
-  assert.deepEqual(receipt.committedEffect, receipt.quotedEffect, "same-instant REVALIDATE commit: the fresh preview recomputes the identical sim effect, so committed === quoted HERE — this is revalidation agreeing, not an EXACT pinning guarantee");
+  // DISCLOSED CHANGE (PR-6, v0.6.2): whole-effect deepEqual was
+  // replaced by figure+determinacy equality plus a committedSource
+  // assertion. Under the migration the committed effect's FIGURES
+  // still equal the quote's figures at the same instant, but its
+  // provenance is — correctly — a different, provider-actual
+  // provenance: the committed effect is established from the
+  // persisted mutation artifact this operation created plus the
+  // post-commit re-read, not from the revalidated preview (finding
+  // F-1). Whole-object equality can no longer hold for ANY
+  // correctly-implemented commit; this is the PR #10 (Stripe)
+  // replacement pattern, also used by PR #11/#14.
+  assert.deepEqual(receipt.committedEffect.immediate, receipt.quotedEffect.immediate);
+  assert.deepEqual(receipt.committedEffect.recurring, receipt.quotedEffect.recurring);
+  assert.deepEqual(receipt.committedEffect.determinacy, receipt.quotedEffect.determinacy);
+  assert.equal(receipt.committedEffect.provenance?.committedSource, "provider_actual");
 
   // The scenario the old test used to "prove" EXACT — elapsed time
   // between quote and commit — now demonstrates the opposite, which is
@@ -462,4 +476,18 @@ test("Test 11j: TOCTOU — Chargebee has no compare-and-swap precondition on upd
   );
   assert.equal(receipt.resultingSnapshot.items[0].quantity, 120, "silent clobber, no conflict surfaced");
   assert.equal(receipt.consistencyGuarantee, "BEST_EFFORT");
+  // DISCLOSED ADDITION (PR-6, v0.6.2) — a strengthening, not a
+  // weakening: this test previously asserted NO receipt status.
+  // The competing write landed inside the mutate window, so the
+  // persisted artifact's fingerprint bracket does not close around
+  // this commit (it began on state the competitor had already
+  // changed, not the state this commit validated). Under PR #14
+  // doctrine Z1 the landing is therefore NOT attributable-verified
+  // even though the final state coincidentally matches the intent:
+  // the receipt caps at COMMITTED_UNVERIFIED / UNVERIFIED, where
+  // the pre-migration code (committed effect = revalidated preview,
+  // finding F-1) would have reported COMMITTED / OK. See test25's
+  // dedicated broken-attribution cases.
+  assert.equal(receipt.status, "COMMITTED_UNVERIFIED");
+  assert.equal(receipt.reconciliation.status, "UNVERIFIED");
 });
