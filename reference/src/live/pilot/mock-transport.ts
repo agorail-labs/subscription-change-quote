@@ -35,6 +35,15 @@ export type PilotMockFaults = {
   partialStatedItems?: boolean;
   /** Adds next_invoice_estimate whose amount_due is reduced by credits (total unchanged). */
   includeNextInvoiceWithCredits?: boolean;
+  /**
+   * Adds next_invoice_estimate with THIS credits_applied figure
+   * (total = the full post-change price level; amount_due = total −
+   * credits). Parameterized so tests can vary ONLY the next-invoice
+   * figures (PR #13 review correction R2: source-separation tests) —
+   * including a credit figure that makes amount_due coincide with the
+   * incurred obligation.
+   */
+  nextInvoiceCredits?: number;
   /** Overrides catalog pricing_model per item price id (e.g. "tiered"). */
   pricingModelOverride?: Record<string, string>;
   /** update_for_items applies, then the transport throws (lost response). */
@@ -143,11 +152,13 @@ export class PilotMockChargebee {
     estimate.subscription_estimate = {
       subscription_items: this.faults.partialStatedItems ? statedAll.filter((s) => s.item_price_id === "pilot-addon-vision") : statedAll,
     };
-    if (this.faults.includeNextInvoiceWithCredits) {
+    if (this.faults.includeNextInvoiceWithCredits || this.faults.nextInvoiceCredits !== undefined) {
       // Next-cycle figure: total is the post-change price level;
-      // amount_due is net of a 300 credit. Neither is the incurred
-      // obligation and neither may enter the effect.
-      estimate.next_invoice_estimate = { total: 80900, amount_due: 80600, credits_applied: 300, date: 1702592000, line_items: [{}, {}] };
+      // amount_due is net of the applied credits. Neither is the
+      // incurred obligation and neither may enter the effect.
+      const credits = this.faults.nextInvoiceCredits ?? 300;
+      const total = statedAll.reduce((s, i) => s + i.amount, 0);
+      estimate.next_invoice_estimate = { total, amount_due: total - credits, credits_applied: credits, date: 1702592000, line_items: [{}, {}] };
     }
     return { estimate };
   }
