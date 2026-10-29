@@ -95,6 +95,61 @@ pinned order effective date replayed verbatim; contract-term reporting unchanged
 committed-term cancellation semantics distinct (settled ⇒ licensed N/A; mid-term ⇒ UNKNOWN +
 refusal); future-dated cancellation verified as SCHEDULED, never by demanding a terminal state.
 
+## Review corrections Z1/Z2 (PR #14) — attribution before classification
+
+Two merge-blocking findings from the PR #14 review, both about *who an observed post-commit
+state may be blamed on*. Failing-first probes against the branch tip `f96b957`:
+
+- **Probe Z1 — contradiction classified before attribution.** A quantity order landed correctly;
+  another actor then changed the quantity to 130 out-of-band (version 2 → 3). The receipt was
+  `COMMITTED / COMMITTED_AND_VERIFIED / VIOLATED`: `establishCommittedEffect` evaluated
+  `stateContradictions(...)` *before* the `attributable` chain check, so the intervening actor's
+  mismatch was recorded as this commit's verified failure.
+- **Probe Z2 — cancel path had no attribution at all.** A pure CANCEL (future DATE) landed as
+  quoted; an intervening change then bumped the version while leaving the cancellation fields
+  untouched. The receipt was `COMMITTED / COMMITTED_AND_VERIFIED / OK`: `establishCancelCommit`
+  re-read only the subscription — never the bound order, never the version chain — so any
+  matching cancelledDate/status verified as this commit's result.
+
+**Fix — one classification order in both paths:** (1) retrieve the bound order and establish
+the unbroken attribution chain (validated version → the bound order's `subscriptionVersionAfter`
+== validated + 1 → re-read version == the order's version-after); (2) only if attribution holds,
+evaluate state contradictions → VIOLATED (D3) or verified OK; (3) if attribution is broken or
+unestablishable, COMMITTED_UNVERIFIED / UNVERIFIED — bound-order financial observations are
+retained and honestly labeled, and any observed mismatch is recorded in the reconciliation
+reason as *unattributed context*, its cause not assigned to this commit. The pure-CANCEL path
+additionally checks the bound order's **action identity** against the sequence this commit
+dispatched (canonical comparison), and an unreadable bound order ⇒ COMMITTED_UNVERIFIED with
+the candidate built from data already in hand (P1). The scheduled-vs-terminal and quoted-date
+rules (P3) are unchanged and now run only behind the attribution gate; D3's VIOLATED is
+preserved for provably attributable wrong landings.
+
+**Regressions** (test24; suite 283 → 286):
+
+- 24.13 (**reworked, required**): the attributable wrong landing now comes from this order's own
+  misapplication — new sim-only one-shot hooks `_debugWrongQuantityOnNextOrder` /
+  `_debugWrongRatePlanOnNextOrder` transform only the *applied* actions (the persisted order
+  keeps the dispatched actions/figures; the version advances by exactly this order's +1) ⇒
+  VIOLATED. Its previous construction (`_debugMutateDirectly` after the order landed) encoded
+  the Z1 defect and moved to 24.23.
+- 24.19 (**reworked, required**): the attributable premature termination now comes from our own
+  order terminating immediately (`_debugCancelEffectiveNowOnNextOrder`; cancelledDate = today ≠
+  quoted date, chain unbroken) ⇒ VIOLATED. The previous direct-mutation construction became a
+  third case in the same test ⇒ UNVERIFIED.
+- 24.23 (new): intervening change after our order, mismatching state ⇒ COMMITTED_UNVERIFIED /
+  UNVERIFIED, observed mismatch recorded as unattributed context, immediate still the bound
+  order's own figure. The matching-final-state counterpart remains 24.12 (UNVERIFIED).
+- 24.24 (new): intervening *order* after our cancel order, cancellation state matching the
+  quoted schedule, chain broken ⇒ UNVERIFIED — never a verified OK.
+- 24.25 (new): bound order unreadable (`_debugFailOrderReads`) ⇒ COMMITTED_UNVERIFIED,
+  candidate from data in hand, never OK/VIOLATED.
+
+Note on deferred verification: the Zuora adapter exposes no deferred-verify entry point of its
+own; `verifyCommitReceipt` remains the store-level PR-1 machinery driven by caller-built
+observations (test 24.20, unchanged). The Z1/Z2 fixes govern the adapter's *initial*
+classification, so a cancellation receipt can no longer be *born* verified-OK/VIOLATED without
+attribution; the frozen store machinery itself is untouched.
+
 ## Remaining limitations
 
 - The persisted-order model is a minimal sim-only artifact; real Zuora order/invoice retrieval
