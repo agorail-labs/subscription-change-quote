@@ -1339,6 +1339,27 @@ export class ChargebeeAdapter implements SubscriptionProvider {
    * re-read-derived DETERMINED figure in this path is the D3
    * mismatch branch's observed recurring, reachable only AFTER
    * the attribution gate above.
+   *
+   * C1 (PR #15 review correction): FINANCIAL-EVIDENCE GATE. State
+   * verification alone does not establish the cancellation's
+   * financial effect. Before ANY financially verified outcome,
+   * the bound artifact's own execution financial signal is
+   * inspected: a verified cancellation requires an ESTABLISHED
+   * artifact actual — `earlyTerminationChargeKnown === true`
+   * AND a finite `cancelNetImmediate`. A figureless artifact
+   * (e.g. the sim's `_debugOmitMutationFinancials` fault) or an
+   * artifact whose signal says the termination consequence was
+   * not established caps the outcome at COMMITTED_UNVERIFIED /
+   * UNVERIFIED with UNKNOWN financial determinacy — the quoted
+   * figure survives only as an unestablished candidate, never
+   * as a DETERMINED committed immediate copied from the quote.
+   * The gate is evaluated from data already in hand (the bound
+   * artifact read above); no further provider read follows a
+   * landed mutation (P1). Where the artifact's established
+   * actual DIFFERS from the quoted figure, the receipt carries
+   * the ARTIFACT's actual (provider_actual) with a VIOLATED
+   * reconciliation — a determined negative verification — rather
+   * than reporting the quoted figure as verified.
    */
   private establishCancelCommit(
     validated: StoredQuote,
@@ -1488,6 +1509,43 @@ export class ChargebeeAdapter implements SubscriptionProvider {
     // read succeeded; bind it under a name the type checker can
     // narrow past the boolean.)
     const boundArtifact = readArtifact as ChargebeeMutationArtifact;
+
+    // C1 FINANCIAL-EVIDENCE GATE (see this method's doc comment):
+    // the bound artifact must carry an ESTABLISHED cancellation
+    // actual before any financially verified outcome may be
+    // claimed. Evaluated entirely from the artifact already read
+    // back above — no further provider read after landing (P1).
+    const artifactFinancialEstablished =
+      boundArtifact.earlyTerminationChargeKnown === true &&
+      typeof boundArtifact.cancelNetImmediate === "number" &&
+      Number.isFinite(boundArtifact.cancelNetImmediate);
+    const artifactCancelActual = artifactFinancialEstablished ? (boundArtifact.cancelNetImmediate as number) : undefined;
+    if (!artifactFinancialEstablished) {
+      return {
+        effect: candidateEffect(
+          "candidate figure: the quoted post-cancellation level; the bound cancel artifact carries no established financial actual, so the cancellation's financial effect is NOT established for this commit"
+        ),
+        reconciliation: {
+          status: "UNVERIFIED",
+          reason:
+            `the cancellation operation landed (its response was received, carrying operation ${mutation.operationId}) and its ` +
+            `result is attributable to this commit (bound artifact ${boundArtifact.id}, closed fingerprint bracket; observed state ` +
+            `status ${readSub.status}, scheduledCancellationAt ${readSub.scheduledCancellationAt ?? "(none)"}), but the bound artifact ` +
+            `does not establish the cancellation's financial effect: ` +
+            (boundArtifact.earlyTerminationChargeKnown !== true
+              ? `its execution signal reports the termination consequence was NOT established (earlyTerminationChargeKnown is not true)`
+              : `it carries no finite cancelNetImmediate figure`) +
+            `. A financially verified cancellation requires the artifact's established actual, so the outcome is capped at ` +
+            `COMMITTED_UNVERIFIED: the quoted immediate figure (${quoted.immediate?.net ?? "absent"}) survives only as an ` +
+            `unestablished candidate and is NOT recorded as a determined committed figure copied from the quote`,
+          undeterminedDimensions: ["immediateFinancialEffect", "recurringFinancialEffect"],
+        },
+        status: "COMMITTED_UNVERIFIED",
+        outcome: "COMMITTED_UNVERIFIED",
+        snapshot: snap,
+      };
+    }
+
     const quotedDate = quoted.effectiveAt;
     let verifiedKind: "TERMINAL" | "SCHEDULED" | undefined;
     let mismatchReason: string | undefined;
@@ -1532,9 +1590,9 @@ export class ChargebeeAdapter implements SubscriptionProvider {
       // the quoted post-cancel zero.
       const observedStrict = recurringTotalStrict(readSub);
       const observed: CommercialEffect = {
-        ...(typeof boundArtifact.cancelNetImmediate === "number" && Number.isFinite(boundArtifact.cancelNetImmediate)
-          ? { immediate: immediateParts(boundArtifact.cancelNetImmediate) }
-          : {}),
+        // The C1 gate above guarantees the artifact's actual is
+        // established here, so it is carried as a DETERMINED figure.
+        immediate: immediateParts(artifactCancelActual as number),
         recurring: {
           previousAmount: quoted.recurring?.previousAmount,
           ...(observedStrict !== undefined ? { resultingAmount: observedStrict } : {}),
@@ -1544,10 +1602,7 @@ export class ChargebeeAdapter implements SubscriptionProvider {
         ...(quoted.term ? { term: quoted.term } : {}),
         effectiveAt: quoted.effectiveAt,
         determinacy: {
-          immediateFinancialEffect:
-            typeof boundArtifact.cancelNetImmediate === "number" && Number.isFinite(boundArtifact.cancelNetImmediate)
-              ? "DETERMINED"
-              : "UNKNOWN",
+          immediateFinancialEffect: "DETERMINED",
           recurringFinancialEffect: observedStrict !== undefined ? "DETERMINED" : "UNKNOWN",
         },
         provenance: {
@@ -1573,15 +1628,69 @@ export class ChargebeeAdapter implements SubscriptionProvider {
       };
     }
 
+    // C1: an ESTABLISHED artifact actual that DIFFERS from the
+    // quoted figure is carried as the committed actual — the
+    // quoted figure is never reported as verified when the
+    // operation's own evidence contradicts it. The state above
+    // verified as this commit's cancellation (attribution closed,
+    // scheduled/terminal state as quoted), so the contradiction
+    // is a determined negative verification (D3) over the
+    // financial dimension.
+    if (artifactCancelActual !== quoted.immediate?.net) {
+      const differingEffect: CommercialEffect = {
+        immediate: immediateParts(artifactCancelActual as number),
+        recurring: {
+          previousAmount: quoted.recurring?.previousAmount,
+          resultingAmount: 0,
+          currency: quoted.recurring?.currency ?? "usd",
+          ...(quoted.recurring?.cadence ? { cadence: quoted.recurring.cadence } : {}),
+        },
+        ...(quoted.term ? { term: quoted.term } : {}),
+        effectiveAt: quoted.effectiveAt,
+        determinacy: { immediateFinancialEffect: "DETERMINED", recurringFinancialEffect: "DETERMINED" },
+        provenance: {
+          immediate:
+            `post-commit actual: cancelNetImmediate recorded on the bound cancel artifact ${boundArtifact.id} — the ` +
+            `operation THIS commit dispatched, read back by its id; its established actual differs from the quoted figure`,
+          recurring: PROV_CANCEL_RECURRING_COMMITTED,
+          committedSource: "provider_actual",
+        },
+      };
+      return {
+        effect: differingEffect,
+        reconciliation: {
+          status: "VIOLATED",
+          reason:
+            `Post-commit cancellation financial verification MISMATCH — a determined negative verification (Decision D3): ` +
+            `the bound cancel artifact ${boundArtifact.id} established an immediate actual of ${artifactCancelActual}, ` +
+            `contradicting the quoted immediate figure (${quoted.immediate?.net ?? "absent"}). The contradiction is ` +
+            `attributable to this commit: the artifact's identity, request binding and closed fingerprint bracket were ` +
+            `established before this evaluation, and the cancellation's state verified as ` +
+            (verifiedKind === "TERMINAL" ? `TERMINAL` : `SCHEDULED at the quoted date`) +
+            `. The committed immediate carries the artifact's actual, not the quoted figure; the operation has already ` +
+            `been dispatched and cannot be rolled back by this reconciliation.`,
+        },
+        status: "COMMITTED",
+        outcome: "COMMITTED_AND_VERIFIED",
+        snapshot: snap,
+      };
+    }
+
     // Verified: the figures are the quoted figures BY PROTOCOL
     // DEFINITION (a pure cancellation has no proration component
-    // to drift), now backed by the established state — honestly
-    // labeled defined_equal_exact, with the verification kind
-    // recorded.
+    // to drift), now backed by BOTH the established state AND —
+    // per C1 — the bound artifact's established financial actual,
+    // which equals the quoted figure — honestly labeled
+    // defined_equal_exact, with the verification kind recorded.
     const committedEffect: CommercialEffect = {
       ...quoted,
       provenance: {
         ...quoted.provenance,
+        immediate:
+          `post-commit financial verification (C1): the bound cancel artifact ${boundArtifact.id} established ` +
+          `cancelNetImmediate ${artifactCancelActual} with earlyTerminationChargeKnown true at execution, matching ` +
+          `the quoted figure — the committed immediate is backed by the artifact's execution evidence, not copied ` +
+          `from the quote on state verification alone`,
         recurring:
           `${PROV_CANCEL_RECURRING_COMMITTED} — established at commit by the post-commit re-read: ` +
           (verifiedKind === "TERMINAL"

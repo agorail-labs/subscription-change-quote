@@ -673,6 +673,107 @@ test("Test 25.18 (§6.10): replay returns the original receipt even after a veri
 // 25.19 — Capability / guarantee truthfulness: BEST_EFFORT, no DATE, no
 // update-backed TERM_END, CANCEL combination refused.
 // ---------------------------------------------------------------------------
+// ---------------------------------------------------------------------------
+// 25.20 — C1: a cancellation whose bound artifact carries NO financial
+// evidence cannot be reported as financially verified, even when the
+// cancellation landed and scheduled correctly.
+// ---------------------------------------------------------------------------
+test("Test 25.20 (C1): evergreen TERM_END cancel with figureless artifact — landed and scheduled, but COMMITTED_UNVERIFIED, immediate not DETERMINED", async () => {
+  const { sim, adapter, sub } = fixture();
+  const quote = await adapter.createChangeQuote(sub.id, {
+    changes: [{ action: "CANCEL" }],
+    effectiveIntent: { type: "TERM_END" },
+  });
+  assert.deepEqual(quote.commercialEffect.immediate, { net: 0 });
+  sim._debugOmitMutationFinancials = true;
+  const receipt = await adapter.commitChangeQuote(quote.id);
+  // The operation DID land and schedule correctly.
+  const landed = sim.get(sub.id);
+  assert.equal(landed.status, "non_renewing");
+  assert.equal(landed.scheduledCancellationAt, quote.commercialEffect.effectiveAt);
+  const artifact = sim.mutationsFor(sub.id)[0];
+  assert.equal(artifact.kind, "cancel");
+  assert.equal(artifact.cancelNetImmediate, undefined, "the artifact persisted without its financial evidence (fault injection)");
+  assert.equal(artifact.earlyTerminationChargeKnown, true);
+  // But no financial verification may be claimed from a figureless artifact.
+  assert.equal(receipt.status, "COMMITTED_UNVERIFIED");
+  assert.equal(receipt.outcome, "COMMITTED_UNVERIFIED");
+  assert.equal(receipt.reconciliation.status, "UNVERIFIED");
+  assert.notEqual(receipt.reconciliation.status, "OK");
+  assert.equal(receipt.committedEffect.determinacy?.immediateFinancialEffect, "UNKNOWN", "the committed immediate is NOT determined — never the quoted zero copied through");
+  assert.equal(receipt.committedEffect.immediate?.net, undefined, "no determined immediate figure is carried; any candidate is unestablished");
+  assert.equal(receipt.committedEffect.provenance?.committedSource, "unestablished");
+  assert.ok(receipt.reconciliation.undeterminedDimensions?.includes("immediateFinancialEffect"));
+});
+
+test("Test 25.21 (C1): a normal evergreen cancel with established artifact financials stays COMMITTED_AND_VERIFIED / OK", async () => {
+  const { sim, adapter, sub } = fixture();
+  const quote = await adapter.createChangeQuote(sub.id, {
+    changes: [{ action: "CANCEL" }],
+    effectiveIntent: { type: "TERM_END" },
+  });
+  const receipt = await adapter.commitChangeQuote(quote.id);
+  assert.equal(receipt.status, "COMMITTED");
+  assert.equal(receipt.outcome, "COMMITTED_AND_VERIFIED");
+  assert.equal(receipt.reconciliation.status, "OK");
+  assert.deepEqual(receipt.committedEffect.immediate, { net: 0 });
+  assert.equal(receipt.committedEffect.determinacy?.immediateFinancialEffect, "DETERMINED");
+  assert.equal(receipt.committedEffect.provenance?.committedSource, "defined_equal_exact");
+  const artifact = sim.mutationsFor(sub.id)[0];
+  assert.equal(artifact.cancelNetImmediate, 0);
+  assert.equal(artifact.earlyTerminationChargeKnown, true);
+});
+
+// ---------------------------------------------------------------------------
+// 25.23 — C1 mirrored edge: an artifact whose execution signal says the
+// termination consequence was NOT established (earlyTerminationChargeKnown
+// !== true) cannot establish a financial figure at verification time, even
+// if a figure value is present on the read-back artifact.
+// ---------------------------------------------------------------------------
+test("Test 25.23 (C1 mirrored): artifact earlyTerminationChargeKnown !== true at verification caps at COMMITTED_UNVERIFIED even with a figure present", async () => {
+  const { sim, adapter, sub } = fixture();
+  const quote = await adapter.createChangeQuote(sub.id, {
+    changes: [{ action: "CANCEL" }],
+    effectiveIntent: { type: "TERM_END" },
+  });
+  const realRetrieve = sim.retrieveMutation.bind(sim);
+  sim.retrieveMutation = ((id: string) => {
+    const a = realRetrieve(id);
+    return { ...a, earlyTerminationChargeKnown: false };
+  }) as typeof realRetrieve;
+  const receipt = await adapter.commitChangeQuote(quote.id);
+  assert.equal(sim.get(sub.id).status, "non_renewing", "the cancellation landed");
+  assert.equal(receipt.status, "COMMITTED_UNVERIFIED");
+  assert.equal(receipt.outcome, "COMMITTED_UNVERIFIED");
+  assert.equal(receipt.reconciliation.status, "UNVERIFIED");
+  assert.equal(receipt.committedEffect.determinacy?.immediateFinancialEffect, "UNKNOWN");
+  assert.equal(receipt.committedEffect.provenance?.committedSource, "unestablished");
+  assert.ok(receipt.reconciliation.undeterminedDimensions?.includes("immediateFinancialEffect"));
+});
+
+test("Test 25.22 (C1): an established artifact cancel actual differing from the quote is carried as the actual — not a verified quoted zero", async () => {
+  const { sim, adapter, sub } = fixture();
+  const quote = await adapter.createChangeQuote(sub.id, {
+    changes: [{ action: "CANCEL" }],
+    effectiveIntent: { type: "TERM_END" },
+  });
+  assert.deepEqual(quote.commercialEffect.immediate, { net: 0 }, "the quote established a zero termination consequence");
+  sim._debugCancelNetImmediateOnNextCancel = 5000;
+  const receipt = await adapter.commitChangeQuote(quote.id);
+  const artifact = sim.mutationsFor(sub.id)[0];
+  assert.equal(artifact.cancelNetImmediate, 5000, "the persisted artifact carries the established differing actual");
+  assert.equal(artifact.earlyTerminationChargeKnown, true);
+  // The receipt must carry the ARTIFACT's actual and reconcile it
+  // honestly — never report the quoted zero as verified.
+  assert.equal(receipt.committedEffect.immediate?.net, 5000, "the artifact's actual, not the quoted zero");
+  assert.equal(receipt.committedEffect.determinacy?.immediateFinancialEffect, "DETERMINED");
+  assert.equal(receipt.committedEffect.provenance?.committedSource, "provider_actual");
+  assert.equal(receipt.reconciliation.status, "VIOLATED", "an established actual contradicting the quote is a determined negative verification, not OK");
+  assert.equal(receipt.status, "COMMITTED");
+  assert.equal(receipt.outcome, "COMMITTED_AND_VERIFIED");
+  assert.equal(sim.get(sub.id).status, "non_renewing", "the cancellation itself landed and scheduled as quoted");
+});
+
 test("Test 25.19: capability reporting stays truthful — BEST_EFFORT, restricted intents, CANCEL never bundled", async () => {
   const { adapter, sub } = fixture();
   const caps = adapter.getCapabilities();

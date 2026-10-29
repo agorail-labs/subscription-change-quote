@@ -278,6 +278,15 @@ export class ChargebeeSim {
   _debugWrongItemPriceOnNextUpdate: string | undefined = undefined;
   /** Next end-of-term cancel applies as an IMMEDIATE cancellation instead. One-shot. */
   _debugCancelImmediatelyOnNextCancel = false;
+  /**
+   * Next cancel's EXECUTION establishes THIS immediate figure instead
+   * of its computed one (the persisted artifact records it as an
+   * established actual, `earlyTerminationChargeKnown: true`). Models
+   * an execution whose established cancellation charge differs from
+   * what the quote preview established — quote/revalidation previews
+   * are unaffected. One-shot. Sim-only.
+   */
+  _debugCancelNetImmediateOnNextCancel: number | undefined = undefined;
   /** Set once any mutation has landed in this sim; gates `_debugFailSubscriptionReadsAfterMutation`. */
   private hasLandedMutation = false;
   /**
@@ -462,7 +471,12 @@ export class ChargebeeSim {
     // The execution's own cancel estimate, computed BEFORE applying:
     // the operation's financial evidence — what the cancellation
     // itself established at execution (NOT a later re-derivation).
-    const executionEstimate = this.previewCancel(subscriptionId, endOfTerm);
+    let executionEstimate = this.previewCancel(subscriptionId, endOfTerm);
+    if (this._debugCancelNetImmediateOnNextCancel !== undefined) {
+      const override = this._debugCancelNetImmediateOnNextCancel;
+      this._debugCancelNetImmediateOnNextCancel = undefined;
+      executionEstimate = { netImmediate: override, earlyTerminationChargeKnown: true };
+    }
 
     // Misexecution fault injection: an end-of-term cancel that
     // lands as an immediate termination. The artifact below keeps

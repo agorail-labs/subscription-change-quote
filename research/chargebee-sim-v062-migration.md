@@ -9,6 +9,7 @@ result in this migration is **SIMULATED_PASS**. The live-commit gate remains
 nothing here changes that, and this PR contains no live call of any kind.
 
 Baseline: main `5ef572f`, fresh clean build **286/286**. After: **309/309**.
+After the PR #15 review correction C1 (below): **313/313**.
 
 ## What was wrong (failing-first probes against main `5ef572f`)
 
@@ -174,6 +175,67 @@ Per PR #14 doctrine:
   unverified branches carry only the QUOTED candidate level under
   UNKNOWN determinacy, never a figure sourced from the re-read state.
 
+### C1 correction (PR #15 review): the cancellation financial-evidence gate
+
+The initial PR-6 cancel path verified the bound artifact's identity,
+recorded request, fingerprint bracket, and the re-read subscription
+state (status / scheduled date), then returned the quoted effect as
+`defined_equal_exact` — without inspecting the artifact's financial
+evidence. With the sim's `_debugOmitMutationFinancials` fault deleting
+the artifact's `cancelNetImmediate`, a correct evergreen TERM_END
+cancel still returned COMMITTED / COMMITTED_AND_VERIFIED / OK with a
+DETERMINED immediate `{ net: 0 }` copied from the quote: financial
+verification was claimed with no financial evidence. (Failing-first:
+test 25.20 reproduced exactly that outcome on the pre-correction head;
+test 25.22 showed an established artifact actual of 5000 being
+reported as the quoted zero.)
+
+The correction adds a financial-evidence gate inside
+`establishCancelCommit`, evaluated after attribution is established
+and before any financially verified outcome, entirely from the bound
+artifact already read back — no further provider/simulator read
+follows a landed mutation (P1):
+
+- A financially verified cancellation requires the artifact's
+  ESTABLISHED actual: `earlyTerminationChargeKnown === true` AND a
+  finite `cancelNetImmediate` on the bound artifact.
+- A figureless/unreadable-as-financial-evidence artifact, or an
+  artifact whose `earlyTerminationChargeKnown !== true` at
+  verification time (the mirrored committed-term edge: the artifact's
+  own execution signal, not just the quote-time signal, must
+  establish the consequence), caps the outcome at
+  COMMITTED_UNVERIFIED / UNVERIFIED. The committed immediate is
+  UNKNOWN with no determined figure; the quoted figure survives only
+  as an unestablished candidate under `committedSource:
+  "unestablished"`, and the reconciliation names
+  `immediateFinancialEffect` among its undetermined dimensions.
+  The known landing (the cancellation did execute and schedule) is
+  retained in the reason and snapshot as context — only the
+  financial verification is withheld.
+- An established artifact actual that DIFFERS from the quoted
+  figure is carried as the committed actual
+  (`committedSource: "provider_actual"`) with a VIOLATED
+  reconciliation — a determined negative verification (D3) — never
+  reported as a verified quoted figure. The sim gained one sim-only
+  hook, `_debugCancelNetImmediateOnNextCancel`, which makes the next
+  cancel's execution establish an injected figure so this case is
+  exercisable (test 25.22: quoted 0, artifact actual 5000, receipt
+  carries 5000 / VIOLATED).
+- A normal evergreen cancel whose artifact establishes the quoted
+  figure stays COMMITTED_AND_VERIFIED / OK, still labeled
+  `defined_equal_exact`, with its committed-immediate provenance now
+  naming the bound artifact's establishing evidence (test 25.21;
+  test 25.17a unchanged in outcome).
+- The state-mismatch (D3) branch is behind the same gate, so its
+  carried immediate is now always the artifact's established actual.
+
+Regression tests (all in test25, no new file): 25.20 figureless
+artifact → COMMITTED_UNVERIFIED, immediate UNKNOWN; 25.21 normal
+evergreen cancel stays verified OK; 25.22 established differing
+actual carried + VIOLATED; 25.23 artifact signal
+`earlyTerminationChargeKnown !== true` at verification (figure
+present on the read-back) → COMMITTED_UNVERIFIED.
+
 ### Outcome taxonomy
 
 - Verified success: COMMITTED / COMMITTED_AND_VERIFIED.
@@ -217,7 +279,9 @@ figureless), `_debugFailMutationReads` (artifact read-back fails),
 `_debugLoseNextMutationResponse` (apply + persist, then lose the
 response), `_debugWrongQuantityOnNextUpdate`,
 `_debugWrongItemPriceOnNextUpdate` (misexecution landings),
-`_debugCancelImmediatelyOnNextCancel` (premature terminal landing).
+`_debugCancelImmediatelyOnNextCancel` (premature terminal landing),
+`_debugCancelNetImmediateOnNextCancel` (C1: the next cancel's
+execution establishes an injected immediate figure).
 
 ## Disclosed pre-existing test changes
 
