@@ -215,6 +215,16 @@ function provImmediateCommitted(orderId: string): string {
     `response); no latest-order pointer was used`
   );
 }
+/**
+ * Z3 (PR #14 review correction): the recurring provenance on a
+ * BROKEN-attribution receipt. The re-read post-commit recurring
+ * level was not produced by this commit alone, so no committed
+ * recurring figure is established for this commit; the observed
+ * level survives only as context (resulting snapshot /
+ * reconciliation reason), never as a figure on the effect.
+ */
+const PROV_RECURRING_UNATTRIBUTED =
+  "UNESTABLISHED for this commit: the version sequence around this commit's order is broken, so the recurring level read back from the post-commit subscription was not produced by this commit alone — it is third-party-influenced observed state, retained only as unattributed context in the resulting snapshot and the reconciliation reason. No committed recurring figure is established for this commit; the bound order artifact establishes this commit's IMMEDIATE actual only (see the immediate provenance)";
 const PROV_RECURRING_COMMITTED =
   "post-commit actual: sum over the re-read post-commit subscription's rate-plan charges (unitAmount x quantity)";
 const PROV_RECURRING_COMMITTED_CANCEL =
@@ -1015,8 +1025,14 @@ export class ZuoraAdapter implements SubscriptionProvider {
    *    state matches intent or contradicts it. A contradiction
    *    under a broken chain may have been caused by the intervening
    *    actor, so it is recorded as unattributed context, never as
-   *    this commit's verified failure. Figures are this commit's
-   *    bound-order actuals only.
+   *    this commit's verified failure. The only figure recorded is
+   *    this commit's bound-order IMMEDIATE actual; the recurring
+   *    dimension is UNKNOWN with NO figure (PR #14 review
+   *    correction Z3): the re-read recurring level is
+   *    third-party-influenced observed state, retained only as
+   *    unattributed context in the resulting snapshot and the
+   *    reconciliation reason — never as this commit's determined
+   *    actual.
    *  - reads succeed + chain unbroken + state contradicts intent:
    *    COMMITTED / COMMITTED_AND_VERIFIED with a VIOLATED
    *    reconciliation naming the contradictions (Decision D3 — a
@@ -1150,6 +1166,11 @@ export class ZuoraAdapter implements SubscriptionProvider {
       readOrder.subscriptionVersionAfter === Number(validated.subscription_version_at_quote) + 1;
     const latestId = this.sim.latestOrderId(subscriptionId);
 
+    // This fully-determined effect is returned ONLY by the two
+    // attributable branches below (verified OK and D3 VIOLATED):
+    // its recurring figure is the re-read state's, which is this
+    // commit's own result only behind the unbroken chain. The
+    // broken-chain branch builds its own effect (correction Z3).
     const committedEffect: CommercialEffect = {
       immediate: immediateFromInvoiceItems(readOrder.invoiceItems, committedImmediateNet),
       recurring: {
@@ -1182,13 +1203,54 @@ export class ZuoraAdapter implements SubscriptionProvider {
     // broken, another actor's change may have produced the observed
     // mismatch, so the outcome is COMMITTED_UNVERIFIED / UNVERIFIED
     // whether or not the observed state happens to match intent:
-    // the bound order's financial observations are retained (they
-    // are this order's own record, read by id) and any observed
-    // state contradiction is recorded as UNATTRIBUTED CONTEXT, its
-    // cause not assigned to this commit.
+    // any observed state contradiction is recorded as UNATTRIBUTED
+    // CONTEXT, its cause not assigned to this commit.
+    //
+    // PR #14 review correction Z3: FINANCIAL ATTRIBUTION FOLLOWS
+    // THE SAME RULE. The committedEffect built above takes its
+    // recurring figure from the re-read subscription
+    // (observedRecurring) — legitimate ONLY behind the unbroken
+    // chain, where that state is this commit's own result. Under a
+    // broken chain the re-read state is third-party-influenced, so
+    // carrying its recurring level as this commit's DETERMINED
+    // actual would attribute another actor's figure to this commit
+    // — the same misattribution Z1 removed from the verdict, one
+    // layer down (at 9efc4a5 test 24.23's receipt recorded the
+    // intervening actor's 130000 as this commit's determined
+    // recurring actual). The broken-chain branch therefore returns
+    // a DIFFERENT effect: the immediate stays — it is the bound
+    // order's own persisted actual, read by id, exactly the scope
+    // that order establishes — while the recurring dimension is
+    // UNKNOWN with NO resultingAmount: no committed recurring
+    // figure is established for this commit. The observed state,
+    // including its recurring level, remains visible only as
+    // unattributed context in the resulting snapshot and in the
+    // reconciliation reason. The effect-level committedSource is
+    // "unestablished" — the committed effect AS A WHOLE is not an
+    // established set of actuals; the immediate dimension's own
+    // determinacy and provenance carry its narrower claim.
     if (!attributable) {
+      const unattributedEffect: CommercialEffect = {
+        immediate: immediateFromInvoiceItems(readOrder.invoiceItems, committedImmediateNet),
+        recurring: {
+          previousAmount: quoted.recurring?.previousAmount,
+          // NO resultingAmount (Z3): the observed post-commit
+          // recurring level was not produced by this commit alone
+          // and is not recorded as this commit's figure.
+          currency: quoted.recurring?.currency ?? "usd",
+          ...(quoted.recurring?.cadence ? { cadence: quoted.recurring.cadence } : {}),
+        },
+        ...(quoted.term ? { term: quoted.term } : {}),
+        effectiveAt: quoted.effectiveAt,
+        determinacy: { immediateFinancialEffect: "DETERMINED", recurringFinancialEffect: "UNKNOWN" },
+        provenance: {
+          immediate: provImmediateCommitted(readOrder.id),
+          recurring: PROV_RECURRING_UNATTRIBUTED,
+          committedSource: "unestablished",
+        },
+      };
       return {
-        effect: committedEffect,
+        effect: unattributedEffect,
         reconciliation: {
           status: "UNVERIFIED",
           reason:
@@ -1199,15 +1261,18 @@ export class ZuoraAdapter implements SubscriptionProvider {
             (latestId && latestId !== readOrder.id ? ` with latest order ${latestId}` : "") +
             ` — the version sequence is not the unbroken +1 this commit alone would produce, so the ` +
             `observed post-commit state was not produced by this commit alone and cannot be attributed to ` +
-            `it. The recorded financial figures are this commit's own bound-order actuals, read by id; no ` +
-            `figure was taken from any intervening order.` +
+            `it. The recorded immediate figure is this commit's own bound-order actual, read by id; NO ` +
+            `committed recurring figure is recorded for this commit (the recurring dimension is UNKNOWN): ` +
+            `the recurring level in the observed state was not produced by this commit alone, so it is ` +
+            `retained only as unattributed context in the resulting snapshot — not as this commit's ` +
+            `determined actual. No figure was taken from any intervening order.` +
             (problems.length > 0
               ? ` The observed state ALSO contradicts the intended sequence (${problems.join("; ")}), but ` +
                 `because attribution is broken that contradiction is recorded as unattributed context ` +
                 `only — it is NOT classified as a verified failure of this commit, since the intervening ` +
                 `change may have caused it.`
               : ``),
-          undeterminedDimensions: [],
+          undeterminedDimensions: ["recurringFinancialEffect"],
         },
         status: "COMMITTED_UNVERIFIED",
         outcome: "COMMITTED_UNVERIFIED",
@@ -1297,6 +1362,19 @@ export class ZuoraAdapter implements SubscriptionProvider {
    *    COMMITTED_UNVERIFIED with candidate figures labeled
    *    unestablished under UNKNOWN determinacy, built entirely
    *    from data already in hand (PR #11 correction P1).
+   *
+   * Z3 audit (PR #14 review correction Z3): this path was audited
+   * for the broken-attribution financial-claim defect fixed in
+   * establishCommittedEffect, and it is CLEAN: its unverified
+   * branches record only the candidateEffect — the QUOTED
+   * post-cancellation level under UNKNOWN determinacy with
+   * committedSource "unestablished", never a figure sourced from
+   * the (possibly third-party-influenced) re-read state, and never
+   * a zero asserted from an observed terminal state. The only
+   * re-read-derived DETERMINED figure in this path is the D3
+   * mismatch branch's observed recurring, reachable only AFTER
+   * the Z2 attribution gate above — an attributable contradiction,
+   * which Z3 does not touch.
    */
   private establishCancelCommit(
     validated: StoredQuote,
