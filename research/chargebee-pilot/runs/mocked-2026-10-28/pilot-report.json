@@ -1,5 +1,5 @@
 {
-  "generatedAt": "2026-10-29T05:27:00.422Z",
+  "generatedAt": "2026-10-29T13:03:31.868Z",
   "mode": "mocked",
   "site": "pilot-test (mocked)",
   "subscriptionRef": "pilot-sub-001",
@@ -23,7 +23,7 @@
     {
       "step": "provider-backed quote (estimate only)",
       "status": "pass",
-      "detail": "quote scq_cblive_4cc173008ba9ee4d; immediate.net=20000; recurring=80900"
+      "detail": "quote scq_cblive_2f8d9505c502485a; immediate.net=20000; recurring=80900"
     },
     {
       "step": "field-by-field comparison (normalized vs raw)",
@@ -68,7 +68,7 @@
       "rawDerived": null,
       "normalized": null,
       "match": true,
-      "note": "next-invoice figures are metadata only; amount_due (net of credits) must never equal-by-substitution the incurred immediate"
+      "note": "next-invoice figures are metadata only, with raw values intact; the effect's figures are sourced from their own fields (see the rows above) — separation is by source, and the figures may legitimately coincide numerically"
     },
     {
       "field": "provenance recorded for every determined dimension",
@@ -98,7 +98,7 @@
     {
       "capability": "normalized-vs-raw field comparison",
       "classification": "SIMULATED_PASS",
-      "basis": "interpretChargebeeEstimate applied independently to the captured raw estimate response"
+      "basis": "harness consistency check — the adapter's own interpretation function re-applied to the captured raw estimate (shares interpretation code with the adapter, so correlated interpretation defects are NOT detectable here; independent verification is the test-only oracle exercised in test22)"
     },
     {
       "capability": "live commit",
@@ -114,10 +114,16 @@
   "transport": {
     "totalCalls": 8,
     "mutatingCalls": 0,
-    "estimateCalls": 1
+    "estimateCalls": 1,
+    "byOperation": {
+      "retrieve_subscription": 3,
+      "get_item_price": 4,
+      "estimate_update_for_items": 1
+    },
+    "rejectedAttempts": 0
   },
   "quote": {
-    "id": "scq_cblive_4cc173008ba9ee4d",
+    "id": "scq_cblive_2f8d9505c502485a",
     "immediateNet": 20000,
     "recurringResulting": 80900,
     "recurringPrevious": 60900,

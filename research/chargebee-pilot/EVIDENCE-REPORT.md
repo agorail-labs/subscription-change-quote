@@ -37,7 +37,8 @@ Command: `npm run pilot:chargebee -- --out research/chargebee-pilot/runs/mocked-
 
 Full suite at this evidence point: **247/247** (227 pre-pilot baseline +
 20 test21), fresh clean build; smoke pack OK; neutrality OK; freeze
-scope clean.
+scope clean. After the PR #13 review corrections (§C) the suite
+stands at **256/256** (test22 added 9 tests).
 
 ## B. Historical live evidence — Oct 27, 2026 (cited)
 
@@ -55,6 +56,77 @@ read/estimate-only authorization for that run.
 These classifications belong to that run and its authorization. This
 pilot does not extend them: in the pilot's own environment, live
 capabilities are BLOCKED as recorded in §A.
+
+## C. Review corrections (PR #13) — R1, R2, R3
+
+Three defects from review of this PR were corrected. All correction
+evidence is SIMULATED_PASS against mocked/stub transports (test22,
+9 tests) — no live calls were made; no credentials exist in this
+environment.
+
+**R1 — the harness comparison was not independent of the code it
+checks.** `compareQuoteToRawEstimate` re-applies the adapter's own
+`interpretChargebeeEstimate`, so a systematic defect inside that
+function would corrupt the quote and the comparison identically, and
+the comparison would still report a match. Resolution: a genuinely
+independent, **test-only oracle**
+(`reference/tests/oracles/chargebee-estimate-oracle.ts`) computes the
+expected effect — values AND provenance (which raw fields each figure
+must come from; `next_invoice_estimate` is never a source) — directly
+from the raw provider response, from PROVENANCE-MATRIX.md semantics,
+importing no adapter interpretation code. Test evidence now rests on
+the oracle (22-o1 validates a real adapter quote against it, values
+and provenance). The harness keeps its internal comparison for the
+CLI report, relabeled honestly as a consistency check (see the
+regenerated run artifact's basis text). 22-o2 is the new regression:
+a quote embodying the systematic error (recurring taken from
+`next_invoice_estimate.amount_due`, provenance citing it) FAILS the
+oracle on value and on provenance, while a comparison driven by the
+same defective mapping "passes" it — the correlated blind spot,
+demonstrated; the shipped comparison catches the doctored quote only
+because the shipped interpretation is currently correct. (21-p3's
+raw-divergence regression is preserved untouched.)
+
+**R2 — next-invoice isolation was asserted by numeric inequality.**
+The harness's isolation row required the incurred figure to DIFFER
+numerically from `next_invoice_estimate.amount_due` — a bogus
+requirement, since the figures may legitimately coincide.
+Failing-first evidence: on the pre-correction code, a fixture with
+amount_due legitimately equal to the incurred 20000 produced matching
+raw and normalized figures, yet the row reported mismatch — solely
+from the inequality conjunct. The requirement was removed (disclosed
+in-file in run-pilot.ts); isolation is now a SOURCE property, tested
+by 22-i1 (vary only the raw next-invoice figures — credits 300 vs
+900 vs absent — and the quoted effect is byte-identical) and 22-i2
+(the coincidence case: amount_due exactly 20000 — quote accepted,
+oracle passes in full, and the recorded provenance still sources the
+incurred figure from `unbilled_charge_estimates`, never from
+`next_invoice_estimate`). Test 21-p4's fixture description in §A is
+unchanged; it never asserted the inequality — the requirement lived
+in the harness comparison.
+
+**R3 — live-read safeguards are now enforced, not described.** (a)
+Preflight: before any live request, the harness requires an approved
+test-site configuration (`-test` designation or explicit allowlist)
+AND a synthetic-designated test subscription id, failing closed with
+the named error `LIVE_PREFLIGHT_FAILED`; 22-g1 covers the failure
+modes (production-looking site, missing id, non-synthetic id) with a
+recording stub — zero requests attempted, BLOCKED report, no
+LIVE_PASS. (b) Allowlist at the transport boundary: a guarded live
+transport (`reference/src/live/pilot/live-guard.ts`) permits only GET
+subscription retrieve, GET item_price, and POST subscription
+estimate; everything else (update_for_items, create, cancel,
+invoice/payment paths, arbitrary reads) is rejected pre-dispatch
+with the named error `OPERATION_NOT_ALLOWED` (22-g2, including
+through the adapter's client path — nothing dispatches). (c)
+Observed counts: report transport counts now derive from the
+transport's observed call log — the previously hardcoded
+mutating/total figures are removed — and live classifications derive
+from observed successful operations (`classifyRunCapability`); an
+empty log can never emit LIVE_PASS. 22-g3: mocked-mode counts match
+the fixture's own call log exactly. 22-g4: the live counting/
+classification logic exercised against the stubbed network (a logic
+test, not live evidence). 22-g5 pins the classification gate.
 
 ## Classification discipline
 

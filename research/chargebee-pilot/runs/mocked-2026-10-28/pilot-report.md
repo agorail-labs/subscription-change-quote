@@ -1,13 +1,13 @@
 # Chargebee pilot run — mocked mode
 
-Generated: 2026-10-29T05:27:00.422Z · Site: pilot-test (mocked) · Subscription: pilot-sub-001
+Generated: 2026-10-29T13:03:31.868Z · Site: pilot-test (mocked) · Subscription: pilot-sub-001
 Proposal: CHANGE_QUANTITY pilot-addon-vision 1 -> 21
 
 ## Steps
 - [pass] retrieve subscription — status=active, items=2, version=rv:1700000000000
 - [pass] build SCQ snapshot — recurring=60900 USD
 - [pass] construct proposal — CHANGE_QUANTITY pilot-addon-vision 1 -> 21, IMMEDIATE
-- [pass] provider-backed quote (estimate only) — quote scq_cblive_4cc173008ba9ee4d; immediate.net=20000; recurring=80900
+- [pass] provider-backed quote (estimate only) — quote scq_cblive_2f8d9505c502485a; immediate.net=20000; recurring=80900
 - [pass] field-by-field comparison (normalized vs raw) — 6/6 fields match
 
 ## Field-by-field comparison (normalized quote vs raw provider estimate)
@@ -27,8 +27,9 @@ Proposal: CHANGE_QUANTITY pilot-addon-vision 1 -> 21
 |---|---|---|
 | retrieve subscription + snapshot | SIMULATED_PASS | mocked transport fixture (pilot mock) |
 | estimate-backed quote | SIMULATED_PASS | mocked transport fixture (pilot mock) |
-| normalized-vs-raw field comparison | SIMULATED_PASS | interpretChargebeeEstimate applied independently to the captured raw estimate response |
+| normalized-vs-raw field comparison | SIMULATED_PASS | harness consistency check — the adapter's own interpretation function re-applied to the captured raw estimate (shares interpretation code with the adapter, so correlated interpretation defects are NOT detectable here; independent verification is the test-only oracle exercised in test22) |
 | live commit | BLOCKED | prohibited in this pilot; harness constructs the adapter with liveCommitEnabled=false in both modes; SCQ_LIVE_COMMIT_ENABLED untouched |
 | mocked commit-path + recovery behavior | DOCUMENTATION_SUPPORTED | exercised by test21/test13 mocked suites, not by this read-only harness run |
 
-Transport: 8 calls, 1 estimate calls, **0 mutating calls**.
+Transport: 8 calls, 1 estimate calls, **0 mutating calls** (all counts observed in the transport log).
+Observed operations: retrieve_subscription ×3, get_item_price ×4, estimate_update_for_items ×1.
