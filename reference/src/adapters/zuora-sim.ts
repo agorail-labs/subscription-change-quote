@@ -242,6 +242,24 @@ export class ZuoraSim {
   _debugFailSubscriptionReadsAfterMutation = false;
   /** The next createOrder APPLIES and PERSISTS, then throws a connection-class error instead of returning (lost response). One-shot. */
   _debugLoseNextOrderResponse = false;
+  /**
+   * PR #14 review corrections Z1/Z2: the next createOrder's own
+   * APPLICATION diverges from the actions it was given — the order
+   * itself lands wrong while the version advances by exactly the +1
+   * this order alone produces (the attribution chain stays unbroken:
+   * the wrongness is THIS order's, provably). The persisted order
+   * record and the execution computation keep the DISPATCHED actions
+   * and figures; only the applied state diverges. These hooks model
+   * a provider-side misexecution of our own order — distinct from
+   * `_debugMutateDirectly`, which models a DIFFERENT actor's change
+   * (and therefore breaks attribution). All one-shot.
+   */
+  /** Next order applies UpdateProduct actions with THIS quantity instead of the specified one. */
+  _debugWrongQuantityOnNextOrder: number | undefined = undefined;
+  /** Next order applies AddProduct actions with THIS productRatePlanId instead of the specified one. */
+  _debugWrongRatePlanOnNextOrder: string | undefined = undefined;
+  /** Next order applies CancelSubscription actions as an IMMEDIATE termination (effective today) instead of at their stated future effectiveDate. */
+  _debugCancelEffectiveNowOnNextOrder = false;
   /** Set once any order has landed in this sim; gates `_debugFailSubscriptionReadsAfterMutation`. */
   private hasLandedOrder = false;
 
@@ -361,7 +379,32 @@ export class ZuoraSim {
 
     const result = this.computeOrderEffect(sub, orderActions);
 
-    for (const action of orderActions) {
+    // Z1/Z2 fault injection: the misexecution hooks (see their
+    // declarations) transform ONLY the actions used for application
+    // — the persisted order record below and `result` keep the
+    // actions exactly as dispatched, and the version still advances
+    // by exactly this order's +1.
+    let appliedActions = orderActions;
+    if (
+      this._debugWrongQuantityOnNextOrder !== undefined ||
+      this._debugWrongRatePlanOnNextOrder !== undefined ||
+      this._debugCancelEffectiveNowOnNextOrder
+    ) {
+      const wrongQuantity = this._debugWrongQuantityOnNextOrder;
+      const wrongRatePlan = this._debugWrongRatePlanOnNextOrder;
+      const cancelNow = this._debugCancelEffectiveNowOnNextOrder;
+      this._debugWrongQuantityOnNextOrder = undefined;
+      this._debugWrongRatePlanOnNextOrder = undefined;
+      this._debugCancelEffectiveNowOnNextOrder = false;
+      appliedActions = orderActions.map((a) => {
+        if (a.type === "UpdateProduct" && wrongQuantity !== undefined) return { ...a, quantity: wrongQuantity };
+        if (a.type === "AddProduct" && wrongRatePlan !== undefined) return { ...a, productRatePlanId: wrongRatePlan };
+        if (a.type === "CancelSubscription" && cancelNow) return { ...a, effectiveDate: this.now.toISOString().slice(0, 10) };
+        return a;
+      });
+    }
+
+    for (const action of appliedActions) {
       this.applyAction(sub, action);
     }
     sub.version += 1;

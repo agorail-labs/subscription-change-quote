@@ -621,6 +621,18 @@ function stateContradictions(
   return problems;
 }
 
+/** Key-order-insensitive JSON for comparing a persisted order's actions against the sequence a commit dispatched. */
+function canonicalJson(value: unknown): string {
+  if (Array.isArray(value)) return `[${value.map(canonicalJson).join(",")}]`;
+  if (value !== null && typeof value === "object") {
+    const entries = Object.entries(value as Record<string, unknown>)
+      .filter(([, v]) => v !== undefined)
+      .sort(([a], [b]) => (a < b ? -1 : a > b ? 1 : 0));
+    return `{${entries.map(([k, v]) => `${JSON.stringify(k)}:${canonicalJson(v)}`).join(",")}}`;
+  }
+  return JSON.stringify(value) ?? "null";
+}
+
 function recurringTotalOf(sub: ZuoraSubscription): number {
   return sub.ratePlans.reduce((sum, p) => sum + p.ratePlanCharges.reduce((s, c) => s + c.unitAmount * c.quantity, 0), 0);
 }
@@ -995,17 +1007,25 @@ export class ZuoraAdapter implements SubscriptionProvider {
    * is a MISMATCH, never a verified scheduled cancellation — the
    * PR #11 P3 lesson).
    *
-   * Outcomes:
-   *  - reads succeed + state matches + version attributable:
+   * Outcomes (PR #14 review correction Z1 — classification order
+   * is attribution FIRST, contradiction second):
+   *  - reads succeed + version chain broken (an order intervened
+   *    before or after this commit's order): COMMITTED_UNVERIFIED
+   *    with an UNVERIFIED reconciliation — whether the observed
+   *    state matches intent or contradicts it. A contradiction
+   *    under a broken chain may have been caused by the intervening
+   *    actor, so it is recorded as unattributed context, never as
+   *    this commit's verified failure. Figures are this commit's
+   *    bound-order actuals only.
+   *  - reads succeed + chain unbroken + state contradicts intent:
+   *    COMMITTED / COMMITTED_AND_VERIFIED with a VIOLATED
+   *    reconciliation naming the contradictions (Decision D3 — a
+   *    determined negative verification, never UNVERIFIED, never a
+   *    false success). The unbroken chain is what makes the
+   *    contradiction provably this commit's own wrong landing.
+   *  - reads succeed + chain unbroken + state matches:
    *    COMMITTED / COMMITTED_AND_VERIFIED, reconciliation computed
    *    by the core from quoted vs established actuals.
-   *  - reads succeed + state contradicts intent: COMMITTED /
-   *    COMMITTED_AND_VERIFIED with a VIOLATED reconciliation naming
-   *    the contradictions (Decision D3 — a determined negative
-   *    verification, never UNVERIFIED, never a false success).
-   *  - reads succeed + state matches + a later order intervened:
-   *    COMMITTED_UNVERIFIED (attribution unverified; figures are
-   *    this commit's bound-order actuals only).
    *  - a read is unavailable, the bound order is unavailable, or
    *    the persisted order carries no financial actuals:
    *    COMMITTED_UNVERIFIED with an UNVERIFIED reconciliation. The
@@ -1154,22 +1174,18 @@ export class ZuoraAdapter implements SubscriptionProvider {
       },
     };
 
-    if (problems.length > 0) {
-      return {
-        effect: committedEffect,
-        reconciliation: {
-          status: "VIOLATED",
-          reason:
-            `Post-commit state verification MISMATCH — a determined negative verification (Decision D3): ` +
-            `${problems.join("; ")}. The committed immediate is this mutation's bound-order actual and the ` +
-            `recurring figure reports the observed state; the order has already been created and cannot be ` +
-            `rolled back by this reconciliation.`,
-        },
-        status: "COMMITTED",
-        outcome: "COMMITTED_AND_VERIFIED",
-        snapshot: snap,
-      };
-    }
+    // PR #14 review correction Z1: ATTRIBUTION IS ESTABLISHED
+    // BEFORE ANY CONTRADICTION IS CLASSIFIED. A state contradiction
+    // may be declared a verified failure of THIS commit (D3's
+    // VIOLATED) only when the observed state is attributable to this
+    // commit — the unbroken version chain above. When the chain is
+    // broken, another actor's change may have produced the observed
+    // mismatch, so the outcome is COMMITTED_UNVERIFIED / UNVERIFIED
+    // whether or not the observed state happens to match intent:
+    // the bound order's financial observations are retained (they
+    // are this order's own record, read by id) and any observed
+    // state contradiction is recorded as UNATTRIBUTED CONTEXT, its
+    // cause not assigned to this commit.
     if (!attributable) {
       return {
         effect: committedEffect,
@@ -1184,11 +1200,35 @@ export class ZuoraAdapter implements SubscriptionProvider {
             ` — the version sequence is not the unbroken +1 this commit alone would produce, so the ` +
             `observed post-commit state was not produced by this commit alone and cannot be attributed to ` +
             `it. The recorded financial figures are this commit's own bound-order actuals, read by id; no ` +
-            `figure was taken from any intervening order.`,
+            `figure was taken from any intervening order.` +
+            (problems.length > 0
+              ? ` The observed state ALSO contradicts the intended sequence (${problems.join("; ")}), but ` +
+                `because attribution is broken that contradiction is recorded as unattributed context ` +
+                `only — it is NOT classified as a verified failure of this commit, since the intervening ` +
+                `change may have caused it.`
+              : ``),
           undeterminedDimensions: [],
         },
         status: "COMMITTED_UNVERIFIED",
         outcome: "COMMITTED_UNVERIFIED",
+        snapshot: snap,
+      };
+    }
+    if (problems.length > 0) {
+      return {
+        effect: committedEffect,
+        reconciliation: {
+          status: "VIOLATED",
+          reason:
+            `Post-commit state verification MISMATCH — a determined negative verification (Decision D3): ` +
+            `${problems.join("; ")}. The contradiction is attributable to this commit: the version sequence ` +
+            `is the unbroken +1 this commit alone produces, so no intervening change can account for it. ` +
+            `The committed immediate is this mutation's bound-order actual and the ` +
+            `recurring figure reports the observed state; the order has already been created and cannot be ` +
+            `rolled back by this reconciliation.`,
+        },
+        status: "COMMITTED",
+        outcome: "COMMITTED_AND_VERIFIED",
         snapshot: snap,
       };
     }
@@ -1210,11 +1250,25 @@ export class ZuoraAdapter implements SubscriptionProvider {
    * the post-cancellation recurring level is 0 once effective, so
    * committed := quoted, labeled defined_equal_exact — but ONLY
    * after the cancellation's STATE is independently verified from
-   * a post-commit re-read of the subscription record (the adapter
-   * owns this establishment because the PR-1 machinery's generic
-   * snapshot check cannot see a cancellation schedule — the F3
-   * limitation; the sim's subscription record carries
-   * `cancelledDate`, so the richer read is available here):
+   * a post-commit re-read of the subscription record AND — PR #14
+   * review correction Z2 — attributed to THIS commit: the
+   * persisted order this mutation created is read back by id, its
+   * actions are checked against the dispatched sequence, and the
+   * version sequence must be the unbroken +1 this commit alone
+   * produces (the same attribution establishCommittedEffect
+   * requires; this path previously verified status/date alone, so
+   * another actor's cancellation could verify as this commit's).
+   * If the bound order cannot be read, its identity does not
+   * match, or the chain is broken, the outcome is
+   * COMMITTED_UNVERIFIED / UNVERIFIED with candidate figures —
+   * neither OK nor VIOLATED may be issued for an unattributable
+   * cancellation. (The adapter owns this establishment because the
+   * PR-1 machinery's generic snapshot check cannot see a
+   * cancellation schedule — the F3 limitation; the sim's
+   * subscription record carries `cancelledDate`, so the richer
+   * read is available here.)
+   *
+   * With attribution established, the state verdicts are:
    *
    *  - IMMEDIATE intent: the re-read status must be the terminal
    *    "Cancelled" — kind TERMINAL. A non-terminal read is an
@@ -1235,7 +1289,9 @@ export class ZuoraAdapter implements SubscriptionProvider {
    *  - MISMATCH (D3): COMMITTED / COMMITTED_AND_VERIFIED with a
    *    VIOLATED reconciliation, and the committed figures honestly
    *    report the OBSERVED state (the still-active price level),
-   *    never a fabricated post-cancel zero.
+   *    never a fabricated post-cancel zero. Reachable ONLY with
+   *    attribution established (above) — an unattributable
+   *    contradiction is UNVERIFIED, not this commit's VIOLATED.
    *  - Re-read unavailable: landing is established (the createOrder
    *    call returned) but verification is not —
    *    COMMITTED_UNVERIFIED with candidate figures labeled
@@ -1255,36 +1311,64 @@ export class ZuoraAdapter implements SubscriptionProvider {
     const subscriptionId = validated.subscription_id;
     const quoted = validated.quoted_effect;
     const proposal = validated.proposal;
+    const input = validated.provider_preview_input as ZuoraPreviewInput;
 
+    // Candidate figures for an unverifiable landing, built
+    // ENTIRELY from data already in hand (the stored quote and the
+    // mutation response) — recording a COMMITTED_UNVERIFIED
+    // receipt never depends on a further successful provider read
+    // after the order has landed (PR #11 correction P1).
+    const candidateEffect = (recurringProvenance: string): CommercialEffect => ({
+      recurring: {
+        previousAmount: quoted.recurring?.previousAmount,
+        resultingAmount: 0,
+        currency: quoted.recurring?.currency ?? "usd",
+        ...(quoted.recurring?.cadence ? { cadence: quoted.recurring.cadence } : {}),
+      },
+      ...(quoted.term ? { term: quoted.term } : {}),
+      effectiveAt: quoted.effectiveAt,
+      determinacy: { immediateFinancialEffect: "UNKNOWN", recurringFinancialEffect: "UNKNOWN" },
+      provenance: {
+        recurring: recurringProvenance,
+        committedSource: "unestablished",
+        applicabilityCitations: {
+          immediateFinancialEffect: { action: "CANCEL", dimension: "immediateFinancialEffect" },
+        },
+      },
+    });
+
+    // Independent post-commit reads: the subscription AND — PR #14
+    // review correction Z2 — the persisted ORDER this mutation
+    // created, read back by its id via retrieveOrder. Cancellation
+    // verification is bound to that order exactly as the general
+    // path (establishCommittedEffect) binds to it: the order's
+    // identity, its action identity against the stored dispatched
+    // sequence, and the unbroken +1 version chain must ALL be
+    // established before the observed cancellation state may be
+    // classified as this commit's verified success (OK) or verified
+    // failure (VIOLATED). Previously this path re-read only the
+    // subscription, so a matching cancelledDate or terminal status
+    // produced by some OTHER actor's order verified as this
+    // commit's own result.
     let readSub: ZuoraSubscription | undefined;
     try {
       readSub = this.sim.get(subscriptionId);
     } catch {
       readSub = undefined;
     }
+    let readOrder: ZuoraOrder | undefined;
+    try {
+      const order = this.sim.retrieveOrder(mutation.orderId);
+      if (order.subscriptionId === subscriptionId) readOrder = order;
+    } catch {
+      readOrder = undefined;
+    }
 
     if (!readSub) {
-      const candidate: CommercialEffect = {
-        recurring: {
-          previousAmount: quoted.recurring?.previousAmount,
-          resultingAmount: 0,
-          currency: quoted.recurring?.currency ?? "usd",
-          ...(quoted.recurring?.cadence ? { cadence: quoted.recurring.cadence } : {}),
-        },
-        ...(quoted.term ? { term: quoted.term } : {}),
-        effectiveAt: quoted.effectiveAt,
-        determinacy: { immediateFinancialEffect: "UNKNOWN", recurringFinancialEffect: "UNKNOWN" },
-        provenance: {
-          recurring:
-            "candidate figure: the quoted post-cancellation level, reported by the mutating call's own response path; the independent post-commit re-read was unavailable, so the cancellation's landing is NOT independently established",
-          committedSource: "unestablished",
-          applicabilityCitations: {
-            immediateFinancialEffect: { action: "CANCEL", dimension: "immediateFinancialEffect" },
-          },
-        },
-      };
       return {
-        effect: candidate,
+        effect: candidateEffect(
+          "candidate figure: the quoted post-cancellation level, reported by the mutating call's own response path; the independent post-commit re-read was unavailable, so the cancellation's landing is NOT independently established"
+        ),
         reconciliation: {
           status: "UNVERIFIED",
           reason:
@@ -1304,6 +1388,66 @@ export class ZuoraAdapter implements SubscriptionProvider {
     }
 
     const snap = snapshotFrom(readSub);
+
+    // Attribution (Z2): the bound order must be THIS mutation's
+    // order (bound by the returned id, on this subscription),
+    // carrying exactly the action sequence this commit dispatched,
+    // and the version sequence must be the unbroken +1 from the
+    // version this commit validated against to the re-read version
+    // — the same chain establishCommittedEffect requires.
+    const orderActionsMatch =
+      readOrder !== undefined && canonicalJson(readOrder.orderActions) === canonicalJson(input.orderActions);
+    const attributable =
+      readOrder !== undefined &&
+      orderActionsMatch &&
+      readOrder.subscriptionVersionAfter === Number(validated.subscription_version_at_quote) + 1 &&
+      readSub.version === readOrder.subscriptionVersionAfter;
+
+    if (!attributable) {
+      let failure: string;
+      if (readOrder === undefined) {
+        failure =
+          `the persisted order ${mutation.orderId} this mutation created could not be read back, so the ` +
+          `cancellation cannot be bound to this commit's order at all`;
+      } else if (!orderActionsMatch) {
+        failure =
+          `the persisted order ${readOrder.id} read back for this mutation does not carry the order-action ` +
+          `sequence this commit dispatched, so it does not establish this cancellation's identity`;
+      } else {
+        const latestId = this.sim.latestOrderId(subscriptionId);
+        failure =
+          `another order intervened around this commit's cancellation order: this commit validated ` +
+          `against subscription version ${validated.subscription_version_at_quote}, order ${readOrder.id} ` +
+          `recorded version ${readOrder.subscriptionVersionAfter} after it applied, and the re-read ` +
+          `subscription is at version ${readSub.version}` +
+          (latestId && latestId !== readOrder.id ? ` with latest order ${latestId}` : "") +
+          ` — the version sequence is not the unbroken +1 this commit alone would produce`;
+      }
+      return {
+        effect: candidateEffect(
+          "candidate figure: the quoted post-cancellation level; the cancellation's attribution to this commit could not be established, so the observed state is NOT an established actual of this commit"
+        ),
+        reconciliation: {
+          status: "UNVERIFIED",
+          reason:
+            `the cancellation order landed (its response was received, carrying order ${mutation.orderId}) ` +
+            `but its result cannot be attributed to this commit: ${failure}. The observed state ` +
+            `(status ${readSub.status}, cancelledDate ${readSub.cancelledDate ?? "(none)"}) is recorded as ` +
+            `unattributed context only — it is NOT classified as this commit's verified cancellation, nor ` +
+            `as its verified failure, since an intervening change may have produced it; the recorded ` +
+            `figures are candidates, pending a later verification`,
+          undeterminedDimensions: ["immediateFinancialEffect", "recurringFinancialEffect"],
+        },
+        status: "COMMITTED_UNVERIFIED",
+        outcome: "COMMITTED_UNVERIFIED",
+        snapshot: snap,
+      };
+    }
+
+    // Attribution is established: the state evaluation below speaks
+    // about THIS commit's cancellation alone, so its verdicts —
+    // verified SCHEDULED/TERMINAL, or a D3 MISMATCH — are this
+    // commit's own.
     const intentType = proposal.effectiveIntent.type;
     const quotedDate = quoted.effectiveAt;
     let verifiedKind: "TERMINAL" | "SCHEDULED" | undefined;
@@ -1381,8 +1525,10 @@ export class ZuoraAdapter implements SubscriptionProvider {
           status: "VIOLATED",
           reason:
             `Post-commit cancellation state verification MISMATCH — a determined negative verification (Decision D3): ` +
-            `${mismatchReason}. The committed recurring figure reports the observed state; the order has ` +
-            `already been created and cannot be rolled back by this reconciliation.`,
+            `${mismatchReason}. The contradiction is attributable to this commit: the bound order's ` +
+            `identity and the unbroken +1 version chain were established before this evaluation, so no ` +
+            `intervening change can account for it. The committed recurring figure reports the observed ` +
+            `state; the order has already been created and cannot be rolled back by this reconciliation.`,
         },
         status: "COMMITTED",
         outcome: "COMMITTED_AND_VERIFIED",
