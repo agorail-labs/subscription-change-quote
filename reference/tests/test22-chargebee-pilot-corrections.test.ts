@@ -40,8 +40,24 @@ import { checkQuoteAgainstOracle, oracleExpectation, type OracleContext } from "
 // Everything here is mocked/stubbed — SIMULATED evidence only. The
 // "live" runs below inject the fixture as the network layer to test
 // the live path's safeguard and classification LOGIC; they are not
-// live evidence and are never classified as such anywhere outside
-// the classification-logic assertions that are their subject.
+// live evidence.
+//
+// RE-REVIEW CORRECTIONS (F1/F2, second review round):
+//   F1 — preflight now requires EXPLICIT per-run site approval (an
+//        approved-site entry exactly matching CHARGEBEE_SITE); a
+//        `-test` suffix alone no longer passes. 22-g1's failure cases
+//        that isolate a non-site defect now supply that approval for
+//        their (synthetic) site, and its passing case supplies the
+//        explicit approval — the tests' intent is unchanged. The new
+//        F1 regressions live in test23.
+//   F2 — REQUIRED TEST CHANGE (disclosed): 22-g4 previously asserted
+//        LIVE_PASS from an injected mock transport. That assertion
+//        contradicted the corrected semantics — an injected transport
+//        proves dispatch through the stub, not origin from a live
+//        provider — and has been reworked: a successful injected run
+//        now asserts SIMULATED_PASS and that "LIVE_PASS" appears
+//        nowhere in the serialized report. Its observed-count
+//        assertions are preserved.
 
 const SUB = "pilot-sub-001";
 const ADDON = "pilot-addon-vision";
@@ -214,8 +230,9 @@ function countingStubTransport() {
 test("Test 22-g1: live preflight failure modes — BLOCKED report, zero requests attempted, no LIVE_PASS", async () => {
   const cases: Array<{ name: string; env: Record<string, string>; detailIncludes: string }> = [
     { name: "production-looking site", env: { CHARGEBEE_SITE: "acme-production", CHARGEBEE_API_KEY: "k", CHARGEBEE_TEST_SUBSCRIPTION_ID: "pilot-sub-001" }, detailIncludes: "not an approved test site" },
-    { name: "missing synthetic subscription id", env: { CHARGEBEE_SITE: "acme-test", CHARGEBEE_API_KEY: "k" }, detailIncludes: "synthetic test subscription id" },
-    { name: "non-synthetic subscription id", env: { CHARGEBEE_SITE: "acme-test", CHARGEBEE_API_KEY: "k", CHARGEBEE_TEST_SUBSCRIPTION_ID: "sub_9f8e7d6c5b" }, detailIncludes: "does not carry a synthetic designation" },
+    { name: "-test site with no explicit per-run approval (F1)", env: { CHARGEBEE_SITE: "acme-test", CHARGEBEE_API_KEY: "k", CHARGEBEE_TEST_SUBSCRIPTION_ID: "pilot-sub-001" }, detailIncludes: "not an approved test site" },
+    { name: "missing synthetic subscription id", env: { CHARGEBEE_SITE: "acme-test", CHARGEBEE_API_KEY: "k", SCQ_PILOT_APPROVED_TEST_SITES: "acme-test" }, detailIncludes: "synthetic test subscription id" },
+    { name: "non-synthetic subscription id", env: { CHARGEBEE_SITE: "acme-test", CHARGEBEE_API_KEY: "k", CHARGEBEE_TEST_SUBSCRIPTION_ID: "sub_9f8e7d6c5b", SCQ_PILOT_APPROVED_TEST_SITES: "acme-test" }, detailIncludes: "does not carry a synthetic designation" },
   ];
   for (const c of cases) {
     const stub = countingStubTransport();
@@ -235,7 +252,12 @@ test("Test 22-g1: live preflight failure modes — BLOCKED report, zero requests
     () => assertLivePilotPreflight({ site: "acme-production", apiKeyPresent: true, subscriptionId: "pilot-sub-001" }),
     (e: unknown) => e instanceof PilotLivePreflightError && (e as PilotLivePreflightError).code === "LIVE_PREFLIGHT_FAILED",
   );
-  assert.doesNotThrow(() => assertLivePilotPreflight({ site: "arjunsamplecompany-test", apiKeyPresent: true, subscriptionId: "cbdemo__XpbKpmKUbu8d2cPS" }));
+  // F1: a `-test` suffix alone no longer passes — explicit approval is required.
+  assert.throws(
+    () => assertLivePilotPreflight({ site: "arjunsamplecompany-test", apiKeyPresent: true, subscriptionId: "cbdemo__XpbKpmKUbu8d2cPS" }),
+    (e: unknown) => e instanceof PilotLivePreflightError,
+  );
+  assert.doesNotThrow(() => assertLivePilotPreflight({ site: "arjunsamplecompany-test", apiKeyPresent: true, subscriptionId: "cbdemo__XpbKpmKUbu8d2cPS", approvedTestSites: ["arjunsamplecompany-test"] }));
 });
 
 // ---------------------------------------------------------------------------
@@ -301,17 +323,21 @@ test("Test 22-g3: mocked-mode report counts match the mock transport's call log 
   assert.equal(report.transport.rejectedAttempts, 0);
 });
 
-test("Test 22-g4: simulated live run (stubbed network) reports the OBSERVED counts; classifications rest on the log", async () => {
-  // CLASSIFICATION-LOGIC TEST ONLY: the network layer is the pilot
-  // fixture, so this run is not live evidence. It proves the live
-  // path's counting and classification mechanics: counts come from
-  // the guard's observed log (which must agree with the fixture's own
-  // log, since every request passed through both), and LIVE_PASS is
-  // emitted only because the corresponding operations were observed.
+test("Test 22-g4: simulated live run (stubbed network) reports the OBSERVED counts; injected origin classifies SIMULATED_PASS, never LIVE_PASS [F2 rework]", async () => {
+  // REQUIRED TEST CHANGE (F2, disclosed in this file's header): this
+  // test previously asserted LIVE_PASS from the injected fixture.
+  // That was the defect — a call log proves dispatch through the
+  // injected transport, not origin from a live provider. The network
+  // layer here is the pilot fixture, so this run is simulated
+  // evidence: its successful capabilities classify SIMULATED_PASS,
+  // and "LIVE_PASS" must appear NOWHERE in the returned report. The
+  // counting mechanics are unchanged and still asserted: counts come
+  // from the guard's observed log (which must agree with the
+  // fixture's own log, since every request passed through both).
   const mock = new PilotMockChargebee();
   const report = await runPilot({
     mode: "live",
-    env: { CHARGEBEE_SITE: "pilot-test", CHARGEBEE_API_KEY: "pilot-mock-key", CHARGEBEE_TEST_SUBSCRIPTION_ID: SUB },
+    env: { CHARGEBEE_SITE: "pilot-test", CHARGEBEE_API_KEY: "pilot-mock-key", CHARGEBEE_TEST_SUBSCRIPTION_ID: SUB, SCQ_PILOT_APPROVED_TEST_SITES: "pilot-test" },
     networkTransport: mock.transport,
   });
   assert.ok(report.steps.every((s) => s.status === "pass"), JSON.stringify(report.steps));
@@ -322,16 +348,27 @@ test("Test 22-g4: simulated live run (stubbed network) reports the OBSERVED coun
   assert.equal(report.transport.byOperation.estimate_update_for_items, 1);
   assert.ok((report.transport.byOperation.retrieve_subscription ?? 0) >= 1);
   assert.equal(report.quote?.immediateNet, 20000);
+  assert.equal(report.transportOrigin, "injected");
   const byCap = Object.fromEntries(report.capabilities.map((c) => [c.capability, c.classification]));
-  assert.equal(byCap["retrieve subscription + snapshot"], "LIVE_PASS");
-  assert.equal(byCap["estimate-backed quote"], "LIVE_PASS");
+  assert.equal(byCap["retrieve subscription + snapshot"], "SIMULATED_PASS");
+  assert.equal(byCap["estimate-backed quote"], "SIMULATED_PASS");
   assert.equal(byCap["live commit"], "BLOCKED");
+  // The F2 regression scan: LIVE_PASS (and LIVE_FAIL) appear nowhere
+  // in the serialized returned report of an injected-transport run.
+  const serialized = JSON.stringify(report);
+  assert.ok(!serialized.includes("LIVE_PASS"), serialized);
+  assert.ok(!serialized.includes("LIVE_FAIL"), serialized);
 });
 
-test("Test 22-g5: classification gate — an empty observed log can never yield LIVE_PASS", () => {
+test("Test 22-g5: classification gate — an empty observed log can never yield LIVE_PASS; injected origin can never yield LIVE_*", () => {
   assert.equal(classifyRunCapability("live", true, 0), "UNVERIFIED");
   assert.equal(classifyRunCapability("live", true, 3), "LIVE_PASS");
+  assert.equal(classifyRunCapability("live", true, 3, "real"), "LIVE_PASS");
   assert.equal(classifyRunCapability("live", false, 3), "LIVE_FAIL");
   assert.equal(classifyRunCapability("mocked", true, 0), "SIMULATED_PASS");
   assert.equal(classifyRunCapability("mocked", false, 0), "UNVERIFIED");
+  // F2: injected origin — success is simulated evidence only.
+  assert.equal(classifyRunCapability("live", true, 3, "injected"), "SIMULATED_PASS");
+  assert.equal(classifyRunCapability("live", true, 0, "injected"), "UNVERIFIED");
+  assert.equal(classifyRunCapability("live", false, 3, "injected"), "UNVERIFIED");
 });
