@@ -115,9 +115,10 @@ state may be blamed on*. Failing-first probes against the branch tip `f96b957`:
 the unbroken attribution chain (validated version → the bound order's `subscriptionVersionAfter`
 == validated + 1 → re-read version == the order's version-after); (2) only if attribution holds,
 evaluate state contradictions → VIOLATED (D3) or verified OK; (3) if attribution is broken or
-unestablishable, COMMITTED_UNVERIFIED / UNVERIFIED — bound-order financial observations are
-retained and honestly labeled, and any observed mismatch is recorded in the reconciliation
-reason as *unattributed context*, its cause not assigned to this commit. The pure-CANCEL path
+unestablishable, COMMITTED_UNVERIFIED / UNVERIFIED — the bound order's immediate observation
+is retained, and any observed mismatch is recorded in the reconciliation
+reason as *unattributed context*, its cause not assigned to this commit (what "retained" means
+for the recurring dimension was narrowed by Z3, next section). The pure-CANCEL path
 additionally checks the bound order's **action identity** against the sequence this commit
 dispatched (canonical comparison), and an unreadable bound order ⇒ COMMITTED_UNVERIFIED with
 the candidate built from data already in hand (P1). The scheduled-vs-terminal and quoted-date
@@ -149,6 +150,70 @@ own; `verifyCommitReceipt` remains the store-level PR-1 machinery driven by call
 observations (test 24.20, unchanged). The Z1/Z2 fixes govern the adapter's *initial*
 classification, so a cancellation receipt can no longer be *born* verified-OK/VIOLATED without
 attribution; the frozen store machinery itself is untouched.
+
+## Review correction Z3 (PR #14) — financial attribution follows the same rule
+
+A third merge-blocking finding from the PR #14 review, one layer below Z1: the *verdict* was
+fixed, but the *figures* were not. Failing-first evidence against the Z1/Z2 head `9efc4a5`:
+
+- **Probe Z3 — the broken-chain branch returned the intervening actor's recurring figure as
+  this commit's determined actual.** `establishCommittedEffect` built `committedEffect` with
+  `resultingAmount: recurringTotalOf(readSub)` labeled DETERMINED / `committedSource:
+  "provider_actual"` *before* the `if (!attributable)` branch, and the broken-chain branch
+  returned that same effect. Probe (24.23's construction: this order changed quantity
+  100 → 120; another actor then changed it 120 → 130, version 2 → 3): status/outcome
+  COMMITTED_UNVERIFIED, reconciliation UNVERIFIED — but `committedEffect.recurring` was
+  `{ previousAmount: 100000, resultingAmount: 130000 }` with `recurringFinancialEffect:
+  "DETERMINED"` and `undeterminedDimensions: []`. The 130000 was the intervening actor's
+  result, not this order's (120000); an UNVERIFIED verdict and an explanatory reason do not
+  change the financial figure's attribution. Test 24.23 at `9efc4a5` explicitly expected the
+  130000 — the expectation itself encoded the defect.
+
+**Fix (option (b), the safer minimum):** the broken-chain branch of `establishCommittedEffect`
+now builds its own effect instead of returning the fully-determined one:
+
+- **Immediate stays** — it is the bound order's own persisted actual, read by id: exactly the
+  scope the persisted order establishes, with its DETERMINED determinacy and order-naming
+  provenance unchanged.
+- **Recurring is UNKNOWN with NO `resultingAmount`** — no committed recurring figure is
+  established for this commit. (No unestablished candidate figure is carried either; the
+  observed level is not this commit's number in any labeling.) The effect-level
+  `committedSource` is `"unestablished"` — the committed effect as a whole is not an
+  established set of actuals; the immediate dimension's own determinacy/provenance carry its
+  narrower claim.
+- **The observed state remains context**: the third-party-influenced post-commit state —
+  including its recurring level — stays visible in the resulting snapshot and in the
+  reconciliation reason, labeled unattributed.
+- **The reconciliation matches the determinacy**: `undeterminedDimensions` is now
+  `["recurringFinancialEffect"]` (was `[]`).
+- The attributable branches are untouched: verified OK and D3 VIOLATED receipts keep their
+  re-read-derived recurring figures as DETERMINED provider actuals — behind the unbroken
+  chain, that state *is* this commit's own result (24.13, 24.19 attributable cases unchanged).
+
+**Cancel-path audit:** `establishCancelCommit` was audited for the same pattern and is
+**clean** — no change. Its unverified branches (re-read unavailable; bound order unreadable /
+action-identity mismatch / broken chain) record only the shared `candidateEffect`: the
+*quoted* post-cancellation level under UNKNOWN determinacy with `committedSource:
+"unestablished"` and candidate provenance — never a figure sourced from the re-read state,
+and never a zero asserted from an observed terminal state. Its one re-read-derived
+DETERMINED figure (the D3 mismatch branch's observed recurring) is reachable only after the
+Z2 attribution gate, which is precisely the attributable case Z3 preserves.
+
+**Regressions** (test24; suite stays 286 — assertion-level reworks, no count change):
+
+- 24.23 (**reworked, required**): the 130000-as-determined-actual expectation replaced by the
+  Z3 discipline — recurring determinacy UNKNOWN, `resultingAmount` absent,
+  `undeterminedDimensions` includes `recurringFinancialEffect`, committed source
+  `unestablished`, and the observed 130000/quantity-130 asserted present ONLY in the
+  resulting snapshot (context). The second case (intervening wrong rate plan) gained the
+  same recurring assertions. Outcome assertions (COMMITTED_UNVERIFIED / UNVERIFIED) unchanged.
+- 24.12 (**assertions added**): the matching-state chain break (check→mutate window). No
+  prior 24.12 expectation asserted the committed recurring figure, so nothing was reversed;
+  the test now pins that even the coincidentally matching observed level (the intended
+  120000) is NOT recorded as this commit's determined actual — determinacy
+  `{ immediate: DETERMINED, recurring: UNKNOWN }`, no `resultingAmount`, undetermined
+  dimensions naming recurring. Its title/comment were narrowed accordingly ("figures still
+  the bound order's" now refers to the immediate alone).
 
 ## Remaining limitations
 
