@@ -93,7 +93,19 @@ test("Test 9c: CHANGE_QUANTITY, EXACT — quote doesn't mutate, commit reproduce
   assert.equal(receipt.status, "COMMITTED");
   assert.equal(receipt.resultingSnapshot.items[0].quantity, 120);
   assert.equal(receipt.resultingSnapshot.version, "2", "version must increment by exactly 1 per order");
-  assert.deepEqual(receipt.committedEffect, receipt.quotedEffect, "EXACT mode: quotedEffect === committedEffect, and unlike Stripe this required NO proration_date-style pin — Zuora's order math was never wall-clock-dependent in the first place");
+  // PR-5 DISCLOSED EXPECTATION CHANGE (v0.6.2 Zuora migration):
+  // whole-effect deepEqual(committedEffect, quotedEffect) is no
+  // longer the contract — a committed effect carries committed
+  // provenance (CORE-2: here, provider_actual figures established
+  // from the persisted order read back by id) that a quote-side
+  // effect never asserts. The zero-drift FIGURES still match
+  // exactly — and unlike Stripe this required NO proration_date-
+  // style pin, since Zuora's order math was never wall-clock-
+  // dependent in the first place; assert those.
+  assert.deepEqual(receipt.committedEffect.immediate, receipt.quotedEffect.immediate, "EXACT mode: committed immediate figures match the quote exactly");
+  assert.deepEqual(receipt.committedEffect.recurring, receipt.quotedEffect.recurring);
+  assert.deepEqual(receipt.committedEffect.determinacy, receipt.quotedEffect.determinacy);
+  assert.equal(receipt.committedEffect.provenance?.committedSource, "provider_actual");
 
   console.log("[Test 9c] quoted/committed immediate charge:", receipt.quotedEffect.immediate, "— unaffected by 10 days elapsing, with no pinning mechanism needed");
 });
@@ -176,7 +188,16 @@ test("Test 9e (v0.5, CHANGED): CANCEL of an evergreen subscription — quote-lev
   const receipt = await adapter.commitChangeQuote(quote.id);
   assert.equal(receipt.resultingSnapshot.status, "active", "remains active until period end");
   assert.equal(receipt.resultingSnapshot.term?.autoRenew, false);
-  assert.deepEqual(receipt.committedEffect, receipt.quotedEffect, "EXACT mode: quoted and committed coincide");
+  // PR-5 DISCLOSED EXPECTATION CHANGE (v0.6.2 Zuora migration):
+  // whole-effect deepEqual(committedEffect, quotedEffect) is no
+  // longer the contract — the verified committed effect is labeled
+  // defined_equal_exact with its verification kind recorded in
+  // provenance (CORE-2), which a quote-side effect never asserts.
+  // The FIGURES still coincide exactly; assert those.
+  assert.deepEqual(receipt.committedEffect.immediate, receipt.quotedEffect.immediate, "EXACT mode: quoted and committed figures coincide");
+  assert.deepEqual(receipt.committedEffect.recurring, receipt.quotedEffect.recurring);
+  assert.deepEqual(receipt.committedEffect.determinacy, receipt.quotedEffect.determinacy);
+  assert.equal(receipt.committedEffect.provenance?.committedSource, "defined_equal_exact");
 
   console.log(
     "[Test 9e] v0.5 fix confirmed: quote-level guaranteeCoverage for an evergreen subscription's CANCEL resolved " +
@@ -232,8 +253,31 @@ test("Test 9f: CANCEL during a committed term — early-termination consequence 
   // because the early-termination question could not be resolved.
   assert.equal(quote.commercialEffect.term?.createsCommitment, "UNKNOWN");
 
-  const receipt = await adapter.commitChangeQuote(quote.id);
-  assert.equal(receipt.resultingSnapshot.status, "canceled");
+  // PR-5 DISCLOSED EXPECTATION CHANGE (v0.6.2 Zuora migration): the
+  // pre-migration code COMMITTED this quote — its committedEffect was
+  // the revalidated preview (finding F-1), whose absent immediate the
+  // frozen v0.6.1 envelope zero-filled, so the unestablished
+  // early-termination exposure passed silently. Under v0.6.2 the
+  // quote's immediate dimension is UNKNOWN (the total incurred
+  // obligation is not established while the fee question is open —
+  // never a fabricated zero, never NOT_APPLICABLE), and the
+  // adapter-level determinacy gate (M2) refuses the commit BEFORE
+  // any mutation. The quote-side assertions above are unchanged.
+  assert.equal(quote.commercialEffect.determinacy?.immediateFinancialEffect, "UNKNOWN");
+  assert.equal(quote.commercialEffect.immediate, undefined, "no figure is emitted for an unestablished dimension — never zero-filled");
+  const stateBefore = JSON.stringify(sim.get(sub.id));
+  await assert.rejects(
+    () => adapter.commitChangeQuote(quote.id),
+    (err: unknown) => {
+      assert.ok(err instanceof SCQError);
+      assert.equal(err.code, "QUOTE_NOT_DETERMINISTIC");
+      assert.equal((err as any).details.stage, "quoted");
+      assert.equal((err as any).details.dimension, "immediateFinancialEffect");
+      return true;
+    }
+  );
+  assert.equal(sim.ordersFor(sub.id).length, 0, "the refusal performed zero mutating calls");
+  assert.equal(JSON.stringify(sim.get(sub.id)), stateBefore, "subscription state is byte-identical after the refusal");
 });
 
 test("Test 9g (v0.5, EXTENDED): quantity change with requestedEffectiveAt — now exercised through the real ZuoraAdapter API, not just the raw sim", async () => {
@@ -265,7 +309,17 @@ test("Test 9g (v0.5, EXTENDED): quantity change with requestedEffectiveAt — no
   const receipt = await adapter.commitChangeQuote(quote.id);
   assert.equal(receipt.status, "COMMITTED");
   assert.equal(receipt.resultingSnapshot.items[0].quantity, 130);
-  assert.deepEqual(receipt.committedEffect, receipt.quotedEffect, "EXACT: the future-dated order action was replayed verbatim, reproducing the quoted numbers exactly");
+  // PR-5 DISCLOSED EXPECTATION CHANGE (v0.6.2 Zuora migration):
+  // whole-effect deepEqual(committedEffect, quotedEffect) is no
+  // longer the contract — the committed effect carries committed
+  // provenance (provider_actual, established from the persisted
+  // order read back by id). The future-dated order action was still
+  // replayed verbatim, reproducing the quoted FIGURES exactly;
+  // assert those.
+  assert.deepEqual(receipt.committedEffect.immediate, receipt.quotedEffect.immediate, "EXACT: the future-dated order action was replayed verbatim, reproducing the quoted figures exactly");
+  assert.deepEqual(receipt.committedEffect.recurring, receipt.quotedEffect.recurring);
+  assert.deepEqual(receipt.committedEffect.determinacy, receipt.quotedEffect.determinacy);
+  assert.equal(receipt.committedEffect.provenance?.committedSource, "provider_actual");
 
   console.log(
     "[Test 9g] v0.5 fix confirmed: requestedEffectiveAt was honored end-to-end through the real adapter API " +

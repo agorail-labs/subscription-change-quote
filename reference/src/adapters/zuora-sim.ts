@@ -162,6 +162,36 @@ export type OrderPreviewInvoiceItem = {
   serviceStartDate: string;
 };
 
+/**
+ * v0.6.2 (PR-5): a PERSISTED order record — the identifiable artifact
+ * a createOrder() call leaves behind, independently readable via
+ * retrieveOrder(). This is the minimal sim-only model the migration
+ * requires: pre-migration, createOrder returned only the mutated
+ * subscription and a preview-shaped result (destructured away by the
+ * adapter), so no order identity survived and post-commit financial
+ * verification had nothing provider-side to bind to. The record's
+ * financial fields are the figures the order computed AT EXECUTION
+ * (the same computation previewOrder runs, persisted) — they are the
+ * order's own financial evidence, distinct from any pre-execution
+ * preview the adapter took. Under the `_debugOmitOrderFinancials`
+ * fault the financial fields are absent at runtime (modeled by the
+ * optional markers below being stripped) — readers must treat a
+ * missing figure as unestablished, never as zero.
+ */
+export type ZuoraOrder = {
+  id: string;
+  subscriptionId: string;
+  /** The order actions exactly as dispatched, in order. */
+  orderActions: OrderAction[];
+  invoiceItems: OrderPreviewInvoiceItem[];
+  netImmediate: number;
+  resultingRecurringAmount: number;
+  resultingCadence: "MONTHLY" | "ANNUAL";
+  /** The subscription's native version immediately after this order applied. */
+  subscriptionVersionAfter: number;
+  createdAt: string;
+};
+
 export type OrderPreviewResult = {
   invoiceItems: OrderPreviewInvoiceItem[];
   netImmediate: number;
@@ -193,7 +223,45 @@ const CATALOG: Record<string, { unitAmount: number; billingPeriod: "Month" | "An
 
 export class ZuoraSim {
   private subs = new Map<string, ZuoraSubscription>();
+  private orders = new Map<string, ZuoraOrder>();
   private now: Date;
+
+  // v0.6.2 (PR-5) fault-injection hooks (the states the migration's
+  // negative matrix needs and ordinary simulator flows cannot
+  // produce). All default off; tests set them explicitly. Confined
+  // to this simulator — the adapter contains no fault branches.
+  /** previewOrder returns its result WITHOUT the immediate figure (netImmediate/invoiceItems stripped at runtime). */
+  _debugOmitPreviewImmediate = false;
+  /** previewOrder returns its result WITHOUT the recurring figure (resultingRecurringAmount stripped at runtime). */
+  _debugOmitPreviewRecurring = false;
+  /** The persisted order record is stored WITHOUT its financial fields (invoiceItems/netImmediate/resultingRecurringAmount stripped at runtime). */
+  _debugOmitOrderFinancials = false;
+  /** retrieveOrder throws — the persisted order is unavailable to readers. */
+  _debugFailOrderReads = false;
+  /** Subscription reads throw once any order has landed (models a post-mutation read outage). */
+  _debugFailSubscriptionReadsAfterMutation = false;
+  /** The next createOrder APPLIES and PERSISTS, then throws a connection-class error instead of returning (lost response). One-shot. */
+  _debugLoseNextOrderResponse = false;
+  /**
+   * PR #14 review corrections Z1/Z2: the next createOrder's own
+   * APPLICATION diverges from the actions it was given — the order
+   * itself lands wrong while the version advances by exactly the +1
+   * this order alone produces (the attribution chain stays unbroken:
+   * the wrongness is THIS order's, provably). The persisted order
+   * record and the execution computation keep the DISPATCHED actions
+   * and figures; only the applied state diverges. These hooks model
+   * a provider-side misexecution of our own order — distinct from
+   * `_debugMutateDirectly`, which models a DIFFERENT actor's change
+   * (and therefore breaks attribution). All one-shot.
+   */
+  /** Next order applies UpdateProduct actions with THIS quantity instead of the specified one. */
+  _debugWrongQuantityOnNextOrder: number | undefined = undefined;
+  /** Next order applies AddProduct actions with THIS productRatePlanId instead of the specified one. */
+  _debugWrongRatePlanOnNextOrder: string | undefined = undefined;
+  /** Next order applies CancelSubscription actions as an IMMEDIATE termination (effective today) instead of at their stated future effectiveDate. */
+  _debugCancelEffectiveNowOnNextOrder = false;
+  /** Set once any order has landed in this sim; gates `_debugFailSubscriptionReadsAfterMutation`. */
+  private hasLandedOrder = false;
 
   constructor(now = new Date()) {
     this.now = now;
@@ -212,6 +280,12 @@ export class ZuoraSim {
   }
 
   get(id: string): ZuoraSubscription {
+    if (this._debugFailSubscriptionReadsAfterMutation && this.hasLandedOrder) {
+      throw new ZuoraSimError(
+        "SubscriptionReadUnavailable",
+        "Simulated subscription read failure: subscription reads are unavailable after an order has landed (fault injection)"
+      );
+    }
     const sub = this.subs.get(id);
     if (!sub) throw new ZuoraSimError("SubscriptionNotFound", `Subscription ${id} not found`);
     return structuredClone(sub);
@@ -232,7 +306,58 @@ export class ZuoraSim {
    */
   previewOrder(subscriptionId: string, orderActions: OrderAction[]): OrderPreviewResult {
     const sub = this.get(subscriptionId);
-    return this.computeOrderEffect(sub, orderActions);
+    const result = this.computeOrderEffect(sub, orderActions);
+    if (this._debugOmitPreviewImmediate || this._debugOmitPreviewRecurring) {
+      // Fault injection at the preview SURFACE only: the returned
+      // result omits the figure(s), modeling a preview response that
+      // cannot establish them. The underlying computation (and any
+      // later createOrder for the same actions) is unaffected.
+      const shaped = { ...result } as unknown as Record<string, unknown>;
+      if (this._debugOmitPreviewImmediate) {
+        delete shaped.netImmediate;
+        delete shaped.invoiceItems;
+      }
+      if (this._debugOmitPreviewRecurring) {
+        delete shaped.resultingRecurringAmount;
+      }
+      return shaped as unknown as OrderPreviewResult;
+    }
+    return result;
+  }
+
+  /**
+   * v0.6.2 (PR-5): reads back a PERSISTED order by its id — the
+   * independent post-commit read the adapter's verification binds
+   * to. Throws ZuoraSimError("OrderNotFound") for an unknown id,
+   * and whatever `_debugFailOrderReads` injects.
+   */
+  retrieveOrder(orderId: string): ZuoraOrder {
+    if (this._debugFailOrderReads) {
+      throw new ZuoraSimError("OrderReadUnavailable", "Simulated order read failure: the order store is unavailable (fault injection)");
+    }
+    const order = this.orders.get(orderId);
+    if (!order) throw new ZuoraSimError("OrderNotFound", `Order ${orderId} not found`);
+    return structuredClone(order);
+  }
+
+  /** All persisted orders for a subscription, in creation order (defensive copies). */
+  ordersFor(subscriptionId: string): ZuoraOrder[] {
+    return Array.from(this.orders.values())
+      .filter((o) => o.subscriptionId === subscriptionId)
+      .map((o) => structuredClone(o));
+  }
+
+  /**
+   * The id of the most recent persisted order for a subscription,
+   * or null. A DIVERGENCE SIGNAL ONLY (mirrors Paddle's
+   * latestTransactionId): financial actuals are never read through
+   * this pointer — a later order may have replaced it — it exists
+   * so a reader can tell that the latest order is no longer the one
+   * a given commit created.
+   */
+  latestOrderId(subscriptionId: string): string | null {
+    const list = Array.from(this.orders.values()).filter((o) => o.subscriptionId === subscriptionId);
+    return list.length > 0 ? list[list.length - 1].id : null;
   }
 
   /**
@@ -248,18 +373,82 @@ export class ZuoraSim {
   createOrder(
     subscriptionId: string,
     orderActions: OrderAction[]
-  ): { subscription: ZuoraSubscription; result: OrderPreviewResult } {
+  ): { subscription: ZuoraSubscription; result: OrderPreviewResult; orderId: string } {
     const sub = this.subs.get(subscriptionId);
     if (!sub) throw new ZuoraSimError("SubscriptionNotFound", `Subscription ${subscriptionId} not found`);
 
     const result = this.computeOrderEffect(sub, orderActions);
 
-    for (const action of orderActions) {
+    // Z1/Z2 fault injection: the misexecution hooks (see their
+    // declarations) transform ONLY the actions used for application
+    // — the persisted order record below and `result` keep the
+    // actions exactly as dispatched, and the version still advances
+    // by exactly this order's +1.
+    let appliedActions = orderActions;
+    if (
+      this._debugWrongQuantityOnNextOrder !== undefined ||
+      this._debugWrongRatePlanOnNextOrder !== undefined ||
+      this._debugCancelEffectiveNowOnNextOrder
+    ) {
+      const wrongQuantity = this._debugWrongQuantityOnNextOrder;
+      const wrongRatePlan = this._debugWrongRatePlanOnNextOrder;
+      const cancelNow = this._debugCancelEffectiveNowOnNextOrder;
+      this._debugWrongQuantityOnNextOrder = undefined;
+      this._debugWrongRatePlanOnNextOrder = undefined;
+      this._debugCancelEffectiveNowOnNextOrder = false;
+      appliedActions = orderActions.map((a) => {
+        if (a.type === "UpdateProduct" && wrongQuantity !== undefined) return { ...a, quantity: wrongQuantity };
+        if (a.type === "AddProduct" && wrongRatePlan !== undefined) return { ...a, productRatePlanId: wrongRatePlan };
+        if (a.type === "CancelSubscription" && cancelNow) return { ...a, effectiveDate: this.now.toISOString().slice(0, 10) };
+        return a;
+      });
+    }
+
+    for (const action of appliedActions) {
       this.applyAction(sub, action);
     }
     sub.version += 1;
 
-    return { subscription: structuredClone(sub), result };
+    // v0.6.2 (PR-5): persist the order as an identifiable,
+    // independently readable artifact BEFORE returning — the
+    // mutation's own record of what it dispatched and what it
+    // computed at execution. Post-commit verification binds to THIS
+    // record by id, never to a latest-order pointer and never to a
+    // pre-execution preview.
+    const order: ZuoraOrder = {
+      id: `ord_${crypto.randomBytes(8).toString("hex")}`,
+      subscriptionId,
+      orderActions: structuredClone(orderActions),
+      invoiceItems: structuredClone(result.invoiceItems),
+      netImmediate: result.netImmediate,
+      resultingRecurringAmount: result.resultingRecurringAmount,
+      resultingCadence: result.resultingCadence,
+      subscriptionVersionAfter: sub.version,
+      createdAt: this.now.toISOString(),
+    };
+    if (this._debugOmitOrderFinancials) {
+      // Fault injection: the order persists WITHOUT its financial
+      // evidence — readers find the artifact but no actuals in it.
+      const shaped = order as unknown as Record<string, unknown>;
+      delete shaped.invoiceItems;
+      delete shaped.netImmediate;
+      delete shaped.resultingRecurringAmount;
+    }
+    this.orders.set(order.id, order);
+    this.hasLandedOrder = true;
+
+    if (this._debugLoseNextOrderResponse) {
+      // Fault injection: everything above HAS landed (state
+      // applied, version bumped, order persisted) — only the
+      // response never reaches the caller.
+      this._debugLoseNextOrderResponse = false;
+      throw new ZuoraSimError(
+        "ApiConnectionError",
+        "Simulated lost response: the order was applied and persisted but its response never reached the caller (fault injection)"
+      );
+    }
+
+    return { subscription: structuredClone(sub), result, orderId: order.id };
   }
 
   private applyAction(sub: ZuoraSubscription, action: OrderAction): void {
@@ -350,7 +539,6 @@ export class ZuoraSim {
 
   private computeOrderEffect(sub: ZuoraSubscription, orderActions: OrderAction[]): OrderPreviewResult {
     const invoiceItems: OrderPreviewInvoiceItem[] = [];
-    let resultingRecurring = 0;
     let resultingCadence: "MONTHLY" | "ANNUAL" = "MONTHLY";
     let termConsequenceKnown = true;
     let resultingTerm: OrderPreviewResult["resultingTerm"] | undefined;
@@ -366,20 +554,35 @@ export class ZuoraSim {
     // per-period value, scaled by the fraction of the current charge
     // period remaining as of the order's stated effectiveDate — which is
     // deterministic given the same inputs, unlike Stripe/Paddle.
-    const priorRecurring = sub.ratePlans.reduce(
-      (sum, p) => sum + p.ratePlanCharges.reduce((s, c) => s + c.unitAmount * c.quantity, 0),
-      0
-    );
+    //
+    // v0.6.2 (PR-5): the computation now walks the action sequence IN
+    // ORDER against an evolving WORKING COPY of the subscription,
+    // applying each action to the working copy as it is priced. The
+    // pre-migration computation priced EVERY action against the
+    // ORIGINAL subscription and then took the LAST action's recurring
+    // figure — so two UpdateProduct actions on the same charge
+    // double-counted the first delta, and two updates on different
+    // charges produced a recurring total reflecting only the second.
+    // An order is an ordered sequence; its preview must price it as
+    // one. (Single-action orders price identically to before — the
+    // working copy starts from the same state.)
+    const working = structuredClone(sub);
+    const totalRecurringOf = (s: ZuoraSubscription): number =>
+      s.ratePlans.reduce((sum, p) => sum + p.ratePlanCharges.reduce((acc, c) => acc + c.unitAmount * c.quantity, 0), 0);
 
     let sawTermsAndConditions = false;
     let sawPlanSwapWithoutTerms = false;
     let sawCancel = false;
     let cancelDuringCommittedTerm = false;
+    // Charges of the plan most recently removed in THIS sequence —
+    // the old side of the plan swap an immediately following
+    // AddProduct completes (the adapter emits Remove+Add adjacently).
+    let lastRemovedCharges: ZuoraRatePlanCharge[] | undefined;
 
     for (const action of orderActions) {
       switch (action.type) {
         case "UpdateProduct": {
-          const plan = sub.ratePlans.find((p) => p.id === action.ratePlanId);
+          const plan = working.ratePlans.find((p) => p.id === action.ratePlanId);
           const charge = plan?.ratePlanCharges.find((c) => c.id === action.productRatePlanChargeId);
           if (!plan || !charge) throw new ZuoraSimError("InvalidOrderAction", "RatePlan/charge not found for UpdateProduct preview");
           const newQuantity = action.quantity ?? charge.quantity;
@@ -394,15 +597,45 @@ export class ZuoraSim {
             });
           }
           resultingCadence = charge.billingPeriod === "Annual" ? "ANNUAL" : "MONTHLY";
+          this.applyAction(working, action);
           break;
         }
-        case "RemoveProduct":
-        case "AddProduct": {
+        case "RemoveProduct": {
           // Plan-swap style action (our CHANGE_PLAN / CHANGE_CADENCE map to
           // Remove+Add pairs). termConsequenceKnown becomes false below
           // UNLESS a TermsAndConditions action is also present in the same
           // order — modeling the genuine gap described in the file header.
           sawPlanSwapWithoutTerms = true;
+          const removed = working.ratePlans.find((p) => p.id === action.ratePlanId);
+          lastRemovedCharges = removed ? structuredClone(removed.ratePlanCharges) : undefined;
+          this.applyAction(working, action);
+          break;
+        }
+        case "AddProduct": {
+          sawPlanSwapWithoutTerms = true;
+          const catalogEntry = action.productRatePlanId ? CATALOG[action.productRatePlanId] : undefined;
+          if (!catalogEntry) throw new ZuoraSimError("InvalidOrderAction", `Unknown productRatePlanId ${action.productRatePlanId}`);
+          const qty = action.quantity ?? 1;
+          resultingCadence = catalogEntry.billingPeriod === "Annual" ? "ANNUAL" : "MONTHLY";
+          if (catalogEntry.billingPeriod === "Annual") {
+            // Mid-period cadence-changing swap: charge/credit the prorated
+            // difference for the remainder of the CURRENT period, using the
+            // order's stated effectiveDate as the pivot (deterministic, not
+            // wall-clock-dependent). The old side is the plan this
+            // sequence just removed — valued as it stood AT REMOVAL
+            // (after any earlier in-sequence update to it).
+            const effectiveDate = new Date(action.effectiveDate);
+            const oldCharge = lastRemovedCharges?.[0];
+            if (oldCharge) {
+              const fractionRemaining = this.fractionOfPeriodRemaining(effectiveDate, oldCharge.billingPeriod);
+              const oldRemainingValue = Math.round(oldCharge.unitAmount * oldCharge.quantity * fractionRemaining);
+              invoiceItems.push({ description: "Unused monthly plan credit", amount: -oldRemainingValue, serviceStartDate: action.effectiveDate });
+              const newRemainingValue = Math.round((catalogEntry.unitAmount / 12) * qty * fractionRemaining * 12 * (1 / 12));
+              // Simplified: charge a proportional slice of the new annual amount for the remaining days of the current monthly period.
+              invoiceItems.push({ description: "Prorated annual plan charge", amount: newRemainingValue, serviceStartDate: action.effectiveDate });
+            }
+          }
+          this.applyAction(working, action);
           break;
         }
         case "TermsAndConditions": {
@@ -410,62 +643,28 @@ export class ZuoraSim {
           resultingTerm = {
             createsOrExtendsCommitment: !!(action.newTerm?.initialTerm || action.newTerm?.renewalTerm),
             commitmentUntil: action.newTerm?.termEndDate,
-            autoRenew: action.newTerm?.autoRenew ?? sub.term.autoRenew,
+            autoRenew: action.newTerm?.autoRenew ?? working.term.autoRenew,
           };
+          this.applyAction(working, action);
           break;
         }
         case "CancelSubscription": {
           sawCancel = true;
           const effectiveDate = new Date(action.effectiveDate);
-          const termEnd = new Date(sub.term.termEndDate);
-          cancelDuringCommittedTerm = !sub.term.autoRenew ? effectiveDate < termEnd : false;
+          const termEnd = new Date(working.term.termEndDate);
+          cancelDuringCommittedTerm = !working.term.autoRenew ? effectiveDate < termEnd : false;
+          this.applyAction(working, action);
           break;
         }
       }
     }
 
-    // Recompute resulting recurring total from ratePlans as they'd stand
-    // after applying quantity/plan changes (deterministic, no "now" dependency
-    // beyond what's already folded into fractionRemaining above).
-    for (const action of orderActions) {
-      if (action.type === "UpdateProduct" && action.quantity !== undefined) {
-        const plan = sub.ratePlans.find((p) => p.id === action.ratePlanId)!;
-        const charge = plan.ratePlanCharges.find((c) => c.id === action.productRatePlanChargeId)!;
-        resultingRecurring = priorRecurring - charge.unitAmount * charge.quantity + charge.unitAmount * action.quantity;
-      }
-    }
-    if (orderActions.some((a) => a.type === "AddProduct")) {
-      const addAction = orderActions.find((a) => a.type === "AddProduct")!;
-      const catalogEntry = CATALOG[addAction.productRatePlanId!];
-      const removedTotal = orderActions
-        .filter((a) => a.type === "RemoveProduct")
-        .reduce((sum, a) => {
-          const plan = sub.ratePlans.find((p) => p.id === a.ratePlanId);
-          return sum + (plan ? plan.ratePlanCharges.reduce((s, c) => s + c.unitAmount * c.quantity, 0) : 0);
-        }, 0);
-      const qty = addAction.quantity ?? 1;
-      resultingRecurring = priorRecurring - removedTotal + catalogEntry.unitAmount * qty;
-      resultingCadence = catalogEntry.billingPeriod === "Annual" ? "ANNUAL" : "MONTHLY";
-
-      if (catalogEntry.billingPeriod === "Annual") {
-        // Mid-period cadence-changing swap: charge/credit the prorated
-        // difference for the remainder of the CURRENT period, using the
-        // order's stated effectiveDate as the pivot (deterministic, not
-        // wall-clock-dependent).
-        const effectiveDate = new Date(addAction.effectiveDate);
-        const oldPlan = sub.ratePlans.find((p) => orderActions.some((a) => a.type === "RemoveProduct" && a.ratePlanId === p.id));
-        const oldCharge = oldPlan?.ratePlanCharges[0];
-        if (oldCharge) {
-          const fractionRemaining = this.fractionOfPeriodRemaining(effectiveDate, oldCharge.billingPeriod);
-          const oldRemainingValue = Math.round(oldCharge.unitAmount * oldCharge.quantity * fractionRemaining);
-          invoiceItems.push({ description: "Unused monthly plan credit", amount: -oldRemainingValue, serviceStartDate: addAction.effectiveDate });
-          const newRemainingValue = Math.round((catalogEntry.unitAmount / 12) * qty * fractionRemaining * 12 * (1 / 12));
-          // Simplified: charge a proportional slice of the new annual amount for the remaining days of the current monthly period.
-          invoiceItems.push({ description: "Prorated annual plan charge", amount: newRemainingValue, serviceStartDate: addAction.effectiveDate });
-        }
-      }
-    }
-    if (orderActions.length === 0) resultingRecurring = priorRecurring;
+    // The resulting recurring total is the WORKING state's total after
+    // the full sequence — every action's contribution exactly once.
+    // A cancellation anywhere in the sequence ends the subscription,
+    // so the post-sequence price level (once the cancellation is
+    // effective) is zero regardless of any accompanying changes.
+    const resultingRecurring = sawCancel ? 0 : totalRecurringOf(working);
 
     termConsequenceKnown = !sawPlanSwapWithoutTerms || sawTermsAndConditions;
     if (sawTermsAndConditions && !resultingTerm) {
