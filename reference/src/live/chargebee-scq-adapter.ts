@@ -129,6 +129,14 @@
 //       lost-response commits no longer yield receipts in this
 //       adapter (state landing is verified and reported in the
 //       error). Live commit remains disabled throughout.
+//       [PR-7 SUPERSESSION, 2026-10-29: the v0.6.2 receipt type
+//       (PR #8) DOES represent "committed but unverified" —
+//       COMMITTED_UNVERIFIED + the UNVERIFIED reconciliation
+//       variant — so this fail-closed-as-INDETERMINATE posture is
+//       replaced by the outcome taxonomy in the PR-7 block below.
+//       The "never feed reconciliation an unmeasured figure" rule
+//       is unchanged: unverified receipts carry UNKNOWN dimensions,
+//       never figures reconciliation could read as measured.]
 //     * PR #4 FINAL REVIEW FIXES (2026-10-28, mocked — no live
 //       calls): (c) an ABSENT post-commit subscription_items member
 //       (or an explicitly empty collection, or an incomplete item
@@ -145,6 +153,81 @@
 //       applies the requested item change therefore yields an
 //       indeterminate refusal and no receipt, even when the
 //       financial figures would satisfy the envelope.
+//   - PR-7 MIGRATION TO v0.6.2 SEMANTICS (2026-10-29, mocked
+//     transports only — no live calls; see
+//     research/chargebee-live-v062-migration.md):
+//     * Every effect this adapter produces now carries the v0.6.2
+//       determinacy record (DETERMINED / UNKNOWN per financial
+//       dimension) and field-level provenance. NOT_APPLICABLE is
+//       never asserted: the applicability table licenses it only
+//       for CANCEL's immediate dimension, and this adapter does not
+//       implement CANCEL. A determined zero is emitted present
+//       ({ net: 0 } / resultingAmount 0) — including on committed
+//       effects, where the pre-migration code dropped a zero net
+//       from the effect entirely.
+//     * Snapshots price recurring STRICTLY from provider-stated
+//       item amounts and label the result (CORE-7
+//       recurringAmountState). The pre-migration fallback
+//       (unit_price × quantity, absent collection ⇒ 0) fabricated
+//       figures — for a flat_fee item it was also arithmetically
+//       wrong — and is removed: an absent items member, or any
+//       item without a stated amount, yields NO recurringAmount
+//       and state UNKNOWN.
+//     * Commit outcomes use the v0.6.2 taxonomy (CORE-5):
+//       COMMITTED_AND_VERIFIED (receipt status COMMITTED;
+//       reconciliation OK, or VIOLATED where independently
+//       attributable evidence contradicts the quote — Decision
+//       D3), COMMITTED_UNVERIFIED (typed receipt, UNKNOWN
+//       dimensions honestly labeled — this closes protocol
+//       Defect 3), INDETERMINATE (no receipt; the outcome is
+//       recorded in the store and any later commit attempt on the
+//       quote is refused before any read or mutation — no blind
+//       retry), CONFIRMED_NON_EXECUTION (pre-effect rejections:
+//       the provider refused the dispatched request before
+//       applying anything). HTTP 200 alone never verifies: the
+//       intended item set must be established by an independent
+//       post-commit re-read, the financial actuals must be
+//       established (immediate from the mutating call's own
+//       response; recurring from the re-read items' stated
+//       amounts), and attribution must close (below).
+//     * ATTRIBUTION (PR #14 doctrine Z1–Z3, adapted to the real
+//       API's surfaces): the mutating call's response is bound to
+//       this commit by the HTTP exchange itself and by the
+//       deterministic native idempotency key (same key + different
+//       parameters is a provider 422; a replayed response IS the
+//       original operation's response). The response's subscription
+//       fingerprint must equal the independent re-read's
+//       fingerprint — the bracket — for the observed state to be
+//       attributed to this commit alone. A broken bracket (an
+//       intervening write between the mutating call and the
+//       re-read, detectable because resource_version moves on
+//       every write) caps the outcome at COMMITTED_UNVERIFIED and,
+//       per Z3, records NO recurring figure for this commit: the
+//       observed level is third-party-influenced and survives only
+//       as unattributed context (the resulting snapshot and the
+//       reconciliation reason). The response's own immediate actual
+//       survives a broken bracket — its scope is this operation,
+//       exactly as PR #15's bound-artifact immediate did. The
+//       bracket is fingerprint equality (resource_version when the
+//       payloads carry it), i.e. DETECTION within resource_version's
+//       millisecond resolution — it is NOT a provider-enforced
+//       compare-and-swap, NOT a durable operation identity, and it
+//       cannot see a write that lands between this commit's
+//       validation read and the mutating call (that window is
+//       mitigated, as before, by the pre-mutation envelope gate and
+//       post-commit reconciliation reporting — see test13 T08/T09).
+//       Chargebee offers NO operation-level financial read-back (no
+//       unbilled-charge retrieval in this adapter's validated
+//       surface), so a lost response's immediate actual is
+//       UNRECOVERABLE from provider data: landing can be established
+//       from the re-read state, the financials cannot — the outcome
+//       is COMMITTED_UNVERIFIED with both dimensions UNKNOWN when
+//       the intended set is observed in effect, INDETERMINATE when
+//       it is not.
+//     * Live commit remains DISABLED by default throughout; the
+//       commit path is exercised only against injected mocked
+//       transports. No real-network mutation is dispatched by any
+//       test or by the pilot harness.
 //   - SCHEDULED CHANGES / MANDATORY ADDONS (Phase 2A recovery audit):
 //     a forward update_for_items call can delete or override a
 //     subscription's pre-existing scheduled changes (documented
@@ -161,8 +244,12 @@ import crypto from "node:crypto";
 import {
   SCQError,
   type CommercialEffect,
+  type CommittedFigureSource,
+  type DimensionState,
   type GuaranteeCoverage,
+  type MutationOutcome,
   type ProviderCapabilities,
+  type ReconciliationResult,
   type SubscriptionChangeProposal,
   type SubscriptionChangeQuote,
   type SubscriptionChangeReceipt,
@@ -171,6 +258,7 @@ import {
 } from "../core/types.js";
 import {
   checkIdempotentReplay,
+  determinacyOf,
   enforceEffectiveIntent,
   enforceGuaranteeRequest,
   reconcileCommittedEffect,
@@ -219,9 +307,40 @@ function fingerprintOf(sub: CbSubscription): string {
   return "hash:" + crypto.createHash("sha256").update(material).digest("hex").slice(0, 16);
 }
 
+/**
+ * The strict recurring level of a provider item list: the sum of the
+ * items' provider-STATED amounts, or undefined when the level cannot
+ * be established — the collection member is absent, or any entry is
+ * incomplete (missing item_price_id, quantity, or a stated amount).
+ * An explicitly EMPTY collection is a provider-stated zero level
+ * (the complete list, with nothing on it). Nothing is ever
+ * reconstructed as unit_price × quantity: that multiplication is
+ * unjustified in general and arithmetically wrong for flat_fee.
+ * Shared by snapshot construction and committed-effect establishment.
+ */
+function strictRecurringFromItems(
+  rawItems: CbSubscription["subscription_items"],
+): { amount: number } | { undetermined: string } {
+  if (!Array.isArray(rawItems)) {
+    return { undetermined: "the payload carries no subscription_items member — an absent collection is undetermined, never a verified zero" };
+  }
+  if (rawItems.length === 0) return { amount: 0 };
+  if (!rawItems.every((i) => typeof i.item_price_id === "string" && typeof i.quantity === "number" && typeof i.amount === "number")) {
+    return { undetermined: "a subscription item is incomplete — missing item_price_id, quantity, or a stated amount" };
+  }
+  return { amount: rawItems.reduce((s, i) => s + (i.amount as number), 0) };
+}
+
 function snapshotFrom(sub: CbSubscription): SubscriptionSnapshot {
   const items = sub.subscription_items ?? [];
-  const recurring = items.reduce((s, i) => s + (i.amount ?? (i.unit_price ?? 0) * i.quantity), 0);
+  // v0.6.2 (PR-7, CORE-7): the snapshot's recurring figure is priced
+  // STRICTLY from provider-stated amounts and labeled with its
+  // determinacy. Pre-migration this summed `amount ?? unit_price ×
+  // quantity` and read an absent collection as 0 — a fabricated
+  // figure (and, for flat_fee, a wrong one). Now an unestablishable
+  // level is OMITTED and labeled UNKNOWN instead.
+  const strict = strictRecurringFromItems(sub.subscription_items);
+  const recurringAmount = "amount" in strict ? strict.amount : undefined;
   return {
     id: sub.id,
     version: fingerprintOf(sub),
@@ -232,7 +351,8 @@ function snapshotFrom(sub: CbSubscription): SubscriptionSnapshot {
     items: items.map((i) => ({ id: i.item_price_id, offeringRef: i.item_price_id, quantity: i.quantity })),
     billing: {
       currency: sub.currency_code ?? "USD",
-      recurringAmount: recurring,
+      ...(recurringAmount !== undefined ? { recurringAmount } : {}),
+      recurringAmountState: (recurringAmount !== undefined ? "DETERMINED" : "UNKNOWN") as DimensionState,
       cadence: "MONTHLY",
       nextBillingAt: sub.next_billing_at ? new Date(sub.next_billing_at * 1000).toISOString() : undefined,
     },
@@ -549,6 +669,86 @@ export function interpretChargebeeEstimate(
   return { effect, provenance, nextInvoice };
 }
 
+/**
+ * v0.6.2 (PR-7): attaches the three-state determinacy record and the
+ * field-level provenance to an interpreted estimate effect. A
+ * dimension is DETERMINED exactly when the interpretation
+ * established a finite figure for it (a present zero included);
+ * otherwise UNKNOWN. This adapter asserts NOT_APPLICABLE for no
+ * dimension: the v0.6.2 applicability table licenses it only for
+ * CANCEL's immediate dimension, and CANCEL is not implemented here.
+ * `committedSource` is set only for commit-side roles (the
+ * revalidated gate effect); quote-side effects assert none.
+ */
+function withDeterminacy(
+  interpreted: InterpretedEstimate,
+  opts: { committedSource?: CommittedFigureSource } = {},
+): CommercialEffect {
+  const effect = interpreted.effect;
+  const immediateDetermined = typeof effect.immediate?.net === "number" && Number.isFinite(effect.immediate.net);
+  const recurringDetermined = typeof effect.recurring?.resultingAmount === "number" && Number.isFinite(effect.recurring.resultingAmount);
+  effect.determinacy = {
+    immediateFinancialEffect: immediateDetermined ? "DETERMINED" : "UNKNOWN",
+    recurringFinancialEffect: recurringDetermined ? "DETERMINED" : "UNKNOWN",
+  };
+  effect.provenance = {
+    immediate: interpreted.provenance.immediate,
+    recurring: interpreted.provenance.recurring,
+    ...(opts.committedSource !== undefined ? { committedSource: opts.committedSource } : {}),
+  };
+  return effect;
+}
+
+/**
+ * v0.6.2 (PR-7, M2 pattern): the fail-closed determinacy gate for
+ * commits. The frozen v0.6.1 acceptance envelope coerces absent
+ * figures to 0, so an effect whose bounded dimensions are not
+ * DETERMINED must never reach the envelope — and never reach the
+ * mutating call. (This replaces the pre-migration presence checks,
+ * which encoded the same rule without the determinacy record.)
+ */
+function assertEffectDeterminateForCommit(effect: CommercialEffect, role: "quoted" | "revalidated"): void {
+  const states = determinacyOf(effect);
+  const unknown = (Object.entries(states) as Array<[string, DimensionState]>).filter(([, s]) => s === "UNKNOWN").map(([d]) => d);
+  if (unknown.length > 0) {
+    throw new SCQError(
+      "QUOTE_NOT_DETERMINISTIC",
+      `The ${role} effect does not determine every financial dimension the acceptance envelope bounds ` +
+        `(UNKNOWN: ${unknown.join(", ")}), so the envelope cannot be enforced. No mutation was performed.`,
+      { blocked: "ENVELOPE_UNENFORCEABLE_ON_UNKNOWN_DETERMINACY", role, determinacy: states, provenance: effect.provenance },
+    );
+  }
+}
+
+/**
+ * The mutating call's OWN actual immediate figure, from its response
+ * only: the invoice total when the response carries an invoice,
+ * else the sum of its unbilled_charges member when that member is
+ * present and complete (a present member states its total, including
+ * a genuine 0). Absent or incomplete => undefined (UNDETERMINED).
+ * This response is provider data returned BY the mutating call for
+ * THIS operation — never the pre-mutation estimate.
+ */
+function committedImmediateFromResponse(updateJson: any): { net: number; source: string } | { undetermined: string } {
+  const invoiceTotal = updateJson?.invoice?.total;
+  if (typeof invoiceTotal === "number" && Number.isFinite(invoiceTotal)) {
+    return { net: invoiceTotal, source: "the mutating call's response invoice.total (provider actual for this operation)" };
+  }
+  const unbilledMember = updateJson?.unbilled_charges as Array<{ amount?: number }> | undefined;
+  if (Array.isArray(unbilledMember)) {
+    if (unbilledMember.every((u) => typeof u.amount === "number" && Number.isFinite(u.amount))) {
+      return { net: unbilledMember.reduce((s, u) => s + (u.amount as number), 0), source: "the mutating call's response unbilled_charges (provider actual for this operation)" };
+    }
+    return { undetermined: "immediate (the update response's unbilled_charges member is incomplete — an element lacks a numeric amount)" };
+  }
+  return { undetermined: "immediate (the update response carried neither an invoice total nor an unbilled_charges member)" };
+}
+
+/** Shapes a determined immediate net into the CommercialEffect form, preserving a determined zero as present. */
+function immediateEffect(net: number): { charge?: number; credit?: number; net: number } {
+  return { charge: net > 0 ? net : undefined, credit: net < 0 ? -net : undefined, net };
+}
+
 export type ChargebeeLiveAdapterOptions = {
   /** Default false. When false, commitChangeQuote refuses before any mutating call. */
   liveCommitEnabled?: boolean;
@@ -697,20 +897,26 @@ export class ChargebeeLiveAdapter implements SubscriptionProvider {
 
     const currency = sub.currency_code ?? "USD";
     const interpreted = interpretChargebeeEstimate(estimate, { currency, currentItems: this.itemStatesOf(sub), targetItems, priceInfo });
-    const commercialEffect = interpreted.effect;
+    // v0.6.2 (PR-7): the quoted effect carries the three-state
+    // determinacy record and field-level provenance (CORE-1/CORE-2).
+    const commercialEffect = withDeterminacy(interpreted);
     commercialEffect.effectiveAt = this.now().toISOString();
     // FAIL CLOSED: the REVALIDATE acceptance envelope (mandatory for
     // these actions) is enforced by comparing immediate.net and
     // recurring.resultingAmount. A dimension the provider data cannot
-    // determine would be compared as absent — and the frozen core
-    // engine treats absent as 0 — so an undetermined dimension makes
-    // the envelope unenforceable. Refuse rather than quote it.
-    if (!commercialEffect.immediate || !commercialEffect.recurring) {
-      const missing = [
-        ...(!commercialEffect.immediate ? [`immediate (${interpreted.provenance.immediate})`] : []),
-        ...(!commercialEffect.recurring ? [`recurring (${interpreted.provenance.recurring})`] : []),
-      ];
-      throw new SCQError("QUOTE_NOT_DETERMINISTIC", `The provider's estimate does not determine the ${missing.join(" and ")} financial dimension(s) from any authoritative field or justified computation, so the acceptance envelope cannot be enforced for this proposal. Refusing to quote an invented number.`, { provenance: interpreted.provenance, nextInvoicePresent: interpreted.nextInvoice !== undefined });
+    // determine reads UNKNOWN under the determinacy record — and the
+    // frozen core engine treats an absent figure as 0 — so an
+    // UNKNOWN dimension makes the envelope unenforceable. Refuse
+    // rather than quote it.
+    {
+      const states = determinacyOf(commercialEffect);
+      if (states.immediateFinancialEffect === "UNKNOWN" || states.recurringFinancialEffect === "UNKNOWN") {
+        const missing = [
+          ...(states.immediateFinancialEffect === "UNKNOWN" ? [`immediate (${interpreted.provenance.immediate})`] : []),
+          ...(states.recurringFinancialEffect === "UNKNOWN" ? [`recurring (${interpreted.provenance.recurring})`] : []),
+        ];
+        throw new SCQError("QUOTE_NOT_DETERMINISTIC", `The provider's estimate does not determine the ${missing.join(" and ")} financial dimension(s) from any authoritative field or justified computation, so the acceptance envelope cannot be enforced for this proposal. Refusing to quote an invented number.`, { provenance: interpreted.provenance, determinacy: states, nextInvoicePresent: interpreted.nextInvoice !== undefined });
+      }
     }
 
     const quoteId = `scq_cblive_${crypto.randomBytes(8).toString("hex")}`;
@@ -772,10 +978,30 @@ export class ChargebeeLiveAdapter implements SubscriptionProvider {
     const stored0 = this.store.get(quoteId);
     if (!stored0) throw new SCQError("QUOTE_STALE", `No quote found for id ${quoteId}; if the process restarted, the in-memory quote store lost this quote and exactly-once cannot be proven — refusing rather than re-mutating blindly.`);
 
+    // v0.6.2 (PR-7, CORE-8): a prior attempt on this quote whose
+    // outcome was INDETERMINATE (the mutation was dispatched but its
+    // landing was not established) must never be blindly retried: the
+    // operation may already have landed, and a second dispatch would
+    // double-apply it. Refuse here, before any state read or
+    // mutation. (Pre-migration, a retry was stopped only incidentally
+    // — by staleness when the change had in fact landed; a lost
+    // dispatch that never landed left the quote valid and a retry
+    // would have re-mutated.)
+    if (stored0.commit_outcome?.outcome === "INDETERMINATE") {
+      throw new SCQError(
+        "PROVIDER_ERROR",
+        `Commit outcome for quote ${quoteId} is INDETERMINATE: a previous commit attempt's mutation was ` +
+          `dispatched but its landing was not established. No second mutation was issued. Reconcile the ` +
+          `provider state manually before any retry.`,
+        { outcome: "INDETERMINATE", indeterminate: true, reconciled: false },
+      );
+    }
+
     const input = stored0.provider_preview_input as LivePreviewInput;
     const current = await this.readSubscription(stored0.subscription_id);
     const validated = validateCommit(this.store, quoteId, fingerprintOf(current), this.now);
     const proposal = validated.proposal;
+    const preDispatchFingerprint = fingerprintOf(current);
 
     // Final pre-mutation preview (REVALIDATE): envelope is enforced
     // against THIS preview, before mutation (spec §4.2 clarification 1).
@@ -787,15 +1013,17 @@ export class ChargebeeLiveAdapter implements SubscriptionProvider {
     if (!freshEstimate) throw new SCQError("PROVIDER_ERROR", "Chargebee revalidation estimate returned no estimate object");
     const currency = current.currency_code ?? "USD";
     const priceInfo = await this.fetchPriceInfo(input.items.map((i) => i.itemPriceId));
-    const revalidated = interpretChargebeeEstimate(freshEstimate, { currency, currentItems: this.itemStatesOf(current), targetItems: input.items, priceInfo }).effect;
+    const revalidated = withDeterminacy(
+      interpretChargebeeEstimate(freshEstimate, { currency, currentItems: this.itemStatesOf(current), targetItems: input.items, priceInfo }),
+      { committedSource: "revalidated_preview" },
+    );
     revalidated.effectiveAt = validated.quoted_effect.effectiveAt;
-    // FAIL CLOSED (Phase 3): never feed an effect with an absent
-    // bounded dimension into checkAcceptanceEnvelope — the frozen core
-    // engine compares absent dimensions as 0, which would silently
-    // "enforce" the envelope against an invented zero.
-    if (!revalidated.immediate || !revalidated.recurring || !validated.quoted_effect.immediate || !validated.quoted_effect.recurring) {
-      throw new SCQError("QUOTE_NOT_DETERMINISTIC", "The pre-commit revalidation estimate does not determine every financial dimension the acceptance envelope bounds, so the envelope cannot be enforced. No mutation was performed.", { blocked: "ENVELOPE_UNENFORCEABLE_ON_REVALIDATION" });
-    }
+    // FAIL CLOSED (Phase 3 rule, v0.6.2 form): never feed an effect
+    // with an UNKNOWN bounded dimension into checkAcceptanceEnvelope —
+    // the frozen core engine compares absent dimensions as 0, which
+    // would silently "enforce" the envelope against an invented zero.
+    assertEffectDeterminateForCommit(validated.quoted_effect, "quoted");
+    assertEffectDeterminateForCommit(revalidated, "revalidated");
     const violation = checkAcceptanceEnvelope(validated.quoted_effect, revalidated, proposal.acceptanceEnvelope!);
     if (violation) {
       throw new SCQError("QUOTE_DRIFTED", `Recomputed commercial effect fell outside the caller's acceptance envelope: ${violation}. No mutation was performed.`, { quoted: validated.quoted_effect, revalidated, envelope: proposal.acceptanceEnvelope });
@@ -806,139 +1034,543 @@ export class ChargebeeLiveAdapter implements SubscriptionProvider {
     }
 
     let updateJson: any;
+    let idempotencyReplayed = false;
     try {
-      const { json } = await this.client.updateForItems(validated.subscription_id, this.updateParams(input.items), input.idempotencyKey);
-      updateJson = json;
+      const res = await this.client.updateForItems(validated.subscription_id, this.updateParams(input.items), input.idempotencyKey);
+      updateJson = res.json;
+      idempotencyReplayed = res.idempotencyReplayed;
     } catch (e) {
-      if (e instanceof ChargebeeHttpError && e.indeterminate) {
-        // Lost-response path: DO NOT re-issue the mutation. Re-read
-        // provider state to establish whether the intended item set
-        // landed — but do NOT convert that into a receipt. Without the
-        // update response, the ACTUAL immediate financial outcome is
-        // unverifiable (a subscription re-read carries no unbilled-
-        // charge actuals), and the pre-mutation estimate may never be
-        // substituted for it (PR #4 review fix). The frozen receipt
-        // type has no "committed but financially unverified" state,
-        // so the only honest outcome is an indeterminate refusal:
-        // no receipt is recorded. (Limitation recorded in the
-        // protocol-defect proposal addendum; live commit remains
-        // disabled regardless.)
-        const after = await this.readSubscription(validated.subscription_id);
-        const landed = itemSetMismatches(after.subscription_items ?? [], input.items).length === 0;
-        if (!landed) {
-          throw new SCQError("PROVIDER_ERROR", "Commit outcome is INDETERMINATE: the mutating request's response was lost and provider state does not show the intended change. No second mutation was issued. Reconcile manually before any retry.", { indeterminate: true, reconciled: false });
-        }
-        const { undetermined } = this.committedEffectFromState(validated.quoted_effect, after);
-        throw new SCQError("PROVIDER_ERROR", `Commit outcome is INDETERMINATE: the mutating request's response was lost. Provider state shows the intended item set DID land (exactly one mutating call was made; no second mutation was issued), but the ACTUAL financial outcome cannot be verified from provider data (${undetermined.join("; ")}), and the pre-mutation estimate is never substituted for an actual. No receipt was recorded. Reconcile manually from provider records before any retry.`, { indeterminate: true, reconciled: false, undeterminedDimensions: undetermined, intendedItemsLanded: true });
+      if (
+        e instanceof ChargebeeHttpError &&
+        (e.indeterminate || e.httpStatus === 409 || (typeof e.httpStatus === "number" && e.httpStatus >= 500))
+      ) {
+        // Unknown-dispatch path: the request may have been processed
+        // (transport failure after dispatch; a 409 while the original
+        // operation is in flight under the same idempotency key; a
+        // 5xx, which Chargebee caches under the key without
+        // establishing whether the change applied). DO NOT re-issue
+        // the mutation. Reconcile from an independent state re-read:
+        // landing established + financials unverifiable is a
+        // COMMITTED_UNVERIFIED receipt (v0.6.2 — protocol Defect 3
+        // closed); landing not established is INDETERMINATE.
+        return this.reconcileAfterUnknownDispatch(validated, input, preDispatchFingerprint, e);
+      }
+      if (e instanceof ChargebeeHttpError && typeof e.httpStatus === "number" && e.httpStatus >= 400 && e.httpStatus < 500) {
+        // Pre-effect rejection (CORE-5): the provider refused the
+        // dispatched request BEFORE applying anything (validation
+        // errors; a 422 idempotency conflict, where THIS dispatch was
+        // refused because the key already names a different request).
+        // Non-execution of this dispatch is demonstrable from the
+        // provider's own refusal semantics — record it distinctly
+        // from the indeterminate class; it carries the opposite retry
+        // rule (a fresh attempt may be made; nothing landed).
+        this.store.recordCommitOutcome(quoteId, {
+          outcome: "CONFIRMED_NON_EXECUTION",
+          at: this.now().toISOString(),
+          details: { httpStatus: e.httpStatus, apiErrorCode: e.apiErrorCode, reason: "the mutating request was rejected by the provider before effect" },
+        });
+        const mapped = this.toSCQ(e, validated.subscription_id);
+        throw new SCQError(mapped.code, mapped.message, { outcome: "CONFIRMED_NON_EXECUTION", httpStatus: e.httpStatus, apiErrorCode: e.apiErrorCode });
       }
       throw this.toSCQ(e, validated.subscription_id);
     }
-
-    // Post-commit reconciliation (§6.11): committedEffect is derived
-    // ONLY from actuals — the invoice/unbilled figures the mutating
-    // call itself returned, plus the re-read post-commit state — never
-    // from the pre-mutation preview — so a concurrent write landing in
-    // the TOCTOU window is reported as VIOLATED, never silently
-    // absorbed. If any actual financial dimension is UNDETERMINED
-    // (incomplete update response, post-commit items without stated
-    // amounts), the commit fails closed as INDETERMINATE instead of
-    // recording a receipt whose reconciliation could read OK against
-    // unverified numbers.
-    const after = await this.readSubscription(validated.subscription_id);
-    // Fix B (PR #4 final review): verify the ACTUAL post-commit item
-    // set establishes the intended mutation BEFORE any receipt. A
-    // provider can return HTTP 200 while silently ignoring or
-    // partially applying the requested item change, and the financial
-    // figures cannot detect that on their own (figures computed on
-    // the WRONG item set can still satisfy the envelope). The re-read
-    // item IDs and quantities are therefore compared against the
-    // quote's intended target set; any missing, extra, duplicated,
-    // or quantity-mismatched item makes the outcome INDETERMINATE
-    // with no COMMITTED receipt, even if the envelope would pass.
-    const itemMismatches = itemSetMismatches(after.subscription_items ?? [], input.items);
-    if (itemMismatches.length > 0) {
-      throw new SCQError("PROVIDER_ERROR", `Commit outcome is INDETERMINATE: the mutating call returned success, but the re-read provider state does NOT establish the intended item set (${itemMismatches.join("; ")}). No COMMITTED receipt was recorded — a change that was silently ignored or partially applied must not be reported as a verified commit even if the financial figures would pass. Reconcile manually from provider state before any retry.`, { indeterminate: true, reconciled: false, itemSetMismatches: itemMismatches });
-    }
-    const { effect: committedEffect, undetermined } = this.committedEffectFromState(validated.quoted_effect, after, updateJson);
-    if (undetermined.length > 0) {
-      throw new SCQError("PROVIDER_ERROR", `Commit outcome is INDETERMINATE: the mutating call returned, but the ACTUAL financial outcome cannot be verified from provider data (${undetermined.join("; ")}). The pre-mutation estimate was NOT substituted for the actual outcome and no receipt was recorded. The mutation itself may have landed — reconcile manually from provider state before any retry.`, { indeterminate: true, reconciled: false, undeterminedDimensions: undetermined });
-    }
-    return this.recordReceipt(validated, snapshotFrom(after), committedEffect, proposal);
+    return this.establishLiveCommit(validated, input, preDispatchFingerprint, updateJson, idempotencyReplayed);
   }
 
   /**
-   * Builds the committed effect from ACTUALS ONLY (PR #4 review fix):
-   *   - recurring: the re-read post-commit subscription items'
-   *     provider-stated amounts. Any item without a stated amount
-   *     makes the dimension UNDETERMINED (never reconstructed as
-   *     unit_price × quantity — unjustified for flat_fee and unproven
-   *     in general). An ABSENT subscription_items member — or an
-   *     explicitly empty collection, which cannot represent this
-   *     adapter's never-empty intended item set — is likewise
-   *     UNDETERMINED, never a verified zero (PR #4 final review,
-   *     Fix A): the previous `?? []` default let an absent collection
-   *     sum vacuously to recurringAmount = 0. Only explicitly
-   *     observed values are summed: an item whose stated amount is
-   *     literally 0 contributes a legitimate 0, and a verified sum
-   *     of 0 is a determined zero.
-   *   - immediate: the update response's invoice total, or the sum of
-   *     its unbilled_charges member when present and complete (a
-   *     present member states its total, including a genuine 0). With
-   *     no update response (lost-response path) the immediate outcome
-   *     is UNDETERMINED — a subscription re-read cannot supply it.
-   * The pre-mutation estimate is NEVER an input here: an unavailable
-   * actual outcome is reported via `undetermined`, and the caller
-   * fails closed rather than recording a receipt against unverified
-   * numbers. (A missing resultingAmount must never reach
-   * reconcileCommittedEffect, whose frozen comparison would treat it
-   * as 0 and could report a misleading OK.)
+   * v0.6.2 (PR-7): reconciles a dispatch whose outcome is unknown
+   * (lost response / 409 in-flight / 5xx) from an independent
+   * post-dispatch state re-read, WITHOUT re-issuing the mutation.
+   *
+   * Landing is established when the re-read state shows the complete
+   * intended item set in effect AND the state fingerprint moved from
+   * the fingerprint this commit validated (some write landed). Where
+   * landing is established, the commit is KNOWN to have landed but
+   * its financial outcome is unverifiable: Chargebee provides no
+   * operation-level financial read-back in this adapter's validated
+   * surface (a subscription re-read carries no unbilled-charge
+   * actuals), the lost response carried the only immediate actual,
+   * and the re-read recurring level cannot be EXCLUSIVELY attributed
+   * to this commit (another actor could have produced the identical
+   * set) — so the receipt is COMMITTED_UNVERIFIED with BOTH
+   * dimensions UNKNOWN and NO figures recorded (the estimate is
+   * never substituted; PR #14 Z3). The observed state survives only
+   * as unattributed context in the resulting snapshot.
+   *
+   * Where landing is not established (state unchanged, state shows a
+   * different set, or the re-read itself failed), the outcome is
+   * INDETERMINATE: the outcome is recorded in the store, NO receipt
+   * is recorded, and the guard at the top of commitChangeQuote
+   * refuses any later blind retry of this quote.
    */
-  private committedEffectFromState(quoted: CommercialEffect, after: CbSubscription, updateJson?: any): { effect: CommercialEffect; undetermined: string[] } {
-    const undetermined: string[] = [];
-    // Fix A (PR #4 final review): the post-commit items MEMBER itself
-    // is evidence. Absent member, an explicitly empty collection, or
-    // any incomplete entry (missing item_price_id, quantity, or a
-    // stated amount) makes recurring UNDETERMINED — none of them may
-    // collapse into a sum that reads as a verified 0.
-    const rawItems = after.subscription_items;
-    let recurringAmount: number | undefined;
-    if (!Array.isArray(rawItems)) {
-      undetermined.push("recurring (the post-commit subscription response carries no subscription_items member — an absent collection is undetermined, never a verified zero)");
-    } else if (rawItems.length === 0) {
-      undetermined.push("recurring (the post-commit subscription_items collection is empty, but the intended item set is never empty — the resulting amount cannot be verified)");
-    } else if (rawItems.every((i) => typeof i.item_price_id === "string" && typeof i.quantity === "number" && typeof i.amount === "number")) {
-      recurringAmount = rawItems.reduce((s, i) => s + (i.amount as number), 0);
-    } else {
-      undetermined.push("recurring (a post-commit subscription item is incomplete — missing item_price_id, quantity, or a stated amount)");
+  private async reconcileAfterUnknownDispatch(
+    validated: StoredQuote,
+    input: LivePreviewInput,
+    preDispatchFingerprint: string,
+    cause: ChargebeeHttpError,
+  ): Promise<SubscriptionChangeReceipt> {
+    const quoteId = validated.quote_id;
+    let after: CbSubscription | undefined;
+    try { after = await this.readSubscription(validated.subscription_id); } catch { after = undefined; }
+    const landed =
+      after !== undefined &&
+      itemSetMismatches(after.subscription_items ?? [], input.items).length === 0 &&
+      fingerprintOf(after) !== preDispatchFingerprint;
+    if (after !== undefined && landed) {
+      const quoted = validated.quoted_effect;
+      const effect: CommercialEffect = {
+        recurring: {
+          currency: after.currency_code ?? quoted.recurring?.currency ?? "USD",
+          ...(quoted.recurring?.previousAmount !== undefined ? { previousAmount: quoted.recurring.previousAmount } : {}),
+        },
+        effectiveAt: quoted.effectiveAt,
+        determinacy: { immediateFinancialEffect: "UNKNOWN", recurringFinancialEffect: "UNKNOWN" },
+        provenance: {
+          immediate:
+            "unestablished: the mutating call's response was lost, and Chargebee provides no operation-level financial read-back in this adapter's validated surface — the incurred actual cannot be recovered from provider data; the pre-mutation estimate is never substituted for it",
+          recurring:
+            "unestablished for this commit: the re-read state shows the intended item set in effect, but with the mutation response lost the observed level cannot be exclusively attributed to this commit (PR #14 Z3) — it is retained only as unattributed context in the resulting snapshot",
+          committedSource: "unestablished",
+        },
+      };
+      return this.recordOutcomeReceipt(validated, {
+        effect,
+        reconciliation: {
+          status: "UNVERIFIED",
+          reason:
+            "the mutation is known to have landed — exactly one mutating call was dispatched, its response was lost, " +
+            "and an independent post-dispatch re-read shows the complete intended item set in effect on a moved state " +
+            "fingerprint — but the financial outcome cannot be verified: the response carrying the immediate actual " +
+            "was lost and no provider read-back can recover it, and the observed recurring level cannot be " +
+            "exclusively attributed to this commit. No figure is recorded for either dimension; the observed " +
+            "state is retained as unattributed context in the resulting snapshot, pending manual reconciliation " +
+            "from provider records",
+          undeterminedDimensions: ["immediateFinancialEffect", "recurringFinancialEffect"],
+        },
+        status: "COMMITTED_UNVERIFIED",
+        outcome: "COMMITTED_UNVERIFIED",
+        snapshot: snapshotFrom(after),
+      });
     }
-    const invoiceTotal = updateJson?.invoice?.total;
-    const unbilledMember = updateJson?.unbilled_charges as Array<{ amount?: number }> | undefined;
-    const unbilledTotal = Array.isArray(unbilledMember) && unbilledMember.every((u) => typeof u.amount === "number")
-      ? unbilledMember.reduce((s, u) => s + (u.amount as number), 0)
-      : undefined;
-    const net = typeof invoiceTotal === "number" ? invoiceTotal : unbilledTotal;
-    if (net === undefined) undetermined.push("immediate (no actual update response, or it carried neither an invoice total nor a complete unbilled_charges member)");
-    const effect: CommercialEffect = {
-      recurring: { ...(recurringAmount !== undefined ? { resultingAmount: recurringAmount } : {}), currency: after.currency_code ?? quoted.recurring?.currency ?? "USD", ...(quoted.recurring?.previousAmount !== undefined ? { previousAmount: quoted.recurring.previousAmount } : {}) },
-      effectiveAt: quoted.effectiveAt,
-    };
-    if (net !== undefined && net !== 0) effect.immediate = { charge: net > 0 ? net : undefined, credit: net < 0 ? -net : undefined, net };
-    return { effect, undetermined };
+    this.store.recordCommitOutcome(quoteId, {
+      outcome: "INDETERMINATE",
+      at: this.now().toISOString(),
+      details: {
+        reason: after === undefined
+          ? "the mutating request's response was lost and the post-dispatch state re-read failed"
+          : "the mutating request's response was lost and provider state does not establish the intended change",
+        cause: cause.message,
+      },
+    });
+    if (after === undefined) {
+      throw new SCQError("PROVIDER_ERROR", "Commit outcome is INDETERMINATE: the mutating request's response was lost and the post-dispatch provider state could not be re-read, so whether the change landed is not established. No receipt was recorded and no second mutation was issued. Reconcile manually from provider records before any retry.", { outcome: "INDETERMINATE", indeterminate: true, reconciled: false });
+    }
+    throw new SCQError("PROVIDER_ERROR", "Commit outcome is INDETERMINATE: the mutating request's response was lost and provider state does not show the intended change. No receipt was recorded and no second mutation was issued. Reconcile manually before any retry.", { outcome: "INDETERMINATE", indeterminate: true, reconciled: false, intendedItemsLanded: false });
   }
 
-  private recordReceipt(validated: StoredQuote, snap: SubscriptionSnapshot, committedEffect: CommercialEffect, proposal: SubscriptionChangeProposal): SubscriptionChangeReceipt {
-    const reconciliation = reconcileCommittedEffect(validated.quoted_effect, committedEffect, proposal.acceptanceEnvelope);
+  /**
+   * v0.6.2 (PR-7): establishes a commit whose mutating call RETURNED,
+   * from independent evidence — never from the pre-mutation estimate.
+   *
+   * The evidence surfaces, kept distinct:
+   *   - the MUTATION RESPONSE (bound to this commit by the HTTP
+   *     exchange and the deterministic native idempotency key): the
+   *     only source of the immediate incurred actual, and the
+   *     state this operation itself produced (its subscription
+   *     payload anchors the attribution bracket);
+   *   - the independent post-commit RE-READ (a fresh GET): the
+   *     complete intended item set is verified against it, and the
+   *     recurring actual is the strict sum of its items' stated
+   *     amounts.
+   *
+   * Classification order (PR #14 Z1: attribution BEFORE any
+   * contradiction is classified):
+   *   1. Re-read unavailable: the mutation is known landed (its
+   *      response was received) but nothing can be independently
+   *      verified => COMMITTED_UNVERIFIED, recorded entirely from
+   *      data already in hand (PR #11 P1) — the response's figures
+   *      present in the committed effect as candidates under
+   *      UNKNOWN determinacy (the PR #10/#11 construction).
+   *   2. Intended set established by the re-read:
+   *      - bracket broken (an intervening write landed between the
+   *        mutating call and the re-read) => COMMITTED_UNVERIFIED;
+   *        per Z3 NO recurring figure is recorded for this commit.
+   *        The response's immediate actual survives — its scope is
+   *        this operation alone.
+   *      - bracket closed, a financial dimension unestablished
+   *        (response without financials; re-read items without
+   *        stated amounts) => COMMITTED_UNVERIFIED (protocol
+   *        Defect 3), the established dimension keeping its figure.
+   *      - bracket closed, both dimensions established =>
+   *        COMMITTED_AND_VERIFIED; reconciliation is the core's
+   *        verdict over the established actuals (OK, or VIOLATED
+   *        when the actuals fall outside the envelope).
+   *   3. Intended set NOT established by the re-read:
+   *      - the re-read data itself is incomplete (absent items
+   *        member, empty collection, incomplete entries) =>
+   *        verification unavailable => COMMITTED_UNVERIFIED.
+   *      - the re-read fingerprint equals the pre-dispatch
+   *        fingerprint: nothing landed, despite the success-shaped
+   *        response. Execution cannot be established either way
+   *        (the response claims success the state contradicts) =>
+   *        INDETERMINATE, outcome recorded, no receipt.
+   *      - bracket closed and both financial dimensions established
+   *        from the presented state => the contradiction is this
+   *        operation's own wrong landing => COMMITTED_AND_VERIFIED
+   *        with a VIOLATED reconciliation (Decision D3).
+   *      - otherwise => COMMITTED_UNVERIFIED, the contradiction
+   *        recorded as context (unattributed when the bracket is
+   *        broken; financially incomplete when it is closed).
+   */
+  private async establishLiveCommit(
+    validated: StoredQuote,
+    input: LivePreviewInput,
+    preDispatchFingerprint: string,
+    updateJson: any,
+    idempotencyReplayed: boolean,
+  ): Promise<SubscriptionChangeReceipt> {
+    const quoteId = validated.quote_id;
+    const quoted = validated.quoted_effect;
+    const proposal = validated.proposal;
+    const respSub = (updateJson as any)?.subscription as CbSubscription | undefined;
+    const immediateActual = committedImmediateFromResponse(updateJson);
+    const immediateNet = "net" in immediateActual ? immediateActual.net : undefined;
+    const immediateSource = "net" in immediateActual ? immediateActual.source : undefined;
+    const immediateUndetermined = "net" in immediateActual ? undefined : (immediateActual as { undetermined: string }).undetermined;
+    const replayNote = idempotencyReplayed
+      ? " The response was a native idempotency replay of this commit's original operation (same key, same parameters), so its figures are the original operation's own."
+      : "";
+
+    let after: CbSubscription | undefined;
+    try { after = await this.readSubscription(validated.subscription_id); } catch { after = undefined; }
+
+    if (!after) {
+      if (!respSub) {
+        // No state evidence exists at all: the success response
+        // carried no subscription and the re-read failed. Nothing
+        // can be recorded honestly — not even a resulting snapshot.
+        this.store.recordCommitOutcome(quoteId, {
+          outcome: "INDETERMINATE",
+          at: this.now().toISOString(),
+          details: { reason: "the mutating call returned success without any subscription state, and the post-commit re-read failed" },
+        });
+        throw new SCQError("PROVIDER_ERROR", "Commit outcome is INDETERMINATE: the mutating call returned success without any subscription state, and the post-commit re-read failed, so neither the landed state nor the financial outcome can be established. No receipt was recorded. Reconcile manually from provider records before any retry.", { outcome: "INDETERMINATE", indeterminate: true, reconciled: false });
+      }
+      // Known landed, verification read unavailable (P1): record
+      // the mutation response's candidate figures as UNVERIFIED —
+      // present in the committed effect (so a later verification
+      // has a record to verify against) but labeled unestablished
+      // under UNKNOWN determinacy, built entirely from data
+      // already in hand. This is the merged PR #10/#11 candidate
+      // construction, verbatim in structure.
+      const candRecurring = strictRecurringFromItems(respSub.subscription_items);
+      const candRecurringAmount = "amount" in candRecurring ? candRecurring.amount : undefined;
+      const effect: CommercialEffect = {
+        ...(immediateNet !== undefined ? { immediate: immediateEffect(immediateNet) } : {}),
+        recurring: {
+          ...(candRecurringAmount !== undefined ? { resultingAmount: candRecurringAmount } : {}),
+          currency: respSub.currency_code ?? quoted.recurring?.currency ?? "USD",
+          ...(quoted.recurring?.previousAmount !== undefined ? { previousAmount: quoted.recurring.previousAmount } : {}),
+        },
+        effectiveAt: quoted.effectiveAt,
+        determinacy: { immediateFinancialEffect: "UNKNOWN", recurringFinancialEffect: "UNKNOWN" },
+        provenance: {
+          immediate: immediateNet !== undefined
+            ? `candidate figure reported by the mutating call's own response (${immediateSource}); the independent post-commit re-read was unavailable, so this is NOT an established actual`
+            : "unestablished: the update response carried no financial actual and the post-commit re-read was unavailable",
+          recurring: candRecurringAmount !== undefined
+            ? "candidate figure from the mutating call's returned subscription items' stated amounts; not independently re-read — NOT an established actual"
+            : "unestablished: the response's subscription items cannot be strictly priced and the post-commit re-read was unavailable",
+          committedSource: "unestablished",
+        },
+      };
+      return this.recordOutcomeReceipt(validated, {
+        effect,
+        reconciliation: {
+          status: "UNVERIFIED",
+          reason:
+            "the update landed (its response was received, bound to this commit by its native idempotency key) but the independent " +
+            "post-commit re-read was unavailable, so neither the landed item set nor the financial outcome could be independently " +
+            "verified; the recorded figures are the mutation response's candidates, pending a later verification",
+          undeterminedDimensions: ["immediateFinancialEffect", "recurringFinancialEffect"],
+        },
+        status: "COMMITTED_UNVERIFIED",
+        outcome: "COMMITTED_UNVERIFIED",
+        snapshot: snapshotFrom(respSub),
+      });
+    }
+
+    const snap = snapshotFrom(after);
+    const mismatches = itemSetMismatches(after.subscription_items ?? [], input.items);
+    const afterFingerprint = fingerprintOf(after);
+    const respFingerprint = respSub ? fingerprintOf(respSub) : undefined;
+    const bracketClosed = respFingerprint !== undefined && respFingerprint === afterFingerprint;
+    const strictRecurring = strictRecurringFromItems(after.subscription_items);
+    const recurringAmount = "amount" in strictRecurring ? strictRecurring.amount : undefined;
+    const recurringUndetermined = "amount" in strictRecurring ? undefined : (strictRecurring as { undetermined: string }).undetermined;
+    // State-verification data completeness: ids + quantities present
+    // on a non-empty collection. (Amounts are a separate, financial
+    // completeness question, carried by strictRecurring.)
+    const stateDataComplete =
+      Array.isArray(after.subscription_items) &&
+      after.subscription_items.length > 0 &&
+      after.subscription_items.every((i) => typeof i.item_price_id === "string" && typeof i.quantity === "number");
+
+    const currencyOf = after.currency_code ?? quoted.recurring?.currency ?? "USD";
+    const recurringShell = {
+      currency: currencyOf,
+      ...(quoted.recurring?.previousAmount !== undefined ? { previousAmount: quoted.recurring.previousAmount } : {}),
+    };
+    const provImmediateDetermined = `${immediateSource}${replayNote}`;
+    const provRecurringDetermined =
+      "post-commit subscription re-read: strict sum of provider-stated subscription_items[].amount over the re-read item set";
+
+    if (mismatches.length === 0) {
+      // The independent re-read establishes the complete intended
+      // item set. Attribution and financial establishment decide.
+      if (!bracketClosed) {
+        // Z1/Z3: an intervening write (or an unanchorable response)
+        // breaks attribution. The response's immediate actual is
+        // this operation's own and survives; NO recurring figure is
+        // recorded for this commit.
+        const dims: string[] = [...(immediateNet === undefined ? ["immediateFinancialEffect"] : []), "recurringFinancialEffect"];
+        const effect: CommercialEffect = {
+          ...(immediateNet !== undefined ? { immediate: immediateEffect(immediateNet) } : {}),
+          recurring: { ...recurringShell },
+          effectiveAt: quoted.effectiveAt,
+          determinacy: {
+            immediateFinancialEffect: immediateNet !== undefined ? "DETERMINED" : "UNKNOWN",
+            recurringFinancialEffect: "UNKNOWN",
+          },
+          provenance: {
+            immediate: immediateNet !== undefined ? provImmediateDetermined : `unestablished: ${immediateUndetermined}`,
+            recurring:
+              "unestablished for this commit: an intervening write landed between the mutating call and the post-commit re-read " +
+              "(the response state's fingerprint does not equal the re-read state's), so the observed recurring level was not " +
+              "produced by this commit alone (PR #14 Z3) — it is retained only as unattributed context in the resulting snapshot",
+            committedSource: "unestablished",
+          },
+        };
+        return this.recordOutcomeReceipt(validated, {
+          effect,
+          reconciliation: {
+            status: "UNVERIFIED",
+            reason:
+              `the intended item set is in effect, but attribution does not close around this commit: the mutating call's response ` +
+              `state fingerprints ${respFingerprint ?? "(no subscription in the response)"} while the independent re-read fingerprints ` +
+              `${afterFingerprint} — a competing write intervened between the mutating call and the re-read, so the observed state ` +
+              `cannot be attributed to this commit alone. No committed recurring figure is recorded for this commit (PR #14 Z3).`,
+            undeterminedDimensions: dims,
+          },
+          status: "COMMITTED_UNVERIFIED",
+          outcome: "COMMITTED_UNVERIFIED",
+          snapshot: snap,
+        });
+      }
+      if (immediateNet === undefined || recurringAmount === undefined) {
+        // Defect 3: known landed, state verified, attribution
+        // closed — but a financial dimension is unestablished.
+        const dims: string[] = [
+          ...(immediateNet === undefined ? ["immediateFinancialEffect"] : []),
+          ...(recurringAmount === undefined ? ["recurringFinancialEffect"] : []),
+        ];
+        const effect: CommercialEffect = {
+          ...(immediateNet !== undefined ? { immediate: immediateEffect(immediateNet) } : {}),
+          recurring: { ...(recurringAmount !== undefined ? { resultingAmount: recurringAmount } : {}), ...recurringShell },
+          effectiveAt: quoted.effectiveAt,
+          determinacy: {
+            immediateFinancialEffect: immediateNet !== undefined ? "DETERMINED" : "UNKNOWN",
+            recurringFinancialEffect: recurringAmount !== undefined ? "DETERMINED" : "UNKNOWN",
+          },
+          provenance: {
+            immediate: immediateNet !== undefined ? provImmediateDetermined : `unestablished: ${immediateUndetermined}`,
+            recurring: recurringAmount !== undefined ? provRecurringDetermined : `unestablished: ${recurringUndetermined}`,
+            committedSource: "unestablished",
+          },
+        };
+        return this.recordOutcomeReceipt(validated, {
+          effect,
+          reconciliation: {
+            status: "UNVERIFIED",
+            reason:
+              `the mutation landed and the independent re-read establishes the intended item set with attribution closed, but the ` +
+              `financial outcome is not fully established (${dims.join(", ")} UNKNOWN) — the pre-mutation estimate is never ` +
+              `substituted for an actual, so the commit is recorded as committed-but-unverified rather than failing closed ` +
+              `as indeterminate (protocol Defect 3, closed by this migration)`,
+            undeterminedDimensions: dims,
+          },
+          status: "COMMITTED_UNVERIFIED",
+          outcome: "COMMITTED_UNVERIFIED",
+          snapshot: snap,
+        });
+      }
+      // Fully established: verified success or verified-with-
+      // violation, per the core reconciliation over actuals.
+      const effect: CommercialEffect = {
+        immediate: immediateEffect(immediateNet),
+        recurring: { resultingAmount: recurringAmount, ...recurringShell },
+        effectiveAt: quoted.effectiveAt,
+        determinacy: { immediateFinancialEffect: "DETERMINED", recurringFinancialEffect: "DETERMINED" },
+        provenance: { immediate: provImmediateDetermined, recurring: provRecurringDetermined, committedSource: "provider_actual" },
+      };
+      return this.recordOutcomeReceipt(validated, {
+        effect,
+        reconciliation: reconcileCommittedEffect(quoted, effect, proposal.acceptanceEnvelope),
+        status: "COMMITTED",
+        outcome: "COMMITTED_AND_VERIFIED",
+        snapshot: snap,
+      });
+    }
+
+    // The re-read does NOT establish the intended item set.
+    if (!stateDataComplete) {
+      // The re-read data itself is incomplete (absent member, empty
+      // collection, incomplete entries): verification is unavailable,
+      // which is a different claim from an established contradiction.
+      const dims: string[] = [...(immediateNet === undefined ? ["immediateFinancialEffect"] : []), "recurringFinancialEffect"];
+      const effect: CommercialEffect = {
+        ...(immediateNet !== undefined ? { immediate: immediateEffect(immediateNet) } : {}),
+        recurring: { ...recurringShell },
+        effectiveAt: quoted.effectiveAt,
+        determinacy: {
+          immediateFinancialEffect: immediateNet !== undefined ? "DETERMINED" : "UNKNOWN",
+          recurringFinancialEffect: "UNKNOWN",
+        },
+        provenance: {
+          immediate: immediateNet !== undefined ? provImmediateDetermined : `unestablished: ${immediateUndetermined}`,
+          recurring:
+            "unestablished: the post-commit re-read's subscription_items data is incomplete (absent member, empty collection, or " +
+            "incomplete entries), so neither the landed item set nor the recurring level can be established from it — an absent " +
+            "collection is never summed as a verified zero",
+          committedSource: "unestablished",
+        },
+      };
+      return this.recordOutcomeReceipt(validated, {
+        effect,
+        reconciliation: {
+          status: "UNVERIFIED",
+          reason:
+            "the update landed (its response was received) but the post-commit re-read's item data is incomplete, so the landed " +
+            "state and the recurring outcome cannot be established from provider data; no figure was derived from the incomplete read",
+          undeterminedDimensions: dims,
+        },
+        status: "COMMITTED_UNVERIFIED",
+        outcome: "COMMITTED_UNVERIFIED",
+        snapshot: snap,
+      });
+    }
+
+    if (afterFingerprint === preDispatchFingerprint) {
+      // Nothing landed: the re-read state is byte-identical (same
+      // fingerprint) to the state this commit validated, despite the
+      // success-shaped response. Execution cannot be established
+      // either way — the response claims a success the state
+      // contradicts — so the outcome is INDETERMINATE, recorded in
+      // the store, with no receipt and no blind retry.
+      this.store.recordCommitOutcome(quoteId, {
+        outcome: "INDETERMINATE",
+        at: this.now().toISOString(),
+        details: { reason: "the mutating call returned success but the re-read state is identical to the pre-dispatch state — the intended change did not land", itemSetMismatches: mismatches },
+      });
+      throw new SCQError("PROVIDER_ERROR", `Commit outcome is INDETERMINATE: the mutating call returned success, but the re-read provider state does NOT establish the intended item set (${mismatches.join("; ")}) and is identical to the pre-dispatch state — the change did not land, and the success response cannot be reconciled with the state. No receipt was recorded. Reconcile manually from provider state before any retry.`, { outcome: "INDETERMINATE", indeterminate: true, reconciled: false, itemSetMismatches: mismatches });
+    }
+
+    if (bracketClosed && immediateNet !== undefined && recurringAmount !== undefined) {
+      // D3: the contradiction is attributable to this commit — the
+      // response state's fingerprint equals the re-read's, so no
+      // intervening write can account for the wrong landing. A
+      // determined negative verification: VIOLATED, with the actual
+      // figures as presented by the provider.
+      const effect: CommercialEffect = {
+        immediate: immediateEffect(immediateNet),
+        recurring: { resultingAmount: recurringAmount, ...recurringShell },
+        effectiveAt: quoted.effectiveAt,
+        determinacy: { immediateFinancialEffect: "DETERMINED", recurringFinancialEffect: "DETERMINED" },
+        provenance: { immediate: provImmediateDetermined, recurring: provRecurringDetermined, committedSource: "provider_actual" },
+      };
+      return this.recordOutcomeReceipt(validated, {
+        effect,
+        reconciliation: {
+          status: "VIOLATED",
+          reason:
+            `Post-commit state verification MISMATCH — a determined negative verification (Decision D3): the re-read item set does ` +
+            `not establish the intended set (${mismatches.join("; ")}). The contradiction is attributable to this commit: the ` +
+            `mutating call's response state and the independent re-read agree (fingerprint ${afterFingerprint}), so no intervening ` +
+            `write can account for the wrong landing. The committed figures report the provider's actuals as presented; the ` +
+            `mutation has already occurred and cannot be rolled back by this reconciliation.`,
+        },
+        status: "COMMITTED",
+        outcome: "COMMITTED_AND_VERIFIED",
+        snapshot: snap,
+      });
+    }
+
+    // Landed wrong, but the outcome cannot be fully established:
+    // attribution is broken (the mismatch is unattributed context
+    // only) and/or a financial dimension is unestablished.
+    const dims: string[] = [
+      ...(immediateNet === undefined ? ["immediateFinancialEffect"] : []),
+      ...(!bracketClosed || recurringAmount === undefined ? ["recurringFinancialEffect"] : []),
+    ];
+    const recurringFigure = bracketClosed && recurringAmount !== undefined ? recurringAmount : undefined;
+    const effect: CommercialEffect = {
+      ...(immediateNet !== undefined ? { immediate: immediateEffect(immediateNet) } : {}),
+      recurring: { ...(recurringFigure !== undefined ? { resultingAmount: recurringFigure } : {}), ...recurringShell },
+      effectiveAt: quoted.effectiveAt,
+      determinacy: {
+        immediateFinancialEffect: immediateNet !== undefined ? "DETERMINED" : "UNKNOWN",
+        recurringFinancialEffect: recurringFigure !== undefined ? "DETERMINED" : "UNKNOWN",
+      },
+      provenance: {
+        immediate: immediateNet !== undefined ? provImmediateDetermined : `unestablished: ${immediateUndetermined}`,
+        recurring: recurringFigure !== undefined
+          ? provRecurringDetermined
+          : !bracketClosed
+            ? "unestablished for this commit: attribution is broken (the response state's fingerprint does not equal the re-read state's), so no recurring figure is recorded for this commit (PR #14 Z3)"
+            : `unestablished: ${recurringUndetermined}`,
+        committedSource: "unestablished",
+      },
+    };
+    return this.recordOutcomeReceipt(validated, {
+      effect,
+      reconciliation: {
+        status: "UNVERIFIED",
+        reason:
+          `the re-read item set does not establish the intended set (${mismatches.join("; ")})` +
+          (!bracketClosed
+            ? `, but attribution does not close around this commit (response state fingerprints ${respFingerprint ?? "(no subscription in the response)"}, re-read ${afterFingerprint}), so the contradiction is recorded as unattributed context only — it is NOT classified as a verified failure of this commit, since an intervening change may have caused it`
+            : `, and although attribution closes, the financial outcome is not fully established (${dims.join(", ")} UNKNOWN), so the contradiction cannot be carried as a verified violation over established actuals`),
+        undeterminedDimensions: dims,
+      },
+      status: "COMMITTED_UNVERIFIED",
+      outcome: "COMMITTED_UNVERIFIED",
+      snapshot: snap,
+    });
+  }
+
+  /** Records a v0.6.2 commit receipt (verified or unverified) for an established commit outcome. */
+  private recordOutcomeReceipt(
+    validated: StoredQuote,
+    established: {
+      effect: CommercialEffect;
+      reconciliation: ReconciliationResult;
+      status: SubscriptionChangeReceipt["status"];
+      outcome: MutationOutcome;
+      snapshot: SubscriptionSnapshot;
+    },
+  ): SubscriptionChangeReceipt {
     const receipt: SubscriptionChangeReceipt = {
       quoteId: validated.quote_id,
       subscriptionRef: validated.subscription_id,
-      status: "COMMITTED",
-      resultingSnapshot: snap,
+      status: established.status,
+      outcome: established.outcome,
+      resultingSnapshot: established.snapshot,
       quotedEffect: validated.quoted_effect,
-      committedEffect,
+      committedEffect: established.effect,
       guaranteeMode: validated.effective_guarantee_mode,
       consistencyGuarantee: "BEST_EFFORT",
       multiChangeConsistency: validated.multi_change_consistency,
-      reconciliation,
+      reconciliation: established.reconciliation,
       committedAt: this.now().toISOString(),
     };
     this.store.recordCommitReceipt(validated.quote_id, receipt);

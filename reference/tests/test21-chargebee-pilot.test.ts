@@ -214,17 +214,34 @@ test("Test 21-c5: conflicting idempotency — same native key with different par
   assert.equal(json.subscription.subscription_items.find((i: any) => i.item_price_id === ADDON).quantity, 21, "the conflicting call did not change state");
 });
 
-test("Test 21-c6: lost mutation response — INDETERMINATE, no receipt, no blind retry, no duplicate mutation", async () => {
+test("Test 21-c6: lost mutation response, intended set landed — COMMITTED_UNVERIFIED receipt, no blind retry, no duplicate mutation", async () => {
+  // DISCLOSED CHANGE (PR-7, v0.6.2): previously INDETERMINATE with
+  // no receipt (protocol Defect 3 — the frozen v0.6.1 receipt type
+  // had no committed-but-unverified state). The mock APPLIES the
+  // update before losing the response, and the adapter's
+  // post-dispatch re-read establishes the landing (complete intended
+  // set in effect, resource_version moved) — so under the v0.6.2
+  // taxonomy the outcome is a typed COMMITTED_UNVERIFIED receipt
+  // with BOTH financial dimensions UNKNOWN and no figures: the
+  // immediate actual was in the lost response, and the observed
+  // recurring level cannot be exclusively attributed to this commit
+  // (PR #14 Z3). INDETERMINATE is now reserved for landings that
+  // cannot be established at all (see test26 rows 11/12).
   const { adapter, mock, store } = makeAdapter({ loseUpdateResponse: true }, { commitEnabled: true });
   const quote = await adapter.createChangeQuote(SUB, PROPOSAL(21));
-  await assert.rejects(
-    () => adapter.commitChangeQuote(quote.id),
-    (e: unknown) => e instanceof SCQError && (e.details as any)?.indeterminate === true,
-  );
-  assert.equal(store.get(quote.id)?.commit_receipt, undefined, "no receipt is recorded for an unverified outcome");
+  const receipt = await adapter.commitChangeQuote(quote.id);
+  assert.equal(receipt.status, "COMMITTED_UNVERIFIED");
+  assert.equal(receipt.outcome, "COMMITTED_UNVERIFIED");
+  assert.equal(receipt.reconciliation.status, "UNVERIFIED");
+  assert.equal(receipt.committedEffect.immediate, undefined);
+  assert.equal(receipt.committedEffect.recurring?.resultingAmount, undefined);
+  assert.deepEqual(receipt.committedEffect.determinacy, { immediateFinancialEffect: "UNKNOWN", recurringFinancialEffect: "UNKNOWN" });
+  assert.equal(store.get(quote.id)?.commit_receipt?.status, "COMMITTED_UNVERIFIED");
   assert.equal(mock.mutationCount, 1);
-  // A second attempt must NOT re-mutate: the landed state makes the quote stale.
-  await assert.rejects(() => adapter.commitChangeQuote(quote.id));
+  // A second attempt must NOT re-mutate: §6.10 replay returns the
+  // recorded unverified receipt.
+  const replay = await adapter.commitChangeQuote(quote.id);
+  assert.deepEqual(replay, receipt);
   assert.equal(mock.mutationCount, 1, "still exactly one mutating call — no blind retry");
 });
 
@@ -239,31 +256,53 @@ test("Test 21-c7: provider 200 with silently unapplied change — no verified re
   assert.equal(mock.mutationCount, 1);
 });
 
-test("Test 21-c8: post-commit financial uncertainty (incomplete update response) — indeterminate, no receipt", async () => {
-  // NOTE on classification: the frozen v0.6.1 receipt type has no
-  // "committed but financially unverified" state, so this adapter
-  // fails closed as INDETERMINATE with no receipt rather than
-  // recording a COMMITTED_UNVERIFIED receipt. The v0.6.2 store
-  // machinery (PR #8) can represent COMMITTED_UNVERIFIED; adopting it
-  // here is part of the future Chargebee migration gate, not this
-  // pilot. The behavior asserted is the adapter's actual behavior.
+test("Test 21-c8: post-commit financial uncertainty (incomplete update response) — COMMITTED_UNVERIFIED typed receipt (Defect 3 closed by PR-7)", async () => {
+  // DISCLOSED CHANGE (PR-7, v0.6.2): this test's own note previously
+  // recorded that the adapter failed closed as INDETERMINATE with no
+  // receipt because the frozen v0.6.1 receipt type had no
+  // "committed but financially unverified" state, and that adopting
+  // the v0.6.2 representation was "part of the future Chargebee
+  // migration gate". PR-7 is that migration. The mutation response
+  // WAS received (landing known), the re-read establishes the
+  // intended set with attribution closed, and the recurring actual
+  // is established — only the immediate actual is unavailable, so
+  // the receipt is COMMITTED_UNVERIFIED with the immediate
+  // dimension UNKNOWN (never the estimate substituted, never OK).
   const { adapter, mock, store } = makeAdapter({ incompleteUpdateResponse: true }, { commitEnabled: true });
   const quote = await adapter.createChangeQuote(SUB, PROPOSAL(21));
-  await assert.rejects(
-    () => adapter.commitChangeQuote(quote.id),
-    (e: unknown) => e instanceof SCQError && (e.details as any)?.indeterminate === true && JSON.stringify((e.details as any)?.undeterminedDimensions ?? []).includes("immediate"),
-  );
-  assert.equal(store.get(quote.id)?.commit_receipt, undefined);
+  const receipt = await adapter.commitChangeQuote(quote.id);
+  assert.equal(receipt.status, "COMMITTED_UNVERIFIED");
+  assert.equal(receipt.outcome, "COMMITTED_UNVERIFIED");
+  assert.equal(receipt.reconciliation.status, "UNVERIFIED");
+  assert.deepEqual((receipt.reconciliation as any).undeterminedDimensions, ["immediateFinancialEffect"]);
+  assert.equal(receipt.committedEffect.immediate, undefined);
+  assert.equal(receipt.committedEffect.determinacy?.immediateFinancialEffect, "UNKNOWN");
+  assert.equal(receipt.committedEffect.recurring?.resultingAmount, 80900, "the recurring actual is established from the independent re-read");
+  assert.equal(store.get(quote.id)?.commit_receipt?.status, "COMMITTED_UNVERIFIED");
   assert.equal(mock.mutationCount, 1);
 });
 
-test("Test 21-c9: mandatory addon attached by the provider on update — item-set verification refuses a verified receipt", async () => {
+test("Test 21-c9: mandatory addon attached by the provider on update — attributable VIOLATED receipt (the landed set is not the quoted set)", async () => {
+  // DISCLOSED CHANGE (PR-7, v0.6.2): previously INDETERMINATE with
+  // no receipt. The extra item landed as part of THIS commit's own
+  // update (the provider's documented mandatory-addon behavior),
+  // attribution closes (response state fingerprint == re-read
+  // fingerprint), and both financial dimensions are established
+  // from the presented actuals — so the contradiction is Decision
+  // D3's determined negative verification: a COMMITTED_AND_VERIFIED
+  // receipt with a VIOLATED reconciliation whose committed recurring
+  // (83400) includes the mandatory addon's stated amount. The landed
+  // set is still never reported as the quoted set — it is reported
+  // as a verified violation of it.
   const { adapter, mock, store } = makeAdapter({ mandatoryAddonOnUpdate: "pilot-addon-mandatory" }, { commitEnabled: true });
   const quote = await adapter.createChangeQuote(SUB, PROPOSAL(21));
-  await assert.rejects(
-    () => adapter.commitChangeQuote(quote.id),
-    (e: unknown) => e instanceof SCQError && (e.details as any)?.indeterminate === true,
-  );
-  assert.equal(store.get(quote.id)?.commit_receipt, undefined, "the extra mandatory item means the landed set is not the quoted set — no verified receipt");
+  const receipt = await adapter.commitChangeQuote(quote.id);
+  assert.equal(receipt.status, "COMMITTED");
+  assert.equal(receipt.outcome, "COMMITTED_AND_VERIFIED");
+  assert.equal(receipt.reconciliation.status, "VIOLATED");
+  assert.match((receipt.reconciliation as any).reason, /extra item pilot-addon-mandatory/);
+  assert.equal(receipt.committedEffect.recurring?.resultingAmount, 83400, "59900 plan + 21000 addon + the mandatory addon's stated 2500, as actually landed");
+  assert.equal(receipt.committedEffect.immediate?.net, 20000);
+  assert.equal(store.get(quote.id)?.commit_receipt?.reconciliation.status, "VIOLATED");
   assert.equal(mock.mutationCount, 1);
 });
