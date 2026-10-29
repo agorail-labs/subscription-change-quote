@@ -13,6 +13,13 @@
 //     environment (CHARGEBEE_SITE + CHARGEBEE_API_KEY, plus
 //     CHARGEBEE_TEST_SUBSCRIPTION_ID). Without them the run classifies
 //     live capabilities BLOCKED and performs NO network call.
+//   - Live mode additionally enforces the safeguards in
+//     live-guard.ts (PR #13 review correction R3): a preflight
+//     requiring an explicitly approved TEST site and a synthetic
+//     subscription id BEFORE any request is constructed; an operation
+//     allowlist enforced at the transport boundary; and report counts
+//     derived from the OBSERVED transport log (a LIVE_PASS requires
+//     the corresponding observed successful operations).
 //   - The harness NEVER enables live commit, in either mode: the
 //     adapter is constructed with liveCommitEnabled=false, and the
 //     report classifies commit BLOCKED with the reason. Commit-path
@@ -30,6 +37,16 @@ import type { SubscriptionChangeQuote } from "../../core/types.js";
 import { ChargebeeClient, chargebeeConfigFromEnv, fetchTransport, type HttpTransport } from "../chargebee-http.js";
 import { ChargebeeLiveAdapter, interpretChargebeeEstimate, type CbItemPriceInfo } from "../chargebee-scq-adapter.js";
 import { PilotMockChargebee } from "./mock-transport.js";
+import {
+  PilotLivePreflightError,
+  assertLivePilotPreflight,
+  classifyChargebeeOperation,
+  createGuardedLiveTransport,
+  observedSuccessfulOps,
+  summarizeTransportLog,
+  type TransportLogEntry,
+  type TransportSummary,
+} from "./live-guard.js";
 
 export type EvidenceClass = "LIVE_PASS" | "LIVE_FAIL" | "SIMULATED_PASS" | "DOCUMENTATION_SUPPORTED" | "BLOCKED" | "UNVERIFIED";
 export const EVIDENCE_CLASSES: EvidenceClass[] = ["LIVE_PASS", "LIVE_FAIL", "SIMULATED_PASS", "DOCUMENTATION_SUPPORTED", "BLOCKED", "UNVERIFIED"];
@@ -47,7 +64,8 @@ export type PilotReport = {
   steps: PilotStep[];
   comparisons: FieldComparison[];
   capabilities: CapabilityResult[];
-  transport: { totalCalls: number; mutatingCalls: number; estimateCalls: number };
+  /** Observed transport counts, derived from the run's transport log (never hardcoded). */
+  transport: TransportSummary;
   quote?: { id: string; immediateNet?: number; recurringResulting?: number; recurringPrevious?: number; currency?: string; provenance?: unknown; nextInvoiceEstimate?: unknown };
 };
 
@@ -56,12 +74,33 @@ export const PILOT_SUBSCRIPTION_ID = "pilot-sub-001";
 export const PILOT_TARGET_QTY = 21;
 
 /**
+ * Classification discipline for a run capability (PR #13 review
+ * correction R3c): in live mode a PASS must rest on OBSERVED
+ * successful operations in the transport log — a step that nominally
+ * succeeded but produced no observed operation for its capability is
+ * UNVERIFIED, never LIVE_PASS. In mocked mode the evidence is
+ * SIMULATED_PASS when the step succeeded.
+ */
+export function classifyRunCapability(mode: "mocked" | "live", ok: boolean, observedSuccessfulOpsCount: number): EvidenceClass {
+  if (mode === "mocked") return ok ? "SIMULATED_PASS" : "UNVERIFIED";
+  if (!ok) return "LIVE_FAIL";
+  return observedSuccessfulOpsCount > 0 ? "LIVE_PASS" : "UNVERIFIED";
+}
+
+/**
  * Field-by-field comparison of the adapter's normalized quote against
- * the RAW provider estimate. The raw response is interpreted
- * independently (interpretChargebeeEstimate over the raw JSON with
- * the same context) and each normalized figure must equal the
- * raw-derived figure; next-invoice figures must appear ONLY in
- * metadata and never in the effect.
+ * the RAW provider estimate. The raw response is interpreted with
+ * interpretChargebeeEstimate over the raw JSON — the adapter's OWN
+ * interpretation function. This is therefore a harness CONSISTENCY
+ * check (quote vs raw response, same interpretation applied twice):
+ * it catches raw-response divergence, but it CANNOT detect a
+ * systematic defect inside the shared interpretation function, which
+ * would corrupt both sides identically (PR #13 review correction
+ * R1). Independent verification — values AND provenance, computed
+ * from the documented semantics without the adapter's code — is the
+ * test-only oracle in tests/oracles/chargebee-estimate-oracle.ts,
+ * exercised by test22; the TEST evidence rests on the oracle, not on
+ * this function.
  */
 export function compareQuoteToRawEstimate(
   quote: SubscriptionChangeQuote,
@@ -78,16 +117,28 @@ export function compareQuoteToRawEstimate(
   push("recurring.resultingAmount", raw.provenance.recurring, raw.effect.recurring?.resultingAmount, eff.recurring?.resultingAmount, "post-change price level; credits do not reduce it");
   push("recurring.previousAmount", "sum of current subscription_items[].amount (provider-stated)", raw.effect.recurring?.previousAmount, eff.recurring?.previousAmount);
   push("currency", "subscription.currency_code", ctx.currency, eff.recurring?.currency);
-  // Next-invoice separation: figures exist in metadata only.
+  // Next-invoice separation: figures exist in metadata only, carrying
+  // the raw response's values unchanged.
+  //
+  // PR #13 review correction R2 (disclosed removal): this row
+  // previously ALSO required `eff.immediate?.net !==
+  // raw.nextInvoice?.amountDue` — a NUMERIC INEQUALITY requirement.
+  // That was wrong: amount_due may legitimately EQUAL the incurred
+  // figure (e.g. credits bring the next invoice's amount due to
+  // exactly the incurred amount) without any substitution occurring.
+  // Isolation is a SOURCE property, not a numeric one: the effect
+  // figures are checked against their own sources (the rows above,
+  // and independently by the test-only oracle in test22), and this
+  // row checks only that the next-invoice figures appear HERE, in
+  // metadata, with their raw values intact.
   const ni = (md.nextInvoiceEstimate ?? null) as { total?: number; amountDue?: number } | null;
   out.push({
     field: "nextInvoiceEstimate isolation",
     providerSource: "next_invoice_estimate.total / amount_due",
     rawDerived: raw.nextInvoice ? { total: raw.nextInvoice.total, amountDue: raw.nextInvoice.amountDue } : null,
     normalized: ni ? { total: ni.total, amountDue: ni.amountDue } : null,
-    match: JSON.stringify(raw.nextInvoice ? { total: raw.nextInvoice.total, amountDue: raw.nextInvoice.amountDue } : null) === JSON.stringify(ni ? { total: ni.total, amountDue: ni.amountDue } : null)
-      && eff.immediate?.net !== raw.nextInvoice?.amountDue,
-    note: "next-invoice figures are metadata only; amount_due (net of credits) must never equal-by-substitution the incurred immediate",
+    match: JSON.stringify(raw.nextInvoice ? { total: raw.nextInvoice.total, amountDue: raw.nextInvoice.amountDue } : null) === JSON.stringify(ni ? { total: ni.total, amountDue: ni.amountDue } : null),
+    note: "next-invoice figures are metadata only, with raw values intact; the effect's figures are sourced from their own fields (see the rows above) — separation is by source, and the figures may legitimately coincide numerically",
   });
   const prov = (md.financialProvenance ?? {}) as Record<string, string>;
   out.push({
@@ -106,10 +157,16 @@ export type RunPilotOptions = {
   subscriptionId?: string;
   targetQuantity?: number;
   mock?: PilotMockChargebee;
+  /**
+   * Live mode only: the network transport the guarded live transport
+   * wraps (default: global fetch). Tests inject a stub here to
+   * exercise the live path — preflight, allowlist, observed counts —
+   * with zero real network access.
+   */
+  networkTransport?: HttpTransport;
 };
 
 export async function runPilot(opts: RunPilotOptions): Promise<PilotReport> {
-  const passClass: EvidenceClass = opts.mode === "live" ? "LIVE_PASS" : "SIMULATED_PASS";
   const steps: PilotStep[] = [];
   const capabilities: CapabilityResult[] = [];
   const targetQty = opts.targetQuantity ?? PILOT_TARGET_QTY;
@@ -118,30 +175,60 @@ export async function runPilot(opts: RunPilotOptions): Promise<PilotReport> {
   let clientConfig: { site: string; apiKey: string };
   let subscriptionId = opts.subscriptionId ?? PILOT_SUBSCRIPTION_ID;
   const mock = opts.mode === "mocked" ? (opts.mock ?? new PilotMockChargebee()) : undefined;
+  // The run's observed transport log: the guard's log in live mode;
+  // the fixture's call log (classified) in mocked mode. Report counts
+  // and live classifications derive from it (R3c).
+  let transportLog: TransportLogEntry[] = [];
+
+  const blockedLiveReport = (step: string, detail: string, basis: string): PilotReport => ({
+    generatedAt: new Date().toISOString(),
+    mode: "live",
+    site: "<test-site>",
+    subscriptionRef: "<subscription-id>",
+    proposalDescription: `CHANGE_QUANTITY ${PILOT_ADDON} -> ${targetQty}`,
+    steps: [{ step, status: "blocked", detail }],
+    comparisons: [],
+    capabilities: [
+      { capability: "retrieve subscription (live)", classification: "BLOCKED", basis },
+      { capability: "estimate-backed quote (live)", classification: "BLOCKED", basis },
+      { capability: "live commit", classification: "BLOCKED", basis: "prohibited in this pilot; SCQ_LIVE_COMMIT_ENABLED untouched (false)" },
+    ],
+    transport: summarizeTransportLog(transportLog),
+  });
 
   if (opts.mode === "live") {
     const envStatus = chargebeeConfigFromEnv(opts.env ?? process.env);
     if (!envStatus.ok) {
-      const blocked: PilotReport = {
-        generatedAt: new Date().toISOString(),
-        mode: "live",
-        site: "<test-site>",
-        subscriptionRef: "<subscription-id>",
-        proposalDescription: `CHANGE_QUANTITY ${PILOT_ADDON} -> ${targetQty}`,
-        steps: [{ step: "environment check", status: "blocked", detail: `Missing environment: ${envStatus.missing.join(", ")}. No network call was made.` }],
-        comparisons: [],
-        capabilities: [
-          { capability: "retrieve subscription (live)", classification: "BLOCKED", basis: `credentials unavailable: ${envStatus.missing.join(", ")}` },
-          { capability: "estimate-backed quote (live)", classification: "BLOCKED", basis: "credentials unavailable" },
-          { capability: "live commit", classification: "BLOCKED", basis: "prohibited in this pilot; SCQ_LIVE_COMMIT_ENABLED untouched (false)" },
-        ],
-        transport: { totalCalls: 0, mutatingCalls: 0, estimateCalls: 0 },
-      };
-      return blocked;
+      return blockedLiveReport(
+        "environment check",
+        `Missing environment: ${envStatus.missing.join(", ")}. No network call was made.`,
+        `credentials unavailable: ${envStatus.missing.join(", ")}`,
+      );
     }
     clientConfig = envStatus.config;
     subscriptionId = opts.subscriptionId ?? envStatus.testSubscriptionId ?? "";
-    baseTransport = fetchTransport;
+    // R3(a): preflight — an explicitly approved TEST site and a
+    // synthetic subscription id are required BEFORE any request is
+    // constructed. Failure is closed: no client, no transport, no
+    // network call; the run classifies BLOCKED with the named error.
+    try {
+      assertLivePilotPreflight({ site: clientConfig.site, apiKeyPresent: !!clientConfig.apiKey, subscriptionId });
+    } catch (e) {
+      if (e instanceof PilotLivePreflightError) {
+        return blockedLiveReport(
+          "live preflight",
+          `${e.code}: ${e.problems.join("; ")}. No network call was made.`,
+          `live preflight failed (${e.code}): ${e.problems.join("; ")}`,
+        );
+      }
+      throw e;
+    }
+    steps.push({ step: "live preflight", status: "pass", detail: "approved test site + synthetic subscription id verified before any request" });
+    // R3(b): every live request flows through the guarded transport,
+    // which enforces the read/estimate allowlist at its boundary.
+    const guard = createGuardedLiveTransport(opts.networkTransport ?? fetchTransport);
+    transportLog = guard.log;
+    baseTransport = guard.transport;
   } else {
     clientConfig = { site: "pilot-test", apiKey: "pilot-mock-key" };
     baseTransport = mock!.transport;
@@ -163,7 +250,6 @@ export async function runPilot(opts: RunPilotOptions): Promise<PilotReport> {
   const snapshot = await adapter.getSubscription(subscriptionId);
   steps.push({ step: "retrieve subscription", status: "pass", detail: `status=${snapshot.status}, items=${snapshot.items.length}, version=${snapshot.version}` });
   steps.push({ step: "build SCQ snapshot", status: "pass", detail: `recurring=${snapshot.billing.recurringAmount} ${snapshot.billing.currency}` });
-  capabilities.push({ capability: "retrieve subscription + snapshot", classification: passClass, basis: opts.mode === "live" ? "real test-site GET via fetch transport" : "mocked transport fixture (pilot mock)" });
 
   // (3)+(4) proposal + estimate-backed quote (read/estimate only)
   const proposal = {
@@ -176,7 +262,6 @@ export async function runPilot(opts: RunPilotOptions): Promise<PilotReport> {
   const quote = await adapter.createChangeQuote(subscriptionId, proposal);
   steps.push({ step: "construct proposal", status: "pass", detail: `CHANGE_QUANTITY ${PILOT_ADDON} 1 -> ${targetQty}, IMMEDIATE` });
   steps.push({ step: "provider-backed quote (estimate only)", status: "pass", detail: `quote ${quote.id}; immediate.net=${quote.commercialEffect.immediate?.net}; recurring=${quote.commercialEffect.recurring?.resultingAmount}` });
-  capabilities.push({ capability: "estimate-backed quote", classification: passClass, basis: opts.mode === "live" ? "real test-site estimate POST (non-mutating)" : "mocked transport fixture (pilot mock)" });
 
   // (5) field-by-field comparison against the raw estimate
   const { json: rawSub } = await client.getSubscription(subscriptionId);
@@ -192,11 +277,26 @@ export async function runPilot(opts: RunPilotOptions): Promise<PilotReport> {
   const comparisons = compareQuoteToRawEstimate(quote, rawEstimateJson, { currency: sub.currency_code ?? "USD", currentItems, targetItems, priceInfo });
   const allMatch = comparisons.every((c) => c.match);
   steps.push({ step: "field-by-field comparison (normalized vs raw)", status: allMatch ? "pass" : "fail", detail: `${comparisons.filter((c) => c.match).length}/${comparisons.length} fields match` });
-  capabilities.push({ capability: "normalized-vs-raw field comparison", classification: allMatch ? passClass : (opts.mode === "live" ? "LIVE_FAIL" : "UNVERIFIED"), basis: "interpretChargebeeEstimate applied independently to the captured raw estimate response" });
+
+  // Observed transport evidence (R3c): in mocked mode the fixture's
+  // call log is classified into the same entry shape; in live mode
+  // transportLog IS the guard's log (a live reference, now complete).
+  // Every count in the report — including the mutating-call count —
+  // is derived from these observed entries, never hardcoded.
+  if (opts.mode === "mocked") {
+    transportLog = mock!.calls.map((c) => {
+      const cls = classifyChargebeeOperation(c.method, c.path);
+      return { method: c.method, path: c.path, operation: cls.operation, mutating: cls.mutating, dispatched: true };
+    });
+  }
+  const retrieveObserved = observedSuccessfulOps(transportLog, "retrieve_subscription");
+  const estimateObserved = observedSuccessfulOps(transportLog, "estimate_update_for_items");
+  capabilities.push({ capability: "retrieve subscription + snapshot", classification: classifyRunCapability(opts.mode, true, retrieveObserved), basis: opts.mode === "live" ? `guarded live transport log: ${retrieveObserved} observed successful retrieve operation(s)` : "mocked transport fixture (pilot mock)" });
+  capabilities.push({ capability: "estimate-backed quote", classification: classifyRunCapability(opts.mode, true, estimateObserved), basis: opts.mode === "live" ? `guarded live transport log: ${estimateObserved} observed successful estimate operation(s)` : "mocked transport fixture (pilot mock)" });
+  capabilities.push({ capability: "normalized-vs-raw field comparison", classification: classifyRunCapability(opts.mode, allMatch, estimateObserved), basis: "harness consistency check — the adapter's own interpretation function re-applied to the captured raw estimate (shares interpretation code with the adapter, so correlated interpretation defects are NOT detectable here; independent verification is the test-only oracle exercised in test22)" });
   capabilities.push({ capability: "live commit", classification: "BLOCKED", basis: "prohibited in this pilot; harness constructs the adapter with liveCommitEnabled=false in both modes; SCQ_LIVE_COMMIT_ENABLED untouched" });
   capabilities.push({ capability: "mocked commit-path + recovery behavior", classification: "DOCUMENTATION_SUPPORTED", basis: "exercised by test21/test13 mocked suites, not by this read-only harness run" });
 
-  const calls = mock?.calls ?? [];
   return {
     generatedAt: new Date().toISOString(),
     mode: opts.mode,
@@ -206,11 +306,7 @@ export async function runPilot(opts: RunPilotOptions): Promise<PilotReport> {
     steps,
     comparisons,
     capabilities,
-    transport: {
-      totalCalls: opts.mode === "mocked" ? calls.length : -1,
-      mutatingCalls: opts.mode === "mocked" ? calls.filter((c) => c.mutating).length : 0,
-      estimateCalls: opts.mode === "mocked" ? mock!.estimateCount : -1,
-    },
+    transport: summarizeTransportLog(transportLog),
     quote: {
       id: quote.id,
       immediateNet: quote.commercialEffect.immediate?.net,
@@ -245,7 +341,10 @@ export function renderMarkdown(report: PilotReport): string {
   lines.push("|---|---|---|");
   for (const c of report.capabilities) lines.push(`| ${c.capability} | ${c.classification} | ${c.basis} |`);
   lines.push("");
-  lines.push(`Transport: ${report.transport.totalCalls} calls, ${report.transport.estimateCalls} estimate calls, **${report.transport.mutatingCalls} mutating calls**.`);
+  lines.push(`Transport: ${report.transport.totalCalls} calls, ${report.transport.estimateCalls} estimate calls, **${report.transport.mutatingCalls} mutating calls** (all counts observed in the transport log).`);
+  const ops = Object.entries(report.transport.byOperation).map(([k, v]) => `${k} ×${v}`).join(", ");
+  lines.push(`Observed operations: ${ops || "none"}.`);
+  if (report.transport.rejectedAttempts > 0) lines.push(`Disallowed operations rejected before dispatch: ${report.transport.rejectedAttempts}.`);
   return lines.join("\n") + "\n";
 }
 
