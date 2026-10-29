@@ -1,0 +1,131 @@
+{
+  "generatedAt": "2026-10-29T05:27:00.422Z",
+  "mode": "mocked",
+  "site": "pilot-test (mocked)",
+  "subscriptionRef": "pilot-sub-001",
+  "proposalDescription": "CHANGE_QUANTITY pilot-addon-vision 1 -> 21",
+  "steps": [
+    {
+      "step": "retrieve subscription",
+      "status": "pass",
+      "detail": "status=active, items=2, version=rv:1700000000000"
+    },
+    {
+      "step": "build SCQ snapshot",
+      "status": "pass",
+      "detail": "recurring=60900 USD"
+    },
+    {
+      "step": "construct proposal",
+      "status": "pass",
+      "detail": "CHANGE_QUANTITY pilot-addon-vision 1 -> 21, IMMEDIATE"
+    },
+    {
+      "step": "provider-backed quote (estimate only)",
+      "status": "pass",
+      "detail": "quote scq_cblive_4cc173008ba9ee4d; immediate.net=20000; recurring=80900"
+    },
+    {
+      "step": "field-by-field comparison (normalized vs raw)",
+      "status": "pass",
+      "detail": "6/6 fields match"
+    }
+  ],
+  "comparisons": [
+    {
+      "field": "immediate.net",
+      "providerSource": "sum(unbilled_charge_estimates[].amount) − sum(credit_note_estimates[].total)",
+      "rawDerived": 20000,
+      "normalized": 20000,
+      "match": true,
+      "note": "incurred obligation incurred by the change (never amount_due)"
+    },
+    {
+      "field": "recurring.resultingAmount",
+      "providerSource": "subscription_estimate.subscription_items[].amount (provider-stated; verified complete against the intended item set)",
+      "rawDerived": 80900,
+      "normalized": 80900,
+      "match": true,
+      "note": "post-change price level; credits do not reduce it"
+    },
+    {
+      "field": "recurring.previousAmount",
+      "providerSource": "sum of current subscription_items[].amount (provider-stated)",
+      "rawDerived": 60900,
+      "normalized": 60900,
+      "match": true
+    },
+    {
+      "field": "currency",
+      "providerSource": "subscription.currency_code",
+      "rawDerived": "USD",
+      "normalized": "USD",
+      "match": true
+    },
+    {
+      "field": "nextInvoiceEstimate isolation",
+      "providerSource": "next_invoice_estimate.total / amount_due",
+      "rawDerived": null,
+      "normalized": null,
+      "match": true,
+      "note": "next-invoice figures are metadata only; amount_due (net of credits) must never equal-by-substitution the incurred immediate"
+    },
+    {
+      "field": "provenance recorded for every determined dimension",
+      "providerSource": "adapter financialProvenance",
+      "rawDerived": {
+        "immediate": "sum(unbilled_charge_estimates[].amount) − sum(credit_note_estimates[].total)",
+        "recurring": "subscription_estimate.subscription_items[].amount (provider-stated; verified complete against the intended item set)"
+      },
+      "normalized": {
+        "immediate": "sum(unbilled_charge_estimates[].amount) − sum(credit_note_estimates[].total)",
+        "recurring": "subscription_estimate.subscription_items[].amount (provider-stated; verified complete against the intended item set)"
+      },
+      "match": true
+    }
+  ],
+  "capabilities": [
+    {
+      "capability": "retrieve subscription + snapshot",
+      "classification": "SIMULATED_PASS",
+      "basis": "mocked transport fixture (pilot mock)"
+    },
+    {
+      "capability": "estimate-backed quote",
+      "classification": "SIMULATED_PASS",
+      "basis": "mocked transport fixture (pilot mock)"
+    },
+    {
+      "capability": "normalized-vs-raw field comparison",
+      "classification": "SIMULATED_PASS",
+      "basis": "interpretChargebeeEstimate applied independently to the captured raw estimate response"
+    },
+    {
+      "capability": "live commit",
+      "classification": "BLOCKED",
+      "basis": "prohibited in this pilot; harness constructs the adapter with liveCommitEnabled=false in both modes; SCQ_LIVE_COMMIT_ENABLED untouched"
+    },
+    {
+      "capability": "mocked commit-path + recovery behavior",
+      "classification": "DOCUMENTATION_SUPPORTED",
+      "basis": "exercised by test21/test13 mocked suites, not by this read-only harness run"
+    }
+  ],
+  "transport": {
+    "totalCalls": 8,
+    "mutatingCalls": 0,
+    "estimateCalls": 1
+  },
+  "quote": {
+    "id": "scq_cblive_4cc173008ba9ee4d",
+    "immediateNet": 20000,
+    "recurringResulting": 80900,
+    "recurringPrevious": 60900,
+    "currency": "USD",
+    "provenance": {
+      "immediate": "sum(unbilled_charge_estimates[].amount) − sum(credit_note_estimates[].total)",
+      "recurring": "subscription_estimate.subscription_items[].amount (provider-stated; verified complete against the intended item set)"
+    },
+    "nextInvoiceEstimate": null
+  }
+}
