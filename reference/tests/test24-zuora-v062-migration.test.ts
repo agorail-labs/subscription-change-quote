@@ -87,6 +87,26 @@ import { freshZuoraFixture, freshZuoraCommittedTermFixture } from "./fixtures.js
 //        unreadable bound order; 24.19's premature-terminal case
 //        reworked the same way as 24.13 — attributable ⇒ VIOLATED,
 //        intervening ⇒ UNVERIFIED).
+//   Z3 — financial attribution follows the same rule: the
+//        broken-chain branch of establishCommittedEffect carried
+//        the re-read state's recurring level (130000 in 24.23 —
+//        the intervening actor's figure, where this order's own
+//        result was 120000) as this commit's DETERMINED committed
+//        actual (provider_actual), and the reconciliation's
+//        undeterminedDimensions was empty. Now: under a broken
+//        chain the committed recurring dimension is UNKNOWN with
+//        NO figure; the observed state survives only as
+//        unattributed context (resulting snapshot / reason); the
+//        bound order's immediate stays, as the scope that order
+//        establishes; undeterminedDimensions names the recurring
+//        dimension. 24.23 reworked (its 130000 expectation WAS
+//        the defect); 24.12 gained the same assertions for the
+//        matching-state chain break. establishCancelCommit was
+//        audited for the same pattern and is clean: its
+//        unverified branches record only the quoted-level
+//        candidate under UNKNOWN determinacy, and its one
+//        re-read-derived determined figure sits behind the Z2
+//        attribution gate (the D3 mismatch branch).
 
 const GENEROUS_ENVELOPE = {
   maxImmediateNetIncrease: 1_000_000,
@@ -493,7 +513,7 @@ test("Test 24.11 (M3): committed figures bind to THIS mutation's persisted order
   assert.notEqual(orders[0].id, orders[1].id);
 });
 
-test("Test 24.12 (M3): an order landing in the check->mutate window breaks attribution — COMMITTED_UNVERIFIED, figures still the bound order's", async () => {
+test("Test 24.12 (M3/Z3): an order landing in the check->mutate window breaks attribution — COMMITTED_UNVERIFIED; the immediate figure is still the bound order's, the recurring dimension is UNKNOWN", async () => {
   const { sim, sub } = freshZuoraFixture();
   const adapter = new ZuoraAdapter(sim, new QuoteStore());
   const quote = await adapter.createChangeQuote(sub.id, {
@@ -522,7 +542,23 @@ test("Test 24.12 (M3): an order landing in the check->mutate window breaks attri
   assert.equal(receipt.outcome, "COMMITTED_UNVERIFIED");
   assert.equal(receipt.reconciliation.status, "UNVERIFIED");
   const order = sim.ordersFor(sub.id)[0];
-  assert.equal(receipt.committedEffect.immediate?.net, order.netImmediate, "the figures are THIS order's persisted actuals, read by id");
+  assert.equal(receipt.committedEffect.immediate?.net, order.netImmediate, "the immediate figure is THIS order's persisted actual, read by id");
+  // Z3 (added assertions — no prior 24.12 expectation asserted
+  // the committed recurring figure): the final state happens to
+  // MATCH intent (quantity 120; the observed recurring level is
+  // the intended 120000), but the version chain is broken, so
+  // that level was not produced by this commit alone and is NOT
+  // recorded as its determined actual. Pre-Z3 this path recorded
+  // the coincidentally matching 120000 as a DETERMINED
+  // provider_actual committed figure — the same provenance
+  // defect as 24.23's 130000, with a luckier number.
+  assert.deepEqual(receipt.committedEffect.determinacy, {
+    immediateFinancialEffect: "DETERMINED",
+    recurringFinancialEffect: "UNKNOWN",
+  });
+  assert.equal(receipt.committedEffect.recurring?.resultingAmount, undefined, "Z3: a coincidentally matching observed level is still not this commit's established actual");
+  const rec12 = receipt.reconciliation;
+  assert.ok(rec12.status === "UNVERIFIED" && rec12.undeterminedDimensions.includes("recurringFinancialEffect"), "the reconciliation's undetermined dimensions match the effect's determinacy");
   assert.equal(receipt.resultingSnapshot.items[0].quantity, 120);
   assert.equal(receipt.consistencyGuarantee, "BEST_EFFORT", "the race is exactly why this never reads ATOMIC");
 });
@@ -574,7 +610,7 @@ test("Test 24.13 (M3/D3): a wrong landing ATTRIBUTABLE to this commit is a deter
   }
 });
 
-test("Test 24.23 (Z1): an intervening change after our order lands, producing a mismatching state, is UNVERIFIED — never this commit's VIOLATED", async () => {
+test("Test 24.23 (Z1/Z3): an intervening change after our order lands, producing a mismatching state, is UNVERIFIED — never this commit's VIOLATED, and its figures are not this commit's actuals", async () => {
   // This is test 24.13's PRE-Z1 construction, reclassified: the
   // wrongness is injected by _debugMutateDirectly AFTER our order
   // landed — a different actor's change. It bumps the version
@@ -609,7 +645,25 @@ test("Test 24.23 (Z1): an intervening change after our order lands, producing a 
     const order = sim.ordersFor(sub.id)[0];
     assert.equal(receipt.committedEffect.immediate?.net, order.netImmediate, "the immediate is still this commit's bound-order actual, read by id");
     assert.equal(receipt.committedEffect.immediate?.net, 20000);
-    assert.equal(receipt.committedEffect.recurring?.resultingAmount, 130000, "the recurring figure reports the observed state — labeled unattributed by the reconciliation, not asserted as this commit's result");
+    // REQUIRED REWORK (PR #14 review correction Z3): this test
+    // previously asserted committedEffect.recurring.resultingAmount
+    // === 130000 — the INTERVENING ACTOR's figure — as this
+    // commit's determined recurring actual (DETERMINED /
+    // provider_actual), on the theory that the UNVERIFIED verdict
+    // and the reason's wording neutralized the attribution. They
+    // do not: the committed effect is the financial record, and it
+    // claimed a third party's value. Under Z3 the broken-chain
+    // effect carries NO committed recurring figure: the dimension
+    // is UNKNOWN, and the observed 130000 survives only as
+    // unattributed context (the resulting snapshot below).
+    assert.equal(receipt.committedEffect.determinacy?.recurringFinancialEffect, "UNKNOWN", "Z3: no committed recurring figure is established for this commit under a broken chain");
+    assert.equal(receipt.committedEffect.recurring?.resultingAmount, undefined, "Z3: the intervening actor's 130000 is NOT carried as this commit's determined recurring actual");
+    assert.equal(receipt.committedEffect.determinacy?.immediateFinancialEffect, "DETERMINED", "the bound-order immediate remains this commit's established actual — the scope the order itself establishes");
+    assert.equal(receipt.committedEffect.provenance?.committedSource, "unestablished", "the committed effect as a whole is unestablished; the immediate dimension's own determinacy/provenance carry its narrower claim");
+    const rec23 = receipt.reconciliation;
+    assert.ok(rec23.status === "UNVERIFIED" && rec23.undeterminedDimensions.includes("recurringFinancialEffect"), "the reconciliation's undetermined dimensions match the effect's determinacy");
+    assert.equal(receipt.resultingSnapshot.items[0].quantity, 130, "the observed state is retained as snapshot context");
+    assert.equal(receipt.resultingSnapshot.billing.recurringAmount, 130000, "the observed 130000 survives ONLY as snapshot context — not as this commit's committed figure");
   }
   // Intervening wrong rate plan.
   {
@@ -631,6 +685,8 @@ test("Test 24.23 (Z1): an intervening change after our order lands, producing a 
     const receipt = await adapter.commitChangeQuote(quote.id);
     assert.equal(receipt.status, "COMMITTED_UNVERIFIED");
     assert.equal(receipt.reconciliation.status, "UNVERIFIED", "the pre-Z1 code returned VIOLATED here, assigning another actor's edit to this commit");
+    assert.equal(receipt.committedEffect.determinacy?.recurringFinancialEffect, "UNKNOWN", "Z3: no committed recurring figure under a broken chain");
+    assert.equal(receipt.committedEffect.recurring?.resultingAmount, undefined, "Z3: the observed post-intervention recurring level is not this commit's actual");
   }
   // The matching-state counterpart — an intervening change whose
   // final state happens to match intent — is test 24.12 (the
