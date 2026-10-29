@@ -63,6 +63,30 @@ import { freshZuoraFixture, freshZuoraCommittedTermFixture } from "./fixtures.js
 //     lives outside the order): immediate UNKNOWN, commit refused
 //     pre-mutation — never a fabricated zero and never
 //     NOT_APPLICABLE.
+// PR #14 review corrections (Z1/Z2) — attribution BEFORE
+// classification, in both establishment paths:
+//   Z1 — establishCommittedEffect checked state contradictions
+//        before attribution, so an intervening actor's change that
+//        produced a mismatching state was returned as THIS commit's
+//        verified VIOLATED (probe Z1 at f96b957: COMMITTED /
+//        COMMITTED_AND_VERIFIED / VIOLATED under a broken version
+//        chain). Now: broken chain ⇒ COMMITTED_UNVERIFIED /
+//        UNVERIFIED regardless of the observed state (24.23; the
+//        matching-state case is 24.12); VIOLATED requires the
+//        unbroken chain plus a contradiction produced by this
+//        commit's own order (24.13, reworked to the sim's
+//        misexecution hooks — its previous _debugMutateDirectly
+//        construction encoded the defect).
+//   Z2 — establishCancelCommit verified status/date alone, never
+//        the bound order or the version chain, so another actor's
+//        cancellation could verify as this commit's OK (probe Z2).
+//        Now the pure-CANCEL path binds to the persisted order id,
+//        checks the order's action identity against the dispatched
+//        sequence, and requires the unbroken +1 chain before any
+//        OK/VIOLATED verdict (24.24 intervening order, 24.25
+//        unreadable bound order; 24.19's premature-terminal case
+//        reworked the same way as 24.13 — attributable ⇒ VIOLATED,
+//        intervening ⇒ UNVERIFIED).
 
 const GENEROUS_ENVELOPE = {
   maxImmediateNetIncrease: 1_000_000,
@@ -503,8 +527,63 @@ test("Test 24.12 (M3): an order landing in the check->mutate window breaks attri
   assert.equal(receipt.consistencyGuarantee, "BEST_EFFORT", "the race is exactly why this never reads ATOMIC");
 });
 
-test("Test 24.13 (M3/D3): a wrong landing is a determined VIOLATED — committed figures report the observed state, never the preview", async () => {
+test("Test 24.13 (M3/D3): a wrong landing ATTRIBUTABLE to this commit is a determined VIOLATED — committed figures report the observed state, never the preview", async () => {
+  // REQUIRED REWORK (PR #14 review correction Z1): this test
+  // previously produced the wrong landing by calling
+  // _debugMutateDirectly AFTER createOrder returned — another
+  // actor's change, which bumps the version and BREAKS the
+  // attribution chain. Under Z1 that construction is no longer a
+  // verified violation of this commit (it is test 24.23's
+  // intervening-change case, classified UNVERIFIED). The wrong
+  // landing here is now produced by THIS commit's own order
+  // misapplying its actions (the sim's misexecution hooks): the
+  // version advances by exactly our order's +1, the chain is
+  // unbroken, and the contradiction is provably this commit's.
   // Wrong final quantity.
+  {
+    const { sim, sub } = freshZuoraFixture();
+    const adapter = new ZuoraAdapter(sim, new QuoteStore());
+    const quote = await adapter.createChangeQuote(sub.id, {
+      changes: [{ action: "CHANGE_QUANTITY", itemId: "rpc_1", quantity: 120 }],
+      effectiveIntent: { type: "IMMEDIATE" },
+      acceptanceEnvelope: GENEROUS_ENVELOPE,
+    });
+    sim._debugWrongQuantityOnNextOrder = 130; // our order applies 130 against its dispatched 120
+    const receipt = await adapter.commitChangeQuote(quote.id);
+    assert.equal(receipt.status, "COMMITTED");
+    assert.equal(receipt.outcome, "COMMITTED_AND_VERIFIED", "a determined negative verification is still a verification (D3)");
+    assert.equal(receipt.reconciliation.status, "VIOLATED");
+    assert.equal(receipt.committedEffect.recurring?.resultingAmount, 130000, "the observed state, not the previewed 120000 (probe D's false OK is impossible)");
+    assert.equal(receipt.committedEffect.provenance?.committedSource, "provider_actual");
+    assert.equal(sim.get(sub.id).version, 2, "the version advanced by exactly this order's +1 — attribution unbroken");
+  }
+  // Wrong final rate plan.
+  {
+    const { sim, sub } = freshZuoraFixture();
+    const adapter = new ZuoraAdapter(sim, new QuoteStore());
+    const quote = await adapter.createChangeQuote(sub.id, {
+      changes: [{ action: "CHANGE_PLAN", itemId: "rpc_1", offeringRef: "plan:pro:monthly" }],
+      effectiveIntent: { type: "IMMEDIATE" },
+      acceptanceEnvelope: GENEROUS_ENVELOPE,
+    });
+    sim._debugWrongRatePlanOnNextOrder = "ratePlan_seat_basic_monthly"; // our order adds the basic plan against its dispatched pro swap
+    const receipt = await adapter.commitChangeQuote(quote.id);
+    assert.equal(receipt.reconciliation.status, "VIOLATED");
+    assert.equal(receipt.status, "COMMITTED");
+    assert.equal(sim.get(sub.id).version, 2, "the version advanced by exactly this order's +1 — attribution unbroken");
+  }
+});
+
+test("Test 24.23 (Z1): an intervening change after our order lands, producing a mismatching state, is UNVERIFIED — never this commit's VIOLATED", async () => {
+  // This is test 24.13's PRE-Z1 construction, reclassified: the
+  // wrongness is injected by _debugMutateDirectly AFTER our order
+  // landed — a different actor's change. It bumps the version
+  // (2 -> 3), breaking the attribution chain, so the observed
+  // contradiction cannot be assigned to this commit even though
+  // the state genuinely contradicts intent. (Failing-first: at
+  // f96b957 this exact construction returned COMMITTED /
+  // COMMITTED_AND_VERIFIED / VIOLATED — probe Z1.)
+  // Intervening wrong quantity.
   {
     const { sim, sub } = freshZuoraFixture();
     const adapter = new ZuoraAdapter(sim, new QuoteStore());
@@ -522,13 +601,17 @@ test("Test 24.13 (M3/D3): a wrong landing is a determined VIOLATED — committed
       return out;
     }) as typeof realCreateOrder;
     const receipt = await adapter.commitChangeQuote(quote.id);
-    assert.equal(receipt.status, "COMMITTED");
-    assert.equal(receipt.outcome, "COMMITTED_AND_VERIFIED", "a determined negative verification is still a verification (D3)");
-    assert.equal(receipt.reconciliation.status, "VIOLATED");
-    assert.equal(receipt.committedEffect.recurring?.resultingAmount, 130000, "the observed state, not the previewed 120000 (probe D's false OK is impossible)");
-    assert.equal(receipt.committedEffect.provenance?.committedSource, "provider_actual");
+    assert.equal(receipt.status, "COMMITTED_UNVERIFIED");
+    assert.equal(receipt.outcome, "COMMITTED_UNVERIFIED", "an unattributable contradiction is not a verified failure of this commit");
+    assert.equal(receipt.reconciliation.status, "UNVERIFIED");
+    assert.match(receipt.reconciliation.reason ?? "", /cannot be attributed to\s+it/);
+    assert.match(receipt.reconciliation.reason ?? "", /unattributed context/, "the observed mismatch is recorded, as context, without assigning its cause");
+    const order = sim.ordersFor(sub.id)[0];
+    assert.equal(receipt.committedEffect.immediate?.net, order.netImmediate, "the immediate is still this commit's bound-order actual, read by id");
+    assert.equal(receipt.committedEffect.immediate?.net, 20000);
+    assert.equal(receipt.committedEffect.recurring?.resultingAmount, 130000, "the recurring figure reports the observed state — labeled unattributed by the reconciliation, not asserted as this commit's result");
   }
-  // Wrong final rate plan.
+  // Intervening wrong rate plan.
   {
     const { sim, sub } = freshZuoraFixture();
     const adapter = new ZuoraAdapter(sim, new QuoteStore());
@@ -546,9 +629,12 @@ test("Test 24.13 (M3/D3): a wrong landing is a determined VIOLATED — committed
       return out;
     }) as typeof realCreateOrder;
     const receipt = await adapter.commitChangeQuote(quote.id);
-    assert.equal(receipt.reconciliation.status, "VIOLATED");
-    assert.equal(receipt.status, "COMMITTED");
+    assert.equal(receipt.status, "COMMITTED_UNVERIFIED");
+    assert.equal(receipt.reconciliation.status, "UNVERIFIED", "the pre-Z1 code returned VIOLATED here, assigning another actor's edit to this commit");
   }
+  // The matching-state counterpart — an intervening change whose
+  // final state happens to match intent — is test 24.12 (the
+  // check->mutate window): also UNVERIFIED, never a verified OK.
 });
 
 test("Test 24.14 (P1): verification unavailable after a landed order — COMMITTED_UNVERIFIED recorded from the mutation response alone", async () => {
@@ -747,8 +833,41 @@ test("Test 24.19 (P3): a future-dated cancellation verifies as SCHEDULED against
     assert.equal(receipt.committedEffect.provenance?.committedSource, "defined_equal_exact");
     assert.match(receipt.committedEffect.provenance?.recurring ?? "", /SCHEDULED/);
   }
-  // Premature termination: the provider ended the subscription NOW
-  // instead of at the quoted future date.
+  // Premature termination ATTRIBUTABLE to this commit: OUR order
+  // itself terminates the subscription NOW instead of at the
+  // quoted future date (the sim's misexecution hook — the version
+  // advances by exactly our order's +1 and the bound order's
+  // identity/chain verify, so the mis-dated termination is provably
+  // this commit's own).
+  //
+  // REQUIRED REWORK (PR #14 review correction Z2): this case
+  // previously produced the terminal state via _debugMutateDirectly
+  // AFTER the order landed — another actor's change, which breaks
+  // attribution. That construction is the third case below and is
+  // now UNVERIFIED; it was a verified VIOLATED at f96b957 only
+  // because the cancel path never checked attribution at all.
+  {
+    const { sim, sub } = freshZuoraFixture();
+    const adapter = new ZuoraAdapter(sim, new QuoteStore());
+    const quote = await adapter.createChangeQuote(sub.id, {
+      changes: [{ action: "CANCEL" }],
+      effectiveIntent: { type: "DATE", at: futureDate },
+      acceptanceEnvelope: GENEROUS_ENVELOPE,
+    });
+    sim._debugCancelEffectiveNowOnNextOrder = true; // our cancel order terminates immediately, against its quoted 2026-08-21 date
+    const receipt = await adapter.commitChangeQuote(quote.id);
+    assert.equal(receipt.status, "COMMITTED");
+    assert.equal(receipt.outcome, "COMMITTED_AND_VERIFIED");
+    assert.equal(receipt.reconciliation.status, "VIOLATED", "a premature termination attributable to this commit is a determined contradiction, not a verified schedule");
+    assert.equal(receipt.committedEffect.recurring?.resultingAmount, 100000, "the committed figure reports the observed state, not a fabricated post-cancel zero");
+    assert.equal(sim.get(sub.id).version, 2, "the version advanced by exactly this order's +1 — attribution unbroken");
+  }
+  // Premature terminal state produced by an INTERVENING actor: our
+  // order scheduled the cancellation correctly at the quoted date,
+  // then another actor's change forced the terminal state (and
+  // bumped the version). The observed state contradicts the quoted
+  // schedule, but it cannot be attributed to this commit — the
+  // outcome is attribution-uncertain, NOT a verified VIOLATED.
   {
     const { sim, sub } = freshZuoraFixture();
     const adapter = new ZuoraAdapter(sim, new QuoteStore());
@@ -766,11 +885,81 @@ test("Test 24.19 (P3): a future-dated cancellation verifies as SCHEDULED against
       return out;
     }) as typeof realCreateOrder;
     const receipt = await adapter.commitChangeQuote(quote.id);
-    assert.equal(receipt.status, "COMMITTED");
-    assert.equal(receipt.outcome, "COMMITTED_AND_VERIFIED");
-    assert.equal(receipt.reconciliation.status, "VIOLATED", "a premature termination is a determined contradiction, not a verified schedule");
-    assert.equal(receipt.committedEffect.recurring?.resultingAmount, 100000, "the committed figure reports the observed state, not a fabricated post-cancel zero");
+    assert.equal(receipt.status, "COMMITTED_UNVERIFIED");
+    assert.equal(receipt.outcome, "COMMITTED_UNVERIFIED", "an unattributable contradiction is not a verified failure of this commit");
+    assert.equal(receipt.reconciliation.status, "UNVERIFIED");
+    assert.match(receipt.reconciliation.reason ?? "", /cannot be attributed to this commit/);
   }
+});
+
+test("Test 24.24 (Z2): an intervening ORDER after our cancel order — cancellation state matches, chain broken — is UNVERIFIED, never a verified OK", async () => {
+  const { sim, sub } = freshZuoraFixture();
+  const adapter = new ZuoraAdapter(sim, new QuoteStore());
+  const quote = await adapter.createChangeQuote(sub.id, {
+    changes: [{ action: "CANCEL" }],
+    effectiveIntent: { type: "DATE", at: new Date("2026-08-21T00:00:00Z").toISOString() },
+    acceptanceEnvelope: GENEROUS_ENVELOPE,
+  });
+  // Another actor's ORDER lands strictly after our cancel order:
+  // a quantity change that leaves the cancellation fields exactly
+  // as quoted (cancelledDate 2026-08-21, still Active). The
+  // cancel-relevant state matches the quoted schedule perfectly —
+  // but the version chain is broken (our order produced version 2,
+  // the re-read is at 3) and the latest order is not ours, so the
+  // observed cancellation cannot be attributed to this commit
+  // alone. (Failing-first: at f96b957 this returned COMMITTED /
+  // COMMITTED_AND_VERIFIED / OK — probe Z2 — because the cancel
+  // path never read the bound order or the version chain.)
+  const realCreateOrder = sim.createOrder.bind(sim);
+  let injected = false;
+  sim.createOrder = ((...args: Parameters<typeof realCreateOrder>) => {
+    const out = realCreateOrder(...args);
+    if (!injected) {
+      injected = true;
+      realCreateOrder(sub.id, [
+        { type: "UpdateProduct", effectiveDate: "2026-08-01", ratePlanId: "rp_1", productRatePlanChargeId: "rpc_1", quantity: 130 },
+      ]);
+    }
+    return out;
+  }) as typeof realCreateOrder;
+  const receipt = await adapter.commitChangeQuote(quote.id);
+  assert.equal(sim.ordersFor(sub.id).length, 2, "our cancel order plus the intervening order");
+  assert.equal(receipt.status, "COMMITTED_UNVERIFIED");
+  assert.equal(receipt.outcome, "COMMITTED_UNVERIFIED", "a matching cancellation state under a broken chain is not a verified success of this commit");
+  assert.equal(receipt.reconciliation.status, "UNVERIFIED");
+  assert.match(receipt.reconciliation.reason ?? "", /cannot be attributed to this commit/);
+  assert.equal(receipt.committedEffect.provenance?.committedSource, "unestablished");
+  assert.deepEqual(receipt.committedEffect.determinacy, {
+    immediateFinancialEffect: "UNKNOWN",
+    recurringFinancialEffect: "UNKNOWN",
+  });
+});
+
+test("Test 24.25 (Z2): the bound order unreadable — pure CANCEL records COMMITTED_UNVERIFIED from data in hand, never OK/VIOLATED", async () => {
+  const { sim, sub } = freshZuoraFixture();
+  const adapter = new ZuoraAdapter(sim, new QuoteStore());
+  const quote = await adapter.createChangeQuote(sub.id, {
+    changes: [{ action: "CANCEL" }],
+    effectiveIntent: { type: "TERM_END" },
+    acceptanceEnvelope: GENEROUS_ENVELOPE,
+  });
+  sim._debugFailOrderReads = true; // the persisted order cannot be read back at all
+  const receipt = await adapter.commitChangeQuote(quote.id);
+  assert.equal(receipt.status, "COMMITTED_UNVERIFIED");
+  assert.equal(receipt.outcome, "COMMITTED_UNVERIFIED");
+  assert.equal(receipt.reconciliation.status, "UNVERIFIED", "without the bound order there is nothing to bind the verification to");
+  assert.match(receipt.reconciliation.reason ?? "", /could not be read back/);
+  assert.equal(receipt.committedEffect.provenance?.committedSource, "unestablished", "the candidate is built from the mutation response and the stored quote — no further reads (P1)");
+  assert.deepEqual(receipt.committedEffect.determinacy, {
+    immediateFinancialEffect: "UNKNOWN",
+    recurringFinancialEffect: "UNKNOWN",
+  });
+  // The cancellation DID land in the provider record — the
+  // unverified classification is about attribution/evidence, not
+  // about doubting the mutation's response.
+  sim._debugFailOrderReads = false;
+  assert.equal(sim.ordersFor(sub.id).length, 1);
+  assert.equal(sim.get(sub.id).cancelledDate, quote.commercialEffect.effectiveAt);
 });
 
 test("Test 24.20 (§6.10): replay returns the ORIGINAL receipt even after a later verification transition", async () => {
