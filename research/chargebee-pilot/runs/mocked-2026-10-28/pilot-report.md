@@ -1,13 +1,13 @@
 # Chargebee pilot run — mocked mode
 
-Generated: 2026-10-29T13:03:31.868Z · Site: pilot-test (mocked) · Subscription: pilot-sub-001
+Generated: 2026-10-29T13:28:08.313Z · Site: pilot-test (mocked) · Subscription: pilot-sub-001
 Proposal: CHANGE_QUANTITY pilot-addon-vision 1 -> 21
 
 ## Steps
 - [pass] retrieve subscription — status=active, items=2, version=rv:1700000000000
 - [pass] build SCQ snapshot — recurring=60900 USD
 - [pass] construct proposal — CHANGE_QUANTITY pilot-addon-vision 1 -> 21, IMMEDIATE
-- [pass] provider-backed quote (estimate only) — quote scq_cblive_2f8d9505c502485a; immediate.net=20000; recurring=80900
+- [pass] provider-backed quote (estimate only) — quote scq_cblive_cf1490c71e2a3aa1; immediate.net=20000; recurring=80900
 - [pass] field-by-field comparison (normalized vs raw) — 6/6 fields match
 
 ## Field-by-field comparison (normalized quote vs raw provider estimate)

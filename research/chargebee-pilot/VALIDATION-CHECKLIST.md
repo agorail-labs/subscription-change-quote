@@ -20,9 +20,10 @@ cd reference
 rm -rf dist && npm test
 ```
 
-- [ ] **256/256 pass, 0 fail** (227 pre-pilot baseline + 20 in
+- [ ] **261/261 pass, 0 fail** (227 pre-pilot baseline + 20 in
       `tests/test21-chargebee-pilot.test.ts` + 9 in
-      `tests/test22-chargebee-pilot-corrections.test.ts`; 247/247 was
+      `tests/test22-chargebee-pilot-corrections.test.ts` + 5 in
+      `tests/test23-chargebee-pilot-rereview.test.ts`; 247/247 was
       the count at pilot delivery, before the PR #13 corrections).
 - [ ] `npm run smoke:pack` → ESM import OK, TS consumer OK, tarball OK.
 - [ ] Freeze scope: `git diff main --stat` shows NO changes under
@@ -94,7 +95,32 @@ npm run build && node --test dist/tests/test22-chargebee-pilot-corrections.test.
       paths through the guarded live transport → rejected with
       `OPERATION_NOT_ALLOWED` before dispatch; allowed reads pass.
 - [ ] 22-g3/g4/g5: report counts equal the transport's own call log;
-      an empty observed log never classifies `LIVE_PASS`.
+      an empty observed log never classifies `LIVE_PASS`. (22-g4 was
+      reworked in re-review round 2 — see §4c: it now asserts
+      SIMULATED_PASS for the injected run, not LIVE_PASS.)
+
+## 4c. Re-review correction spot-checks (test23 — F1/F2)
+
+```bash
+npm run build && node --test dist/tests/test23-chargebee-pilot-rereview.test.js
+```
+
+- [ ] 5/5 pass.
+- [ ] 23-f1a: a site ending in `-test` but NOT explicitly approved
+      for the run → preflight fails (`LIVE_PREFLIGHT_FAILED`) and a
+      recording stub shows **zero** requests dispatched.
+- [ ] 23-f1b: an explicit per-run approved-site entry exactly equal
+      to the configured site + a synthetic subscription id → preflight
+      passes.
+- [ ] 23-f1c: an approved-list entry that does not match the
+      configured site → fails, zero dispatch; approving a
+      production-shaped slug still fails the `-test` sanity property.
+- [ ] 23-f2a: a successful run over an INJECTED transport classifies
+      SIMULATED_PASS, and the string `LIVE_PASS` appears **nowhere**
+      in the serialized JSON report or its Markdown rendering.
+- [ ] 23-f2b: `LIVE_PASS` is gated to transport origin `real` with
+      observed successful operations; injected origin yields only
+      SIMULATED_PASS / UNVERIFIED.
 
 ## 5. Optional live read/estimate reproduction (separate, optional)
 
@@ -103,12 +129,18 @@ Only with a synthetic **test** site you control:
 - [ ] Create a Full-Access key for the test site; export
       `CHARGEBEE_SITE`, `CHARGEBEE_API_KEY`,
       `CHARGEBEE_TEST_SUBSCRIPTION_ID` (a synthetic subscription with a
-      flat_fee plan + per_unit addon). The site slug must carry the
-      `-test` designation (or be on the harness's explicit allowlist)
-      and the subscription id must carry a synthetic designation
-      (`cbdemo_`, `pilot-`, `synthetic-`, `test-` prefix); otherwise
-      the live preflight fails closed with `LIVE_PREFLIGHT_FAILED`
-      before any request is made (test 22-g1).
+      flat_fee plan + per_unit addon) AND
+      `SCQ_PILOT_APPROVED_TEST_SITES` naming the exact
+      `CHARGEBEE_SITE` slug. Live preflight performs
+      configuration/approval validation: it requires BOTH the `-test`
+      designation (a sanity property — a suffix alone is NOT
+      approval) AND that explicit per-run approved-site entry exactly
+      matching the site, and the subscription id must carry a
+      synthetic designation (`cbdemo_`, `pilot-`, `synthetic-`,
+      `test-` prefix); otherwise preflight fails closed with
+      `LIVE_PREFLIGHT_FAILED` before any request is made (tests
+      22-g1, 23-f1a–f1c). This validates operator configuration; it
+      is not independent provider attestation of the tenant.
 - [ ] `npm run pilot:chargebee -- --live --out <dir>` → retrieve/quote
       classify `LIVE_PASS` only if the steps actually pass against the
       real site; commit still classifies `BLOCKED`.

@@ -38,7 +38,9 @@ Command: `npm run pilot:chargebee -- --out research/chargebee-pilot/runs/mocked-
 Full suite at this evidence point: **247/247** (227 pre-pilot baseline +
 20 test21), fresh clean build; smoke pack OK; neutrality OK; freeze
 scope clean. After the PR #13 review corrections (§C) the suite
-stands at **256/256** (test22 added 9 tests).
+stood at **256/256** (test22 added 9 tests); after the re-review
+corrections (§D, F1/F2) it stands at **261/261** (test23 added
+5 tests).
 
 ## B. Historical live evidence — Oct 27, 2026 (cited)
 
@@ -107,7 +109,9 @@ in the harness comparison.
 
 **R3 — live-read safeguards are now enforced, not described.** (a)
 Preflight: before any live request, the harness requires an approved
-test-site configuration (`-test` designation or explicit allowlist)
+test-site configuration (`-test` designation or explicit allowlist —
+the approval rule in this sentence was SUPERSEDED by correction F1
+in §D: a `-test` suffix alone no longer approves a site)
 AND a synthetic-designated test subscription id, failing closed with
 the named error `LIVE_PREFLIGHT_FAILED`; 22-g1 covers the failure
 modes (production-looking site, missing id, non-synthetic id) with a
@@ -126,7 +130,72 @@ from observed successful operations (`classifyRunCapability`); an
 empty log can never emit LIVE_PASS. 22-g3: mocked-mode counts match
 the fixture's own call log exactly. 22-g4: the live counting/
 classification logic exercised against the stubbed network (a logic
-test, not live evidence). 22-g5 pins the classification gate.
+test, not live evidence — and, per correction F2 in §D, 22-g4 was
+reworked because it asserted LIVE_PASS from that stub). 22-g5 pins
+the classification gate.
+
+## D. Re-review corrections (PR #13, round 2) — F1, F2
+
+Two further defects from re-review of this PR were corrected. All
+correction evidence is SIMULATED_PASS against mocked/stub transports
+(test23, 5 tests, plus the reworked 22-g4/22-g5) — no live calls were
+made; no credentials exist in this environment. The mocked run's
+classifications in §A are UNCHANGED (they were already
+SIMULATED_PASS; the regenerated artifact only gains a
+`transportOrigin: "mocked"` field, plus timestamp/quote-id churn).
+
+**F1 — test-site approval was a naming convention.** At the
+pre-correction head, `isApprovedTestSite` accepted any slug ending
+in `-test`, and preflight then described it as an approved site.
+Failing-first probe (pre-fix build): `isApprovedTestSite("sneaky-test")`
+returned `true` and `assertLivePilotPreflight` PASSED for that slug
+with no explicit approval of any kind. A suffix is not proof of
+tenant approval or test mode. Resolution: preflight now requires an
+**explicit per-run approved-site entry that EXACTLY equals
+`CHARGEBEE_SITE`** — supplied via the `SCQ_PILOT_APPROVED_TEST_SITES`
+environment variable (comma-separated exact slugs) or an
+`approvedTestSites`/`approvedSite` parameter to the harness — in
+addition to the `-test` designation, which remains only as a sanity
+property, and the retained synthetic-subscription guard. Failure is
+still `LIVE_PREFLIGHT_FAILED` before any request. All wording that
+called suffix-matching "approved/verified" now describes this as
+**configuration/approval validation** of operator-supplied
+configuration — it is not independent provider attestation that the
+tenant is a test tenant. No secrets appear in any artifact (site
+identifiers are configuration, not credentials). Regressions
+(test23): 23-f1a — a `-test`-suffixed but non-approved site fails
+preflight with **zero dispatch** (recording stub); 23-f1b — an
+explicitly approved exact site + synthetic subscription id passes;
+23-f1c — an approved-list entry that does not match the configured
+site fails with zero dispatch, and explicitly approving a
+production-shaped slug still fails the `-test` sanity property.
+22-g1 gained a non-approved-site failure case and its passing case
+now supplies the explicit approval (intent unchanged).
+
+**F2 — a stubbed live-path run could produce LIVE_PASS.** At the
+pre-correction head, test 22-g4 injected the pilot fixture as
+`runPilot({ mode: "live", networkTransport })` and asserted
+`LIVE_PASS` from the observed stub calls — that assertion is itself
+the pre-fix evidence. A call log proves dispatch through the
+injected transport, not origin from a live provider. Resolution:
+classification now distinguishes **transport origin**.
+`classifyRunCapability` takes a `transportOrigin` (`"real"` |
+`"injected"`), threaded through the harness, and every report
+records its `transportOrigin`. An injected-transport run classifies
+successful capabilities **SIMULATED_PASS** (UNVERIFIED when the step
+failed or no operation was observed) — never `LIVE_PASS` or
+`LIVE_FAIL`. `LIVE_PASS` is issuable only on the real configured
+network path: mode live, NO injected transport (the internally
+constructed guarded transport over the real network transport),
+preflight passed, and observed successful operations present.
+**Disclosed required test change:** 22-g4's old `LIVE_PASS`
+assertions contradicted the corrected semantics and were reworked —
+it now asserts SIMULATED_PASS for the successful injected run,
+preserves all of its observed-count assertions, and scans the
+serialized report for `LIVE_PASS`. 23-f2a repeats the scan over both
+the JSON report and its Markdown rendering; 23-f2b pins the gate
+(LIVE_PASS only for real origin with observed operations). Test
+injection remains available for the safeguard tests (22-g2 etc.).
 
 ## Classification discipline
 

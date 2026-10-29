@@ -12,8 +12,11 @@ Protocol design: #7.
   quote → field-by-field comparison → structured report**.
 - It is **read/estimate only**. The harness never enables live commit in
   either mode, and `SCQ_LIVE_COMMIT_ENABLED` is never touched.
-- Mocked results are classified **SIMULATED_PASS**; live results are
-  classified only when a run actually reaches a verified test site.
+- Mocked results are classified **SIMULATED_PASS**. A run over an
+  injected (stubbed) transport is likewise simulated evidence and can
+  never classify LIVE_PASS; live classifications are issued only on
+  the real configured network path, after preflight, with observed
+  successful operations.
   Nothing here claims production compatibility or provider endorsement.
 
 ## Layout
@@ -21,10 +24,11 @@ Protocol design: #7.
 | Path | Content |
 |---|---|
 | `reference/src/live/pilot/run-pilot.ts` | The harness (library + CLI) and the field-comparison engine |
-| `reference/src/live/pilot/live-guard.ts` | Live safeguards: preflight contract (approved test site + synthetic subscription id) and the read/estimate operation allowlist enforced at the transport |
+| `reference/src/live/pilot/live-guard.ts` | Live safeguards: preflight contract (explicit per-run approved site + synthetic subscription id) and the read/estimate operation allowlist enforced at the transport |
 | `reference/src/live/pilot/mock-transport.ts` | Fixture-driven mocked Chargebee transport with scriptable faults |
 | `reference/tests/test21-chargebee-pilot.test.ts` | Harness, negative, and recovery tests (all mocked) |
 | `reference/tests/test22-chargebee-pilot-corrections.test.ts` | PR #13 review-correction tests: independent oracle, source separation, live safeguards (all mocked/stubbed) |
+| `reference/tests/test23-chargebee-pilot-rereview.test.ts` | PR #13 re-review tests (F1/F2): explicit site approval, transport-origin classification (all mocked/stubbed) |
 | `reference/tests/oracles/chargebee-estimate-oracle.ts` | Test-only independent interpretation oracle (imports no adapter code) |
 | `research/chargebee-pilot/PROVENANCE-MATRIX.md` | Field-level financial provenance matrix |
 | `research/chargebee-pilot/COMMIT-RECOVERY-SAFETY.md` | Commit/recovery safety design + go/no-go inputs |
@@ -38,7 +42,7 @@ Protocol design: #7.
 From `reference/`:
 
 ```bash
-npm test                                   # full suite (256 tests after the PR #13 corrections; 247 at pilot delivery)
+npm test                                   # full suite (261 tests after the PR #13 corrections + re-review; 247 at pilot delivery)
 npm run pilot:chargebee                    # mocked run, printed report
 npm run pilot:chargebee -- --out ../research/chargebee-pilot/runs/<name>   # also write JSON + MD
 npm run pilot:chargebee -- --live          # live read/estimate run (see below)
@@ -54,8 +58,11 @@ Live mode requires `--live` **and** all of the following in the
 environment at run time:
 
 - `CHARGEBEE_SITE` — a **test** site slug (never a production tenant):
-  it must carry the `-test` designation or be on the harness's
-  explicit allowlist
+  it must carry the `-test` designation (a sanity property only)
+- `SCQ_PILOT_APPROVED_TEST_SITES` — the explicit per-run approval:
+  a comma-separated list of exact site slugs, one of which must
+  EXACTLY equal `CHARGEBEE_SITE`. A `-test` suffix alone is not
+  approval, and there is no default approved site.
 - `CHARGEBEE_API_KEY` — a Full-Access key **for that test site**
 - `CHARGEBEE_TEST_SUBSCRIPTION_ID` — a synthetic test subscription,
   carrying a synthetic designation (`cbdemo_`, `pilot-`, `synthetic-`,
@@ -63,10 +70,15 @@ environment at run time:
 
 Without them the run classifies live capabilities **BLOCKED**, lists the
 missing variables, and performs **no network call** (test 21-p2). A
-configuration that is present but unverified (production-looking site,
-non-synthetic subscription id) fails the live preflight closed with
-`LIVE_PREFLIGHT_FAILED` before any request is constructed (test
-22-g1). With a verified configuration, requests flow through a guarded
+configuration that is present but fails configuration/approval
+validation (production-looking site, a `-test` site with no explicit
+per-run approval entry exactly matching it, a mismatched approval
+entry, or a non-synthetic subscription id) fails the live preflight
+closed with `LIVE_PREFLIGHT_FAILED` before any request is constructed
+(tests 22-g1, 23-f1a–f1c). This validation checks the operator's
+configuration; it is not independent provider attestation that the
+tenant is a test tenant. With a configuration that passes it,
+requests flow through a guarded
 transport that permits only subscription retrieve, item-price reads,
 and the subscription estimate — any other operation is rejected with
 `OPERATION_NOT_ALLOWED` before dispatch (test 22-g2) — and the
@@ -74,7 +86,10 @@ harness runs retrieve + snapshot + quote + comparison against the
 real test site, still read/estimate only; commit stays BLOCKED.
 Report transport counts are the counts observed in that transport's
 call log, and a `LIVE_PASS` classification requires the corresponding
-operations to appear in it (tests 22-g3–g5).
+operations to appear in it AND the transport origin to be the real
+configured network path: a run over an injected transport (as in the
+safeguard tests) classifies SIMULATED_PASS, never LIVE_PASS (tests
+22-g3–g5, 23-f2a/f2b).
 
 ## Evidence discipline
 

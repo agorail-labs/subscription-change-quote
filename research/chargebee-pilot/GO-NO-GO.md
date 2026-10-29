@@ -31,8 +31,9 @@ Justification, from evidence rather than assertion:
   (21-c1), stale/expired refusals with zero mutating calls (21-c2/c3),
   lost-response discipline (21-c6), and refusal to issue a verified
   receipt on silently-wrong landed state (21-c7/c9).
-- The full suite is green from a clean build (**256/256** after the
-  PR #13 corrections; 247/247 at delivery), the package smoke passes,
+- The full suite is green from a clean build (**261/261** after the
+  PR #13 corrections and re-review corrections; 247/247 at delivery),
+  the package smoke passes,
   and the diff touches no frozen file.
 
 ## Decision 2 — Controlled test-site commit: **NO-GO** (not ready to propose yet)
@@ -58,6 +59,15 @@ The PR #13 live-read safeguards (preflight contract + transport
 allowlist, tests 22-g1/g2) harden the read path; they do not change
 this decision — condition 3 concerns an executed preflight for a
 specific COMMIT, which has not been run.
+
+The re-review corrections (EVIDENCE-REPORT.md §D) likewise do not
+change this decision: F1 makes the read-path preflight an explicit
+per-run approval check (configuration/approval validation, not
+provider attestation) and F2 confines LIVE_PASS to the real network
+path, so stubbed runs can no longer be mislabeled as live evidence.
+Both strengthen the evidence for Decision 1; neither is a step
+toward authorizing a commit, and the commit NO-GO above is
+unaffected.
 
 A controlled test-site commit **can be proposed** for separate
 authorization once conditions 1–4 are satisfied and evidenced; the

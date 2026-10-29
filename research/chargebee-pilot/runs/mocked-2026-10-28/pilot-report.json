@@ -1,5 +1,5 @@
 {
-  "generatedAt": "2026-10-29T13:03:31.868Z",
+  "generatedAt": "2026-10-29T13:28:08.313Z",
   "mode": "mocked",
   "site": "pilot-test (mocked)",
   "subscriptionRef": "pilot-sub-001",
@@ -23,7 +23,7 @@
     {
       "step": "provider-backed quote (estimate only)",
       "status": "pass",
-      "detail": "quote scq_cblive_2f8d9505c502485a; immediate.net=20000; recurring=80900"
+      "detail": "quote scq_cblive_cf1490c71e2a3aa1; immediate.net=20000; recurring=80900"
     },
     {
       "step": "field-by-field comparison (normalized vs raw)",
@@ -122,8 +122,9 @@
     },
     "rejectedAttempts": 0
   },
+  "transportOrigin": "mocked",
   "quote": {
-    "id": "scq_cblive_2f8d9505c502485a",
+    "id": "scq_cblive_cf1490c71e2a3aa1",
     "immediateNet": 20000,
     "recurringResulting": 80900,
     "recurringPrevious": 60900,
