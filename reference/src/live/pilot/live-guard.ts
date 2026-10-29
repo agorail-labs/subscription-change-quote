@@ -5,10 +5,16 @@
 // the harness:
 //
 //   (a) PREFLIGHT — before any live network request is constructed,
-//       the run must present an explicitly approved TEST-site
-//       configuration AND a synthetic subscription identifier
-//       (assertLivePilotPreflight). Anything missing or unverified
-//       fails closed with a named PilotLivePreflightError.
+//       the run must present a TEST-site configuration that was
+//       EXPLICITLY approved for this run (a per-run approved-site
+//       entry exactly matching CHARGEBEE_SITE; the `-test` suffix is
+//       only an additional sanity property, never approval on its
+//       own) AND a synthetic subscription identifier
+//       (assertLivePilotPreflight). This is configuration/approval
+//       validation of the operator-supplied configuration — it is
+//       NOT independent provider attestation of the tenant's mode.
+//       Anything missing or unapproved fails closed with a named
+//       PilotLivePreflightError.
 //
 //   (b) ALLOWLIST — the guarded live transport
 //       (createGuardedLiveTransport) classifies every request and
@@ -103,18 +109,48 @@ export class PilotLivePreflightError extends Error {
 }
 
 /**
- * Approved TEST-site designation for the pilot: a Chargebee site slug
- * carrying the `-test` suffix (the shape of every test site used by
- * this project, e.g. `<name>-test`), or a slug on the explicit
- * allowlist below. A production-looking slug (no test designation, not
- * allowlisted) is NOT approved and fails preflight.
+ * Static pilot allowlist — deliberately EMPTY. It is not a substitute
+ * for per-run approval: a site is approved only when it is named by
+ * an explicit per-run approved-site entry (see
+ * assertLivePilotPreflight) that EXACTLY equals the configured
+ * CHARGEBEE_SITE.
  */
 export const PILOT_APPROVED_TEST_SITES: readonly string[] = [];
 const TEST_SITE_SUFFIX = /-test$/;
 
-export function isApprovedTestSite(site: string | undefined): boolean {
+/** Environment variable carrying the per-run approved test sites (comma-separated exact site slugs). */
+export const APPROVED_TEST_SITES_ENV = "SCQ_PILOT_APPROVED_TEST_SITES" as const;
+
+/** Parses the per-run approved test sites from an environment map. */
+export function approvedTestSitesFromEnv(env: Record<string, string | undefined> = process.env): string[] {
+  const raw = env[APPROVED_TEST_SITES_ENV];
+  if (!raw) return [];
+  return raw.split(",").map((s) => s.trim()).filter((s) => s.length > 0);
+}
+
+function effectiveApprovedSites(extra?: readonly string[]): string[] {
+  return [...PILOT_APPROVED_TEST_SITES, ...(extra ?? [])];
+}
+
+/**
+ * Explicit test-site approval (PR #13 re-review correction F1).
+ *
+ * A naming convention is not proof of tenant approval or test mode,
+ * so a `-test` suffix ALONE is never sufficient. A site counts as
+ * approved for a run only when BOTH hold:
+ *   1. sanity: the slug carries the `-test` designation, AND
+ *   2. explicit per-run approval: an approved-site entry supplied for
+ *      this run (via SCQ_PILOT_APPROVED_TEST_SITES or an
+ *      approvedTestSites/approvedSite parameter) EXACTLY equals it.
+ *
+ * This is configuration/approval validation of operator-supplied
+ * configuration — it does NOT independently attest, via the
+ * provider, that the tenant is a test tenant.
+ */
+export function isApprovedTestSite(site: string | undefined, approvedTestSites?: readonly string[]): boolean {
   if (!site) return false;
-  return PILOT_APPROVED_TEST_SITES.includes(site) || TEST_SITE_SUFFIX.test(site);
+  if (!TEST_SITE_SUFFIX.test(site)) return false;
+  return effectiveApprovedSites(approvedTestSites).includes(site);
 }
 
 /**
@@ -136,11 +172,23 @@ export function isSyntheticSubscriptionId(id: string | undefined): boolean {
  * is missing or unverified. Callers must run this BEFORE constructing
  * any client or request.
  */
-export function assertLivePilotPreflight(input: { site?: string; apiKeyPresent: boolean; subscriptionId?: string }): void {
+export function assertLivePilotPreflight(input: {
+  site?: string;
+  apiKeyPresent: boolean;
+  subscriptionId?: string;
+  /** Explicit per-run approved test sites: entries must EXACTLY equal the configured site. */
+  approvedTestSites?: readonly string[];
+  /** Single explicit per-run approved test site (convenience form of approvedTestSites). */
+  approvedSite?: string;
+}): void {
+  const approved: string[] = [
+    ...(input.approvedTestSites ?? []),
+    ...(input.approvedSite ? [input.approvedSite] : []),
+  ];
   const problems: string[] = [];
   if (!input.site) problems.push("CHARGEBEE_SITE is missing");
-  else if (!isApprovedTestSite(input.site)) {
-    problems.push(`CHARGEBEE_SITE "${input.site}" is not an approved test site (a site slug must carry the "-test" designation or be on the pilot allowlist; production tenants are never approved)`);
+  else if (!isApprovedTestSite(input.site, approved)) {
+    problems.push(`CHARGEBEE_SITE "${input.site}" is not an approved test site (configuration/approval validation failed: preflight requires BOTH the "-test" designation as a sanity property AND an explicit per-run approved-site entry exactly matching the site, supplied via ${APPROVED_TEST_SITES_ENV} or an approved-site parameter — a "-test" suffix alone is not approval, and this validation is not independent provider attestation)`);
   }
   if (!input.apiKeyPresent) problems.push("CHARGEBEE_API_KEY is missing");
   if (!input.subscriptionId) problems.push("no synthetic test subscription id (set CHARGEBEE_TEST_SUBSCRIPTION_ID or pass --subscription)");

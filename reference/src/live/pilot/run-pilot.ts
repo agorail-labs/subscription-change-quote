@@ -14,12 +14,18 @@
 //     CHARGEBEE_TEST_SUBSCRIPTION_ID). Without them the run classifies
 //     live capabilities BLOCKED and performs NO network call.
 //   - Live mode additionally enforces the safeguards in
-//     live-guard.ts (PR #13 review correction R3): a preflight
-//     requiring an explicitly approved TEST site and a synthetic
-//     subscription id BEFORE any request is constructed; an operation
-//     allowlist enforced at the transport boundary; and report counts
-//     derived from the OBSERVED transport log (a LIVE_PASS requires
-//     the corresponding observed successful operations).
+//     live-guard.ts (PR #13 review corrections R3 + F1/F2): a
+//     preflight performing configuration/approval validation — an
+//     explicit per-run approved-site entry exactly matching
+//     CHARGEBEE_SITE (SCQ_PILOT_APPROVED_TEST_SITES; the `-test`
+//     suffix alone is NOT approval and this validation is not
+//     provider attestation) and a synthetic subscription id —
+//     BEFORE any request is constructed; an operation allowlist
+//     enforced at the transport boundary; and report counts derived
+//     from the OBSERVED transport log (a LIVE_PASS requires the
+//     corresponding observed successful operations AND the real
+//     configured network path — an injected transport can never
+//     produce LIVE_PASS, see classifyRunCapability).
 //   - The harness NEVER enables live commit, in either mode: the
 //     adapter is constructed with liveCommitEnabled=false, and the
 //     report classifies commit BLOCKED with the reason. Commit-path
@@ -39,6 +45,7 @@ import { ChargebeeLiveAdapter, interpretChargebeeEstimate, type CbItemPriceInfo 
 import { PilotMockChargebee } from "./mock-transport.js";
 import {
   PilotLivePreflightError,
+  approvedTestSitesFromEnv,
   assertLivePilotPreflight,
   classifyChargebeeOperation,
   createGuardedLiveTransport,
@@ -66,6 +73,8 @@ export type PilotReport = {
   capabilities: CapabilityResult[];
   /** Observed transport counts, derived from the run's transport log (never hardcoded). */
   transport: TransportSummary;
+  /** Origin of the transport that produced this report's operations: "real" = internally constructed guarded network transport; "injected" = caller/test-supplied transport (simulated evidence); "mocked" = fixture transport. */
+  transportOrigin?: "real" | "injected" | "mocked";
   quote?: { id: string; immediateNet?: number; recurringResulting?: number; recurringPrevious?: number; currency?: string; provenance?: unknown; nextInvoiceEstimate?: unknown };
 };
 
@@ -73,16 +82,34 @@ export const PILOT_ADDON = "pilot-addon-vision";
 export const PILOT_SUBSCRIPTION_ID = "pilot-sub-001";
 export const PILOT_TARGET_QTY = 21;
 
+export type TransportOrigin = "real" | "injected";
+
 /**
  * Classification discipline for a run capability (PR #13 review
- * correction R3c): in live mode a PASS must rest on OBSERVED
- * successful operations in the transport log — a step that nominally
- * succeeded but produced no observed operation for its capability is
- * UNVERIFIED, never LIVE_PASS. In mocked mode the evidence is
+ * corrections R3c + F2): a call log proves dispatch through whatever
+ * transport produced it — it does not prove the responses originated
+ * from a live provider. LIVE_PASS / LIVE_FAIL are therefore issuable
+ * ONLY on the real configured network path: mode "live", transport
+ * origin "real" (the internally constructed guarded transport wrapping
+ * the real network transport, with no caller-injected transport),
+ * preflight passed, and the corresponding OBSERVED successful
+ * operations present. A run over an INJECTED transport — however
+ * successful — is simulated evidence: SIMULATED_PASS when the step
+ * succeeded with observed operations, otherwise UNVERIFIED, and never
+ * LIVE_PASS / LIVE_FAIL. In mocked mode the evidence is likewise
  * SIMULATED_PASS when the step succeeded.
  */
-export function classifyRunCapability(mode: "mocked" | "live", ok: boolean, observedSuccessfulOpsCount: number): EvidenceClass {
+export function classifyRunCapability(
+  mode: "mocked" | "live",
+  ok: boolean,
+  observedSuccessfulOpsCount: number,
+  transportOrigin: TransportOrigin = "real",
+): EvidenceClass {
   if (mode === "mocked") return ok ? "SIMULATED_PASS" : "UNVERIFIED";
+  if (transportOrigin === "injected") {
+    if (!ok) return "UNVERIFIED";
+    return observedSuccessfulOpsCount > 0 ? "SIMULATED_PASS" : "UNVERIFIED";
+  }
   if (!ok) return "LIVE_FAIL";
   return observedSuccessfulOpsCount > 0 ? "LIVE_PASS" : "UNVERIFIED";
 }
@@ -161,9 +188,15 @@ export type RunPilotOptions = {
    * Live mode only: the network transport the guarded live transport
    * wraps (default: global fetch). Tests inject a stub here to
    * exercise the live path — preflight, allowlist, observed counts —
-   * with zero real network access.
+   * with zero real network access. Supplying a transport marks the
+   * run's transport origin as "injected": its classifications are
+   * SIMULATED_PASS / UNVERIFIED, never LIVE_PASS (correction F2).
    */
   networkTransport?: HttpTransport;
+  /** Explicit per-run approved test sites for live preflight (exact site slugs). Falls back to SCQ_PILOT_APPROVED_TEST_SITES from the run environment. */
+  approvedTestSites?: readonly string[];
+  /** Single explicit per-run approved test site (convenience form). */
+  approvedSite?: string;
 };
 
 export async function runPilot(opts: RunPilotOptions): Promise<PilotReport> {
@@ -194,6 +227,7 @@ export async function runPilot(opts: RunPilotOptions): Promise<PilotReport> {
       { capability: "live commit", classification: "BLOCKED", basis: "prohibited in this pilot; SCQ_LIVE_COMMIT_ENABLED untouched (false)" },
     ],
     transport: summarizeTransportLog(transportLog),
+    transportOrigin: opts.networkTransport ? "injected" : "real",
   });
 
   if (opts.mode === "live") {
@@ -211,8 +245,13 @@ export async function runPilot(opts: RunPilotOptions): Promise<PilotReport> {
     // synthetic subscription id are required BEFORE any request is
     // constructed. Failure is closed: no client, no transport, no
     // network call; the run classifies BLOCKED with the named error.
+    const approvedTestSites: string[] = [
+      ...approvedTestSitesFromEnv(opts.env ?? process.env),
+      ...(opts.approvedTestSites ?? []),
+      ...(opts.approvedSite ? [opts.approvedSite] : []),
+    ];
     try {
-      assertLivePilotPreflight({ site: clientConfig.site, apiKeyPresent: !!clientConfig.apiKey, subscriptionId });
+      assertLivePilotPreflight({ site: clientConfig.site, apiKeyPresent: !!clientConfig.apiKey, subscriptionId, approvedTestSites });
     } catch (e) {
       if (e instanceof PilotLivePreflightError) {
         return blockedLiveReport(
@@ -223,7 +262,7 @@ export async function runPilot(opts: RunPilotOptions): Promise<PilotReport> {
       }
       throw e;
     }
-    steps.push({ step: "live preflight", status: "pass", detail: "approved test site + synthetic subscription id verified before any request" });
+    steps.push({ step: "live preflight", status: "pass", detail: "configuration/approval validation passed before any request: exact CHARGEBEE_SITE explicitly approved for this run (per-run approved-site entry; \"-test\" designation present as sanity property) + synthetic subscription id designated — this validates operator configuration, it is not independent provider attestation" });
     // R3(b): every live request flows through the guarded transport,
     // which enforces the read/estimate allowlist at its boundary.
     const guard = createGuardedLiveTransport(opts.networkTransport ?? fetchTransport);
@@ -291,9 +330,14 @@ export async function runPilot(opts: RunPilotOptions): Promise<PilotReport> {
   }
   const retrieveObserved = observedSuccessfulOps(transportLog, "retrieve_subscription");
   const estimateObserved = observedSuccessfulOps(transportLog, "estimate_update_for_items");
-  capabilities.push({ capability: "retrieve subscription + snapshot", classification: classifyRunCapability(opts.mode, true, retrieveObserved), basis: opts.mode === "live" ? `guarded live transport log: ${retrieveObserved} observed successful retrieve operation(s)` : "mocked transport fixture (pilot mock)" });
-  capabilities.push({ capability: "estimate-backed quote", classification: classifyRunCapability(opts.mode, true, estimateObserved), basis: opts.mode === "live" ? `guarded live transport log: ${estimateObserved} observed successful estimate operation(s)` : "mocked transport fixture (pilot mock)" });
-  capabilities.push({ capability: "normalized-vs-raw field comparison", classification: classifyRunCapability(opts.mode, allMatch, estimateObserved), basis: "harness consistency check — the adapter's own interpretation function re-applied to the captured raw estimate (shares interpretation code with the adapter, so correlated interpretation defects are NOT detectable here; independent verification is the test-only oracle exercised in test22)" });
+  const transportOrigin: TransportOrigin = opts.networkTransport ? "injected" : "real";
+  const liveBasis = (n: number, what: string) =>
+    transportOrigin === "injected"
+      ? `injected (stubbed) transport log: ${n} observed successful ${what} operation(s) through the injected transport — simulated evidence, not live-provider evidence`
+      : `guarded live transport log (real configured network path): ${n} observed successful ${what} operation(s)`;
+  capabilities.push({ capability: "retrieve subscription + snapshot", classification: classifyRunCapability(opts.mode, true, retrieveObserved, transportOrigin), basis: opts.mode === "live" ? liveBasis(retrieveObserved, "retrieve") : "mocked transport fixture (pilot mock)" });
+  capabilities.push({ capability: "estimate-backed quote", classification: classifyRunCapability(opts.mode, true, estimateObserved, transportOrigin), basis: opts.mode === "live" ? liveBasis(estimateObserved, "estimate") : "mocked transport fixture (pilot mock)" });
+  capabilities.push({ capability: "normalized-vs-raw field comparison", classification: classifyRunCapability(opts.mode, allMatch, estimateObserved, transportOrigin), basis: "harness consistency check — the adapter's own interpretation function re-applied to the captured raw estimate (shares interpretation code with the adapter, so correlated interpretation defects are NOT detectable here; independent verification is the test-only oracle exercised in test22)" });
   capabilities.push({ capability: "live commit", classification: "BLOCKED", basis: "prohibited in this pilot; harness constructs the adapter with liveCommitEnabled=false in both modes; SCQ_LIVE_COMMIT_ENABLED untouched" });
   capabilities.push({ capability: "mocked commit-path + recovery behavior", classification: "DOCUMENTATION_SUPPORTED", basis: "exercised by test21/test13 mocked suites, not by this read-only harness run" });
 
@@ -307,6 +351,7 @@ export async function runPilot(opts: RunPilotOptions): Promise<PilotReport> {
     comparisons,
     capabilities,
     transport: summarizeTransportLog(transportLog),
+    transportOrigin: opts.mode === "mocked" ? "mocked" : (opts.networkTransport ? "injected" : "real"),
     quote: {
       id: quote.id,
       immediateNet: quote.commercialEffect.immediate?.net,
