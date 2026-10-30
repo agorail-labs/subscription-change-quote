@@ -11,6 +11,7 @@ import {
   type ChangeAction,
   type ChangeSpec,
   type CommercialEffect,
+  type ComparisonUnitContext,
   type DimensionState,
   type EffectiveIntent,
   type FinancialDimension,
@@ -29,6 +30,7 @@ import {
 // accepted assignments between them, but widening only one (as
 // CORE-4 does) would have silently forked them.
 export type { ReconciliationResult } from "./types.js";
+export type { ComparisonUnitContext } from "./types.js";
 import type { QuoteStore, StoredQuote } from "../store/quote-store.js";
 
 /**
@@ -767,6 +769,133 @@ function compareDeterminedDimensions(
 }
 
 /**
+ * PR-16 (Issue #22, Finding 4): UNIT COMPARABILITY — the
+ * precondition the numeric comparison above silently assumed.
+ * `compareDeterminedDimensions` compares raw numbers; numbers
+ * denominated in different units are not comparable, so a
+ * USD-quoted amount and an EUR-committed amount at the same
+ * number are NOT equal, and the same number at a MONTHLY vs an
+ * ANNUAL cadence is a different recurring obligation. This
+ * assessment runs over exactly the dimensions BC-1 established
+ * as comparable (both sides DETERMINED) — a dimension that does
+ * not participate in the numeric comparison raises no unit
+ * question — and reports, per participating dimension:
+ *
+ *   - "contradiction": both sides' units are ESTABLISHED and
+ *     they differ. An established contradiction classifies like
+ *     an established numeric violation (VIOLATED / a pre-dispatch
+ *     refusal): the comparison the caller asked for cannot come
+ *     out in the compared effect's favor.
+ *   - "unestablishable": a participating CURRENCY cannot be
+ *     established on one side. Currency is a required field on
+ *     the recurring effect, so its runtime absence is not a
+ *     legacy shape but missing unit evidence; and the immediate
+ *     dimension's currency exists only as the subscription's
+ *     billing currency (the schema carries no immediate currency
+ *     field), sourced from the effect's recurring currency or
+ *     the caller's threaded snapshot context. An unestablishable
+ *     unit classifies UNVERIFIED — never OK (absence is not
+ *     agreement) and never VIOLATED (nothing was contradicted).
+ *
+ * CADENCE is narrower, deliberately: the schema makes it
+ * optional and committed-effect constructions legitimately omit
+ * it, so a cadence contradiction is decidable only where BOTH
+ * sides state a cadence (on the effect, or via threaded
+ * context). A one-sided cadence omission raises no problem —
+ * the amounts were produced under one cadence regime the record
+ * does not fully state; making the resulting cadence a required
+ * recorded dimension is proposed for PR #21 (see
+ * research/pr-16-identity-currency-comparability.md).
+ *
+ * Currency and cadence codes compare case-insensitively
+ * ("USD" and "usd" are the same unit; adapters in this codebase
+ * emit both casings).
+ */
+type UnitComparabilityProblem = {
+  dimension: FinancialDimension;
+  kind: "contradiction" | "unestablishable";
+  detail: string;
+};
+
+function unitValue(value: unknown): string | undefined {
+  return typeof value === "string" && value.length > 0 ? value : undefined;
+}
+
+function assessUnitComparability(
+  quoted: CommercialEffect,
+  compared: CommercialEffect,
+  comparable: ReadonlySet<FinancialDimension>,
+  unitContext?: ComparisonUnitContext
+): UnitComparabilityProblem[] {
+  const problems: UnitComparabilityProblem[] = [];
+  const differs = (a: string, b: string) => a.toUpperCase() !== b.toUpperCase();
+  if (comparable.has("recurringFinancialEffect")) {
+    const quotedCurrency = unitValue(quoted.recurring?.currency) ?? unitValue(unitContext?.quotedBillingCurrency);
+    const comparedCurrency = unitValue(compared.recurring?.currency) ?? unitValue(unitContext?.comparedBillingCurrency);
+    if (quotedCurrency !== undefined && comparedCurrency !== undefined) {
+      if (differs(quotedCurrency, comparedCurrency)) {
+        problems.push({
+          dimension: "recurringFinancialEffect",
+          kind: "contradiction",
+          detail:
+            `the quoted recurring amount is denominated in ${quotedCurrency} but the compared recurring amount is denominated in ${comparedCurrency} — ` +
+            `amounts in different currencies are not comparable, so numeric equality between them establishes nothing`,
+        });
+      }
+    } else {
+      problems.push({
+        dimension: "recurringFinancialEffect",
+        kind: "unestablishable",
+        detail:
+          `the recurring currency cannot be established on the ${quotedCurrency === undefined ? "quoted" : "compared"} side — ` +
+          `a recurring amount whose currency is unknown cannot be compared against a denominated amount`,
+      });
+    }
+    const quotedCadence = unitValue(quoted.recurring?.cadence) ?? unitValue(unitContext?.quotedBillingCadence);
+    const comparedCadence = unitValue(compared.recurring?.cadence) ?? unitValue(unitContext?.comparedBillingCadence);
+    if (quotedCadence !== undefined && comparedCadence !== undefined && differs(quotedCadence, comparedCadence)) {
+      problems.push({
+        dimension: "recurringFinancialEffect",
+        kind: "contradiction",
+        detail:
+          `the quoted recurring amount is stated at a ${quotedCadence} cadence but the compared recurring amount is stated at a ${comparedCadence} cadence — ` +
+          `the same number at a different cadence is a different recurring obligation`,
+      });
+    }
+  }
+  if (comparable.has("immediateFinancialEffect")) {
+    // The schema carries no immediate currency field: an
+    // immediate figure is denominated in the subscription's
+    // billing currency, established from the caller's threaded
+    // snapshot context first (the state the figures were
+    // observed with), then from the side's own recurring
+    // currency.
+    const quotedCurrency = unitValue(unitContext?.quotedBillingCurrency) ?? unitValue(quoted.recurring?.currency);
+    const comparedCurrency = unitValue(unitContext?.comparedBillingCurrency) ?? unitValue(compared.recurring?.currency);
+    if (quotedCurrency !== undefined && comparedCurrency !== undefined) {
+      if (differs(quotedCurrency, comparedCurrency)) {
+        problems.push({
+          dimension: "immediateFinancialEffect",
+          kind: "contradiction",
+          detail:
+            `the quoted immediate amount is denominated in the subscription's billing currency ${quotedCurrency} but the compared immediate amount is denominated in ${comparedCurrency} — ` +
+            `amounts in different currencies are not comparable, so numeric equality between them establishes nothing`,
+        });
+      }
+    } else {
+      problems.push({
+        dimension: "immediateFinancialEffect",
+        kind: "unestablishable",
+        detail:
+          `the immediate dimension's currency cannot be established on the ${quotedCurrency === undefined ? "quoted" : "compared"} side — ` +
+          `the schema carries no immediate currency field, and neither the side's recurring currency nor threaded snapshot context denominates it`,
+      });
+    }
+  }
+  return problems;
+}
+
+/**
  * PR-15: the FIREABLE projection of a malformed envelope, used ONLY
  * by reconcileCommittedEffect's malformed-envelope classification.
  * Each malformed bound is replaced by +Infinity — an internal
@@ -829,7 +958,8 @@ export function checkAcceptanceEnvelope(
   quoted: CommercialEffect,
   revalidated: CommercialEffect,
   envelope: AcceptanceEnvelope,
-  proposal?: SubscriptionChangeProposal
+  proposal?: SubscriptionChangeProposal,
+  unitContext?: ComparisonUnitContext
 ): string | null {
   // PR-15 (Finding 2): the envelope is caller input, validated
   // BEFORE the determinacy assessment and any comparison — a
@@ -850,7 +980,24 @@ export function checkAcceptanceEnvelope(
   assertEnvelopeEnforceable(quoted, revalidated, proposal);
   const assessments = assessEnvelopePair(quoted, revalidated, proposal, "quote");
   const comparable = new Set(assessments.filter((d) => d.comparable).map((d) => d.dimension));
-  return compareDeterminedDimensions(quoted, revalidated, envelope, comparable);
+  const violation = compareDeterminedDimensions(quoted, revalidated, envelope, comparable);
+  if (violation) return violation;
+  // PR-16 (Finding 4): unit comparability gates the pass. A
+  // numeric pass across differing established units is not a
+  // pass (the numbers are not comparable), and a participating
+  // currency that cannot be established means compliance cannot
+  // be established either. Both refuse at this pre-dispatch gate
+  // (a returned violation string, like numeric drift); the
+  // VIOLATED / UNVERIFIED distinction belongs to the
+  // post-dispatch reconciliation, where an outcome exists to
+  // classify.
+  const unitProblem = assessUnitComparability(quoted, revalidated, comparable, unitContext)[0];
+  if (unitProblem) {
+    return unitProblem.kind === "contradiction"
+      ? `unit comparability precondition failed: ${unitProblem.detail}`
+      : `unit comparability cannot be established: ${unitProblem.detail}`;
+  }
+  return null;
 }
 
 /**
@@ -911,6 +1058,15 @@ export function checkAcceptanceEnvelope(
  * the same input as INVALID_PROPOSAL: invalid input refuses
  * BEFORE dispatch and classifies AFTER it.
  *
+ * PR-16 (Finding 4) adds the unit-comparability precondition to
+ * both envelope-bearing paths: over the dimensions BC-1
+ * established as comparable, an established currency or cadence
+ * contradiction classifies VIOLATED (it is envelope-independent
+ * and outranks unverifiability), and a participating currency
+ * that cannot be established on one side classifies UNVERIFIED.
+ * Equal numbers across differing units never reconcile OK. See
+ * `assessUnitComparability`.
+ *
  * No-envelope case (CANCEL-only REVALIDATE proposals may omit one —
  * see enforceGuaranteeRequest): there is nothing to COMPARE, and OK
  * keeps its v0.6.1 meaning of "no comparison applies" — but only
@@ -928,7 +1084,8 @@ export function reconcileCommittedEffect(
   quoted: CommercialEffect,
   committed: CommercialEffect,
   envelope: AcceptanceEnvelope | undefined,
-  proposal?: SubscriptionChangeProposal
+  proposal?: SubscriptionChangeProposal,
+  unitContext?: ComparisonUnitContext
 ): ReconciliationResult {
   const assessments = assessEnvelopePair(quoted, committed, proposal, "committed");
   const undetermined = assessments.filter((d) => !d.comparable && !d.skipped);
@@ -961,6 +1118,20 @@ export function reconcileCommittedEffect(
 
   const comparable = new Set(assessments.filter((d) => d.comparable).map((d) => d.dimension));
 
+  // PR-16 (Finding 4): unit comparability over the participating
+  // dimensions — computed once, consumed by both classification
+  // paths below. A unit CONTRADICTION is an established negative
+  // (it outranks unverifiability, exactly like an established
+  // numeric violation); an UNESTABLISHABLE participating currency
+  // makes compliance unprovable (UNVERIFIED). Neither can read
+  // OK. The no-envelope path above is untouched: with nothing to
+  // compare against, unit comparability — a comparison
+  // precondition — does not arise; that path judges whether the
+  // committed figures are established actuals, as before.
+  const unitProblems = assessUnitComparability(quoted, committed, comparable, unitContext);
+  const unitContradiction = unitProblems.find((p) => p.kind === "contradiction");
+  const unitUnestablishable = unitProblems.filter((p) => p.kind === "unestablishable");
+
   // PR-15 (Finding 2): a MALFORMED envelope (a NaN / negative /
   // string-typed bound, an unknown field, a non-object shape)
   // encountered POST-commit classifies — it never throws (this
@@ -988,6 +1159,17 @@ export function reconcileCommittedEffect(
           `rolled back by this reconciliation check; it exists solely so this is never reported silently.`,
       };
     }
+    if (unitContradiction) {
+      return {
+        status: "VIOLATED",
+        reason:
+          `Post-commit reconciliation failed: the ACTUALLY-committed effect is not comparable with the quoted effect — ` +
+          `${unitContradiction.detail}. A unit contradiction is envelope-independent (no tolerance denominates across ` +
+          `currencies or cadences), so it is established even though the recorded envelope is additionally malformed ` +
+          `(${envelopeProblem}). The mutation has already occurred and cannot be rolled back by this reconciliation ` +
+          `check; it exists solely so this is never reported silently.`,
+      };
+    }
     return {
       status: "UNVERIFIED",
       reason:
@@ -995,8 +1177,11 @@ export function reconcileCommittedEffect(
         `(${envelopeProblem}), so compliance with the caller's tolerance as recorded cannot be established — ` +
         `a malformed bound is never compared as zero and never read as compliance (PR-15). The mutation has ` +
         `already occurred; its receipt is recorded with this classification, and the malformed envelope ` +
-        `requires operator follow-up.`,
-      undeterminedDimensions: undetermined.map((d) => d.dimension),
+        `requires operator follow-up.` +
+        (unitUnestablishable.length > 0
+          ? ` Unit comparability is additionally unestablishable: ${unitUnestablishable.map((p) => p.detail).join("; ")}.`
+          : ""),
+      undeterminedDimensions: [...new Set([...undetermined.map((d) => d.dimension), ...unitUnestablishable.map((p) => p.dimension)])],
     };
   }
 
@@ -1010,6 +1195,27 @@ export function reconcileCommittedEffect(
         `because ConsistencyGuarantee is BEST_EFFORT — a concurrent write may have landed between the ` +
         `pre-mutation preview and the mutating call itself. The mutation has already occurred and cannot be ` +
         `rolled back by this reconciliation check; it exists solely so this is never reported silently.`,
+    };
+  }
+  if (unitContradiction) {
+    return {
+      status: "VIOLATED",
+      reason:
+        `Post-commit reconciliation failed: the ACTUALLY-committed effect is not comparable with the quoted effect — ` +
+        `${unitContradiction.detail}. The numeric comparison is not meaningful across differing units, so numeric ` +
+        `equality does not reconcile this commit. The mutation has already occurred and cannot be rolled back by ` +
+        `this reconciliation check; it exists solely so this is never reported silently.`,
+    };
+  }
+  if (unitUnestablishable.length > 0) {
+    return {
+      status: "UNVERIFIED",
+      reason:
+        `Post-commit reconciliation cannot be established: ${unitUnestablishable.map((p) => p.detail).join("; ")}. ` +
+        `A unit that cannot be established is not a unit that agrees — an unmeasured denomination cannot reconcile ` +
+        `OK (PR-16, Finding 4). The mutation has already occurred; its unestablished unit(s) require operator ` +
+        `follow-up, not a silent OK.`,
+      undeterminedDimensions: [...new Set([...unitUnestablishable.map((p) => p.dimension), ...undetermined.map((d) => d.dimension)])],
     };
   }
   if (undetermined.length > 0) {

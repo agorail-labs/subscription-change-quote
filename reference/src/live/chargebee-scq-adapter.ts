@@ -513,6 +513,26 @@ function snapshotFrom(sub: CbSubscription): SubscriptionSnapshot {
   };
 }
 
+/**
+ * PR-16 (Issue #22, Finding 3): the refusal for a provider read
+ * that names a subscription OTHER than the one it was addressed
+ * to. A response about a different subscription is not evidence
+ * about this one — the read was keyed by the bound id, so a
+ * payload naming another id is a provider-side identity failure,
+ * refused wherever the read is consumed. The error carries
+ * CONFIRMED_NON_EXECUTION semantics in its details; call sites
+ * that record outcomes (the commit path) do so before throwing.
+ */
+function subscriptionIdentityMismatchError(context: string, expectedSubscriptionId: string, observedSubscriptionId: unknown): SCQError {
+  return new SCQError(
+    "PROVIDER_ERROR",
+    `${context}: the provider read was addressed to subscription "${expectedSubscriptionId}" but the returned record names ` +
+      `subscription ${typeof observedSubscriptionId === "string" ? `"${observedSubscriptionId}"` : "(no subscription id)"} — a read of a ` +
+      `different subscription is not evidence about this one, and nothing was dispatched on the basis of it.`,
+    { blocked: "SUBSCRIPTION_IDENTITY_MISMATCH", outcome: "CONFIRMED_NON_EXECUTION", expectedSubscriptionId, observedSubscriptionId: observedSubscriptionId ?? null },
+  );
+}
+
 /** Authoritative item-price metadata (GET /item_prices/{id}). */
 export type CbItemPriceInfo = {
   itemPriceId: string;
@@ -669,10 +689,19 @@ function verifyLandedItemSet(
   proposal: SubscriptionChangeProposal,
   targetItems: Array<{ itemPriceId: string; quantity: number }>,
   source: string,
+  expectedSubscriptionRef: string,
 ): PostCommitStateVerification {
   const snapshot = snapshotFrom(after);
   return verifyPostCommitState(
-    { proposal, expectedItems: targetItems.map((t) => ({ id: t.itemPriceId, quantity: t.quantity })) },
+    {
+      proposal,
+      expectedItems: targetItems.map((t) => ({ id: t.itemPriceId, quantity: t.quantity })),
+      // PR-16 (Finding 3): the hook binds the observed snapshot
+      // to the quote's subscription — an item-set match on a
+      // DIFFERENT subscription's record is a MISMATCH, never a
+      // verification of this quote.
+      expectedSubscriptionRef,
+    },
     {
       snapshot: {
         ...snapshot,
@@ -1077,6 +1106,18 @@ export class ChargebeeLiveAdapter implements SubscriptionProvider {
     enforceEffectiveIntent(proposal.effectiveIntent, ["IMMEDIATE"]);
 
     const sub = await this.readSubscription(subscriptionId);
+    // PR-16 (Finding 3): the creation read must name the
+    // subscription it was addressed to. The quote records this
+    // read's fingerprint as the state the commit path later
+    // validates against, and the fingerprint is resource-version
+    // based — identity is not a fingerprint input — so a quote
+    // built from another subscription's record is not reliably
+    // caught downstream. (The read-only preflight has checked
+    // read identity since PR #20, PF3; the mutating path's
+    // creation read did not.)
+    if (sub.id !== subscriptionId) {
+      throw subscriptionIdentityMismatchError("Quote creation refused before any estimate or dispatch", subscriptionId, sub.id);
+    }
     const effectiveMode = resolveGuaranteeMode(proposal);
     // EXACT is refused here, before the estimate call, naming the failing
     // dimension — this adapter cannot back EXACT on any financial dim.
@@ -1244,6 +1285,38 @@ export class ChargebeeLiveAdapter implements SubscriptionProvider {
 
     const input = stored0.provider_preview_input as LivePreviewInput;
     const current = await this.readSubscription(stored0.subscription_id);
+    // PR-16 (Finding 3): the commit-phase validation read must
+    // name the quote's bound subscription. Everything below —
+    // the fingerprint comparison, the revalidation estimate, the
+    // dispatch — is decided from this read; a record naming a
+    // DIFFERENT subscription would validate (or stale) this
+    // quote against another subscription's state, and the
+    // rv-based fingerprint cannot catch it (identity is not a
+    // fingerprint input). Placement is deliberate: after the
+    // §6.10 replay and the recorded-INDETERMINATE guard (their
+    // precedence is unchanged — a recorded receipt replays and a
+    // recorded indeterminate outcome refuses before any read),
+    // and before validateCommit, the estimate, every gate, and
+    // the durable write-ahead — a refused commit creates no
+    // durable DISPATCHING attempt and dispatches nothing. The
+    // refusal is recorded with CONFIRMED_NON_EXECUTION semantics
+    // (nothing was dispatched; a retry re-reads and refuses
+    // identically while the provider misnames the record). It is
+    // never INDETERMINATE.
+    if (current.id !== stored0.subscription_id) {
+      const identityError = subscriptionIdentityMismatchError("Commit refused before dispatch", stored0.subscription_id, current.id);
+      this.store.recordCommitOutcome(quoteId, {
+        outcome: "CONFIRMED_NON_EXECUTION",
+        at: this.now().toISOString(),
+        details: {
+          blocked: "SUBSCRIPTION_IDENTITY_MISMATCH",
+          expectedSubscriptionId: stored0.subscription_id,
+          observedSubscriptionId: typeof current.id === "string" ? current.id : null,
+          reason: "the commit-phase validation read named a different subscription than the quote's bound subscription; no fingerprint comparison, estimate, gate, durable attempt, or dispatch was made on the basis of another subscription's record",
+        },
+      });
+      throw identityError;
+    }
     const validated = validateCommit(this.store, quoteId, chargebeeSubscriptionFingerprint(current), this.now);
     // PR-15 (Finding 2): the STORED record is validated before it
     // feeds any gate below — the same shared rules as quote
@@ -1285,7 +1358,18 @@ export class ChargebeeLiveAdapter implements SubscriptionProvider {
     // itself; these adapter-local calls remain the earlier refusal.
     assertEffectDeterminateForCommit(validated.quoted_effect, "quoted");
     assertEffectDeterminateForCommit(revalidated, "revalidated");
-    const violation = checkAcceptanceEnvelope(validated.quoted_effect, revalidated, proposal.acceptanceEnvelope!, proposal);
+    const violation = checkAcceptanceEnvelope(
+      validated.quoted_effect,
+      revalidated,
+      proposal.acceptanceEnvelope!,
+      proposal,
+      // PR-16 (Finding 4): the revalidated preview is denominated
+      // from THIS commit-phase read of the bound subscription —
+      // its currency is the compared side's unit context for the
+      // immediate dimension (whose figures carry no currency of
+      // their own in the schema).
+      { comparedBillingCurrency: current.currency_code ?? undefined },
+    );
     if (violation) {
       throw new SCQError("QUOTE_DRIFTED", `Recomputed commercial effect fell outside the caller's acceptance envelope: ${violation}. No mutation was performed.`, { quoted: validated.quoted_effect, revalidated, envelope: proposal.acceptanceEnvelope });
     }
@@ -1609,6 +1693,15 @@ export class ChargebeeLiveAdapter implements SubscriptionProvider {
     const quoteId = validated.quote_id;
     let after: CbSubscription | undefined;
     try { after = await this.readSubscription(validated.subscription_id); } catch { after = undefined; }
+    // PR-16 (Finding 3): a re-read naming a DIFFERENT subscription
+    // is not diagnostic evidence about this one — its items and
+    // fingerprint describe another subscription's state. It is
+    // treated as an unavailable re-read (the outcome is
+    // INDETERMINATE on this path either way; what changes is that
+    // foreign state is never recorded as this subscription's
+    // observed state).
+    const rereadNamedOtherSubscription = after !== undefined && after.id !== validated.subscription_id ? after.id : undefined;
+    if (rereadNamedOtherSubscription !== undefined) after = undefined;
     // PR-9: the intended-set probe is the shared core hook at
     // FULL_ITEM_SET coverage. Its VERIFIED verdict feeds ONLY the
     // diagnostic record below — per L1 it cannot and does not
@@ -1620,14 +1713,20 @@ export class ChargebeeLiveAdapter implements SubscriptionProvider {
         validated.proposal,
         input.items,
         "chargebee-live adapter: post-dispatch state re-read after an unestablishable dispatch (GET /subscriptions/{id})",
+        validated.subscription_id,
       ).verdict === "VERIFIED";
     const fingerprintMoved = after !== undefined && chargebeeSubscriptionFingerprint(after) !== preDispatchFingerprint;
     this.store.recordCommitOutcome(quoteId, {
       outcome: "INDETERMINATE",
       at: this.now().toISOString(),
       details: {
+        ...(rereadNamedOtherSubscription !== undefined
+          ? { rereadIdentityMismatch: rereadNamedOtherSubscription }
+          : {}),
         reason: after === undefined
-          ? "the dispatch's execution could not be established and the post-dispatch state re-read failed"
+          ? rereadNamedOtherSubscription !== undefined
+            ? `the dispatch's execution could not be established and the post-dispatch state re-read named a different subscription ("${rereadNamedOtherSubscription}"), so it is not evidence about this subscription`
+            : "the dispatch's execution could not be established and the post-dispatch state re-read failed"
           : intendedSetObserved && fingerprintMoved
             ? "the dispatch's execution could not be established; the re-read shows the intended item set in effect on a moved fingerprint, but that observation does not establish that THIS request landed it (an independent actor's identical write is observationally indistinguishable)"
             : "the dispatch's execution could not be established and provider state does not show the intended change",
@@ -1712,8 +1811,26 @@ export class ChargebeeLiveAdapter implements SubscriptionProvider {
     const quoteId = validated.quote_id;
     const quoted = validated.quoted_effect;
     const proposal = validated.proposal;
-    const respSub = (updateJson as any)?.subscription as CbSubscription | undefined;
-    const immediateActual = committedImmediateFromResponse(updateJson);
+    const respSubRaw = (updateJson as any)?.subscription as CbSubscription | undefined;
+    // PR-16 (Finding 3): the mutating call's response must name
+    // THIS quote's subscription. A response naming a different
+    // subscription is not evidence about this commit: its state
+    // anchors no attribution bracket, its subscription derives
+    // no candidate figures, and its financial actuals are not
+    // consumed — the response is treated as carrying no usable
+    // subscription state and no established immediate, exactly
+    // like a response without a subscription body, with the
+    // identity failure named in the classification reasons
+    // below. (A response with NO subscription keeps its prior
+    // behavior; only a present-but-foreign id triggers this.)
+    const responseIdentityNote =
+      respSubRaw !== undefined && respSubRaw.id !== validated.subscription_id
+        ? `the mutating call's response named subscription "${respSubRaw.id}", not this quote's subscription "${validated.subscription_id}" — the response is not evidence about this subscription, so its state and financial actuals were not consumed`
+        : undefined;
+    const respSub = responseIdentityNote !== undefined ? undefined : respSubRaw;
+    const immediateActual = responseIdentityNote !== undefined
+      ? { undetermined: responseIdentityNote }
+      : committedImmediateFromResponse(updateJson);
     const immediateNet = "net" in immediateActual ? immediateActual.net : undefined;
     const immediateSource = "net" in immediateActual ? immediateActual.source : undefined;
     const immediateUndetermined = "net" in immediateActual ? undefined : (immediateActual as { undetermined: string }).undetermined;
@@ -1723,6 +1840,21 @@ export class ChargebeeLiveAdapter implements SubscriptionProvider {
 
     let after: CbSubscription | undefined;
     try { after = await this.readSubscription(validated.subscription_id); } catch { after = undefined; }
+    // PR-16 (Finding 3): a post-commit re-read naming a DIFFERENT
+    // subscription is not evidence about this commit — its items,
+    // fingerprint, and figures describe another subscription.
+    // For establishment it is exactly an unavailable re-read (the
+    // branches below classify from the response alone), with the
+    // identity failure named in their reasons. The mutation
+    // history stands: this is a verification failure on a
+    // dispatched commit, never a non-execution claim.
+    const rereadIdentityNote =
+      after !== undefined && after.id !== validated.subscription_id
+        ? `the post-commit re-read named subscription "${after.id}", not this quote's subscription "${validated.subscription_id}" — a read of a different subscription is not evidence about this commit and was treated as unavailable`
+        : undefined;
+    if (rereadIdentityNote !== undefined) after = undefined;
+    const identityNote = [responseIdentityNote, rereadIdentityNote].filter((n) => n !== undefined).join("; ");
+    const identitySuffix = identityNote ? ` Identity failure: ${identityNote}.` : "";
 
     if (!after) {
       if (!respSub) {
@@ -1732,9 +1864,9 @@ export class ChargebeeLiveAdapter implements SubscriptionProvider {
         this.store.recordCommitOutcome(quoteId, {
           outcome: "INDETERMINATE",
           at: this.now().toISOString(),
-          details: { reason: "the mutating call returned success without any subscription state, and the post-commit re-read failed" },
+          details: { reason: `the mutating call returned success without any subscription state, and the post-commit re-read failed${identitySuffix}` },
         });
-        throw new SCQError("PROVIDER_ERROR", "Commit outcome is INDETERMINATE: the mutating call returned success without any subscription state, and the post-commit re-read failed, so neither the landed state nor the financial outcome can be established. No receipt was recorded. Reconcile manually from provider records before any retry.", { outcome: "INDETERMINATE", indeterminate: true, reconciled: false });
+        throw new SCQError("PROVIDER_ERROR", `Commit outcome is INDETERMINATE: the mutating call returned success without any subscription state, and the post-commit re-read failed, so neither the landed state nor the financial outcome can be established.${identitySuffix} No receipt was recorded. Reconcile manually from provider records before any retry.`, { outcome: "INDETERMINATE", indeterminate: true, reconciled: false });
       }
       // Known landed, verification read unavailable (P1): record
       // the mutation response's candidate figures as UNVERIFIED —
@@ -1771,7 +1903,8 @@ export class ChargebeeLiveAdapter implements SubscriptionProvider {
           reason:
             "the update landed (its response was received, bound to this commit by its native idempotency key) but the independent " +
             "post-commit re-read was unavailable, so neither the landed item set nor the financial outcome could be independently " +
-            "verified; the recorded figures are the mutation response's candidates, pending a later verification",
+            "verified; the recorded figures are the mutation response's candidates, pending a later verification" +
+            identitySuffix,
           undeterminedDimensions: ["immediateFinancialEffect", "recurringFinancialEffect"],
         },
         status: "COMMITTED_UNVERIFIED",
@@ -1795,6 +1928,7 @@ export class ChargebeeLiveAdapter implements SubscriptionProvider {
       validated.proposal,
       input.items,
       "chargebee-live adapter: independent post-commit subscription re-read (GET /subscriptions/{id})",
+      validated.subscription_id,
     );
     const mismatches = stateVerification.contradictions;
     const afterFingerprint = chargebeeSubscriptionFingerprint(after);
@@ -1910,7 +2044,20 @@ export class ChargebeeLiveAdapter implements SubscriptionProvider {
       };
       return this.recordOutcomeReceipt(validated, {
         effect,
-        reconciliation: reconcileCommittedEffect(quoted, effect, proposal.acceptanceEnvelope, proposal),
+        reconciliation: reconcileCommittedEffect(
+          quoted,
+          effect,
+          proposal.acceptanceEnvelope,
+          proposal,
+          // PR-16 (Finding 4): the independent re-read denominates
+          // the committed side — its currency is the unit context
+          // for the immediate dimension (the snapshot's cadence is
+          // NOT threaded: snapshotFrom states a construction
+          // placeholder there, not provider evidence, so cadence
+          // comparability on this path rests on the effects' own
+          // recorded cadences alone).
+          { comparedBillingCurrency: after.currency_code ?? undefined },
+        ),
         status: "COMMITTED",
         outcome: "COMMITTED_AND_VERIFIED",
         snapshot: snap,

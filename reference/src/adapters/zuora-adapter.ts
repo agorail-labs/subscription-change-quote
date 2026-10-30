@@ -1317,7 +1317,15 @@ export class ZuoraAdapter implements SubscriptionProvider {
     }
     return {
       effect: committedEffect,
-      reconciliation: reconcileCommittedEffect(quoted, committedEffect, proposal.acceptanceEnvelope, proposal),
+      // PR-16 (Finding 4): the post-commit re-read's snapshot
+      // denominates the committed side (its billing currency /
+      // cadence are derived from the re-read rate plans) — the
+      // unit context for dimensions whose figures carry no unit
+      // of their own in the schema (immediate).
+      reconciliation: reconcileCommittedEffect(quoted, committedEffect, proposal.acceptanceEnvelope, proposal, {
+        comparedBillingCurrency: snap.billing?.currency,
+        comparedBillingCadence: snap.billing?.cadence,
+      }),
       status: "COMMITTED",
       outcome: "COMMITTED_AND_VERIFIED",
       snapshot: snap,

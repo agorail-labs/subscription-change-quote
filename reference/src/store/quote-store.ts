@@ -523,7 +523,17 @@ export class QuoteStore {
       recorded.quotedEffect,
       evidence.committedEffect,
       q.proposal.acceptanceEnvelope,
-      q.proposal
+      q.proposal,
+      // PR-16 (Finding 4): the recomputation applies the SAME
+      // unit-comparability rule as every other comparison site —
+      // a recomputation that ignored units would re-admit the
+      // defect at this boundary. The compared side's unit context
+      // is the recorded receipt's own resulting snapshot (the
+      // state the committed figures were established from).
+      {
+        comparedBillingCurrency: recorded.resultingSnapshot?.billing?.currency,
+        comparedBillingCadence: recorded.resultingSnapshot?.billing?.cadence,
+      }
     );
     if (recomputed.status !== evidence.reconciliation.status) {
       throw new Error(
@@ -974,14 +984,31 @@ export function establishVerification(quote: StoredQuote, observation: ProviderO
     committedEffect: deepCopy(observation.committedEffect),
     committedSource: source,
     stateVerification: verifyPostCommitState(
-      { proposal: quote.proposal },
+      // PR-16 (Finding 3): the expectation carries the quote's
+      // bound subscription, so an observation whose resulting
+      // snapshot names a DIFFERENT subscription computes MISMATCH
+      // here — the subscriptionRef check above binds the
+      // observation's CLAIM, this binds the observed STATE to the
+      // same subscription.
+      { proposal: quote.proposal, expectedSubscriptionRef: quote.subscription_id },
       {
         snapshot: observation.resultingSnapshot,
         source: observation.source,
         ...(observation.observedAt ? { observedAt: observation.observedAt } : {}),
       }
     ).verdict,
-    reconciliation: reconcileCommittedEffect(quote.quoted_effect, observation.committedEffect, quote.proposal.acceptanceEnvelope, quote.proposal),
+    reconciliation: reconcileCommittedEffect(
+      quote.quoted_effect,
+      observation.committedEffect,
+      quote.proposal.acceptanceEnvelope,
+      quote.proposal,
+      // PR-16 (Finding 4): the observation's own snapshot
+      // denominates its committed figures.
+      {
+        comparedBillingCurrency: observation.resultingSnapshot?.billing?.currency,
+        comparedBillingCadence: observation.resultingSnapshot?.billing?.cadence,
+      }
+    ),
     ...(observation.observedAt ? { at: observation.observedAt } : {}),
   };
   establishedEvidenceTokens.add(token);

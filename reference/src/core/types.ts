@@ -635,6 +635,51 @@ export type PostCommitStateExpectation = {
    * neither kind nor an alignable instant is UNVERIFIABLE.
    */
   termBoundaryAt?: string;
+  /**
+   * PR-16 (Issue #22, Finding 3): the subscription the observed
+   * state must name — the stored quote's bound subscription,
+   * supplied from the expectation (authorized) side, never read
+   * out of the observed snapshot. When supplied, the hook checks
+   * the observed snapshot's own id against it: a snapshot naming
+   * a different subscription is CONTRADICTED (state read from a
+   * different subscription is not evidence about this one), a
+   * snapshot carrying no usable id is UNVERIFIABLE on the
+   * identity dimension, and an absent expectation field leaves
+   * the hook's historical behavior unchanged (the association is
+   * then the caller's assertion, exactly as before this field
+   * existed). Additive and optional: existing expectations and
+   * stored records are unaffected.
+   */
+  expectedSubscriptionRef?: string;
+};
+
+/**
+ * PR-16 (Issue #22, Finding 4): the unit context a caller threads
+ * into the shared financial comparisons (`checkAcceptanceEnvelope`
+ * / `reconcileCommittedEffect`) from the state each side's figures
+ * were observed with — in practice the snapshots' `billing`
+ * fields. Every field is optional; a side's denomination is
+ * established from the first available source in this order: the
+ * effect's own recorded unit (recurring currency / cadence), then
+ * this context. The context exists chiefly for the IMMEDIATE
+ * dimension: the schema carries no immediate currency field (see
+ * the PR #21 schema-extension proposal in
+ * research/pr-16-identity-currency-comparability.md), so a
+ * subscription's billing currency — from the snapshot the figures
+ * were observed with — is the only in-schema denomination an
+ * immediate figure has. Additive and optional: omitting it leaves
+ * the comparisons to the effects' own recorded units, exactly as
+ * before this type existed.
+ */
+export type ComparisonUnitContext = {
+  /** Billing currency observed with the QUOTE side's state (quote-time snapshot), where the caller holds it. */
+  quotedBillingCurrency?: string;
+  /** Billing currency observed with the COMPARED side's state (post-commit / revalidation snapshot). */
+  comparedBillingCurrency?: string;
+  /** Billing cadence observed with the QUOTE side's state, where the caller holds it. */
+  quotedBillingCadence?: string;
+  /** Billing cadence observed with the COMPARED side's state (post-commit / revalidation snapshot). */
+  comparedBillingCadence?: string;
 };
 
 /**
