@@ -56,6 +56,12 @@ recorded, verified, or adopted.
   constructed — so the pre-existing suite and unrelated modules never touch
   the native module. If the binding cannot load, construction throws; there
   is **no silent in-memory fallback** anywhere in this PR.
+- It is declared under `optionalDependencies`, not `dependencies`: the
+  package core installs with zero required runtime dependencies (and the
+  offline consumer smoke passes with a cold npm cache), while `npm ci` in
+  CI still installs the binding so the durable suites exercise it for real.
+  The durable backend is an opt-in capability of the package, not a
+  requirement imposed on every consumer.
 - Single-host file store (see Limitations).
 
 ### Shape
