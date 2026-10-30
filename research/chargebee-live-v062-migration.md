@@ -252,18 +252,18 @@ occurred.
 - **Code-based rule.** CONFIRMED_NON_EXECUTION now requires BOTH
   HTTP 400 AND an `api_error_code` on the narrow allowlist
   `PRE_EFFECT_VALIDATION_ERROR_CODES` in the adapter:
-  `param_required` and `param_wrong_value`. Documentary basis
+  `param_wrong_value` only. Documentary basis
   (Chargebee error-handling documentation,
-  apidocs.chargebee.com/docs/api/error-handling): both codes are
+  apidocs.chargebee.com/docs/api/error-handling): this code is
   grouped under "Invalid Request Errors" (type `invalid_request`,
-  HTTP 400) — a required parameter absent, and a parameter value
-  not meeting its required specification — and the documentation
+  HTTP 400) — a parameter value not meeting its required
+  specification — and the documentation
   states that API calls fail at the first error encountered while
   VALIDATING them, i.e. before the operation is processed. Both
-  codes describe defects in the request's own shape/values, so
-  neither carries prior idempotency-key ambiguity (a consumed key
+  code describes invalid request parameters, so it carries
+  no prior idempotency-key ambiguity (a consumed key
   reused with a different payload surfaces as HTTP 422, not as one
-  of these codes).
+  this code).
 - **Fail closed.** A 400 carrying a payment-stage code
   (`payment_processing_failed`, `payment_method_verification_failed`,
   `payment_intent_invalid`, and the other payment-type codes), the
