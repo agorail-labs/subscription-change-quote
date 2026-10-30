@@ -697,6 +697,11 @@ export class DurableQuoteStore extends QuoteStore {
 
   /**
    * THE write-ahead gate. In ONE immediate transaction:
+   *   - refuses when the intent's quote is not durably stored in
+   *     THIS database, or the stored quote's subscription /
+   *     provider binding differs from the intent's (D5: no orphan
+   *     attempts — the intent and the receipt must live in the
+   *     same database, bound to the same stored quote);
    *   - refuses when the idempotency key is already bound to a
    *     DIFFERENT request hash (key reuse with different parameters);
    *   - refuses when the key is bound to a different quote /
@@ -727,6 +732,33 @@ export class DurableQuoteStore extends QuoteStore {
     try {
       let result: StoredAttempt | undefined;
       const tx = this.db.transaction(() => {
+        // PR-17 review correction D5: the intent must name a quote
+        // DURABLY stored in THIS database, and the stored quote's
+        // subscription / provider binding must match the intent.
+        // Without this check a coordinator bound to the wrong
+        // database could record a write-ahead attempt for a quote
+        // that database has never held (an orphan attempt), while
+        // the receipt landed in another database — each database
+        // individually coherent, the atomic intent↔receipt
+        // association void. The check runs inside the same
+        // immediate transaction as every other beginDispatch
+        // validation, so a refusal rolls back and leaves zero new
+        // attempt rows.
+        const quoteRow = this.db.prepare(`SELECT subscription_id, provider FROM quotes WHERE quote_id = ?`).get(intent.quoteId) as { subscription_id: string; provider: string } | undefined;
+        if (!quoteRow) {
+          throw new DispatchBlockedError(
+            `Dispatch blocked: quote ${intent.quoteId} is not durably stored in this database; a write-ahead attempt cannot be authorized for a quote this store does not hold.`,
+            { quoteId: intent.quoteId },
+          );
+        }
+        if (quoteRow.subscription_id !== intent.subscriptionId || quoteRow.provider !== intent.provider) {
+          throw new DispatchBlockedError(
+            `Dispatch blocked: the intent for quote ${intent.quoteId} names subscription ${intent.subscriptionId} / provider ${intent.provider}, ` +
+              `but the durably stored quote belongs to subscription ${quoteRow.subscription_id} / provider ${quoteRow.provider}; ` +
+              `an attempt's binding must match the stored quote it authorizes.`,
+            { quoteId: intent.quoteId, subscriptionId: quoteRow.subscription_id, provider: quoteRow.provider },
+          );
+        }
         const byKey = this.db.prepare(`SELECT * FROM attempts WHERE idempotency_key = ?`).get(intent.idempotencyKey) as Record<string, unknown> | undefined;
         if (byKey) {
           const existing = this.rowToAttempt(byKey);

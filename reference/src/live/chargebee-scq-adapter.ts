@@ -837,7 +837,12 @@ export type ChargebeeLiveAdapterOptions = {
    * behavior. When absent but the store IS a DurableQuoteStore,
    * commits are REFUSED before any mutating call (PR-17 review
    * correction D4): a durable store without its coordinator would
-   * otherwise dispatch with no write-ahead attempt.
+   * otherwise dispatch with no write-ahead attempt. When present,
+   * the coordinator must be bound to the SAME DurableQuoteStore
+   * object passed as `store` (PR-17 review correction D5): a
+   * coordinator bound to any other store — durable or in-memory —
+   * is refused before any mutating call, because the write-ahead
+   * intent and the receipt must live in one database.
    */
   durableCoordinator?: DurableMutationCoordinator;
   /** Provider site identifier recorded on the write-ahead intent (never a credential). */
@@ -1213,6 +1218,15 @@ export class ChargebeeLiveAdapter implements SubscriptionProvider {
    * its pre-PR-8 behavior, and the replay / stale-quote /
    * indeterminate-retry refusals earlier in commitChangeQuote are
    * unaffected (they perform no mutation either way).
+   *
+   * PR-17 review correction D5: presence is not enough — the
+   * coordinator must be bound to THIS adapter's store object. A
+   * coordinator over a different DurableQuoteStore (or over a
+   * plain in-memory QuoteStore) would split the ledger: intent in
+   * one database, receipt in another. That misbinding is refused
+   * below with DURABLE_COORDINATOR_STORE_MISMATCH, and the durable
+   * store independently refuses attempts for quotes it does not
+   * hold (see DurableQuoteStore.beginDispatch).
    */
   private beginDurableAttempt(validated: StoredQuote, input: LivePreviewInput, preDispatchFingerprint: string): string | undefined {
     const coordinator = this.opts.durableCoordinator;
@@ -1228,6 +1242,31 @@ export class ChargebeeLiveAdapter implements SubscriptionProvider {
         );
       }
       return undefined;
+    }
+    // PR-17 review correction D5: a coordinator that is present but
+    // bound to a DIFFERENT store than this adapter's is a split-
+    // ledger misconfiguration. The write-ahead intent would be
+    // recorded in the coordinator's database while the receipt is
+    // recorded here (this.store) — each database individually
+    // coherent, the atomic intent↔receipt association void. The
+    // binding must be object identity with a DurableQuoteStore: a
+    // coordinator over another DurableQuoteStore, or over a plain
+    // in-memory QuoteStore (whose "ledger" is not durable at all),
+    // is refused here, before any mutating call — distinctly from
+    // the D4 missing-coordinator refusal above.
+    if (coordinator.store !== this.store || !(coordinator.store instanceof DurableQuoteStore)) {
+      throw new SCQError(
+        "PROVIDER_ERROR",
+        coordinator.store instanceof DurableQuoteStore
+          ? "Refusing to commit: the configured DurableMutationCoordinator is bound to a different DurableQuoteStore " +
+            "than the store this adapter records receipts in. The write-ahead intent and the receipt would land in " +
+            "different databases (split ledger) — no provider mutation was issued. Bind the coordinator to the " +
+            "adapter's own store object."
+          : "Refusing to commit: the configured DurableMutationCoordinator is not bound to a DurableQuoteStore " +
+            "(its store is not durable), so its write-ahead ledger cannot authorize dispatches for this adapter's " +
+            "durable store — no provider mutation was issued. Bind the coordinator to the adapter's own DurableQuoteStore.",
+        { blocked: "DURABLE_COORDINATOR_STORE_MISMATCH" },
+      );
     }
     try {
       const attempt = coordinator.beginDispatch({
