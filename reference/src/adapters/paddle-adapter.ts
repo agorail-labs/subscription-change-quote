@@ -20,6 +20,8 @@ import {
 } from "../core/types.js";
 import {
   validateCommit,
+  validateProposalRuntime,
+  validateStoredQuoteRuntime,
   checkAcceptanceEnvelope,
   resolveGuaranteeMode,
   enforceGuaranteeRequest,
@@ -455,6 +457,11 @@ export class PaddleAdapter implements SubscriptionProvider {
     subscriptionId: string,
     proposal: SubscriptionChangeProposal
   ): Promise<SubscriptionChangeQuote> {
+    // PR-15 (Finding 2): the shared runtime validator runs FIRST —
+    // before any provider read, preview, or mutation — so malformed
+    // caller input refuses identically on every adapter. This
+    // adapter's provider-specific checks below run after it.
+    validateProposalRuntime(proposal);
     let sub: PaddleSubscription;
     try {
       sub = this.sim.get(subscriptionId);
@@ -646,6 +653,14 @@ export class PaddleAdapter implements SubscriptionProvider {
     // either, and no adapter-local lock is used to hide that.
     const currentFingerprint = this.sim.fingerprint(quote.subscription_id);
     const validated = validateCommit(this.store, quoteId, currentFingerprint);
+
+    // PR-15 (Finding 2): the STORED record is validated before it
+    // feeds any gate below — the same shared rules as quote
+    // creation, applied to the persisted proposal and the stored
+    // effective guarantee mode. Placement: after §6.10 replay, the
+    // recorded-INDETERMINATE guard, and validateCommit (their
+    // precedence is preserved), before any re-preview or mutation.
+    validateStoredQuoteRuntime(validated);
 
     const input = validated.provider_preview_input as PaddlePreviewInput;
     const proposal = validated.proposal;
