@@ -290,6 +290,7 @@ import {
   checkAcceptanceEnvelope,
 } from "../core/scq-engine.js";
 import { QuoteStore, type StoredQuote } from "../store/quote-store.js";
+import { DurableQuoteStore } from "../store/durable-store.js";
 import { DispatchBlockedError, type DurableMutationCoordinator } from "../store/mutation-coordinator.js";
 import { ChargebeeClient, ChargebeeHttpError } from "./chargebee-http.js";
 
@@ -831,8 +832,12 @@ export type ChargebeeLiveAdapterOptions = {
    * durable attempts are checked before any dispatch, and the
    * attempt is settled from the quote's durable terminal record.
    * A persistence failure throws — there is no silent fallback to
-   * in-memory behavior. When absent, behavior is exactly the
-   * pre-PR-8 in-memory behavior.
+   * in-memory behavior. When absent AND the store is the in-memory
+   * QuoteStore, behavior is exactly the pre-PR-8 in-memory
+   * behavior. When absent but the store IS a DurableQuoteStore,
+   * commits are REFUSED before any mutating call (PR-17 review
+   * correction D4): a durable store without its coordinator would
+   * otherwise dispatch with no write-ahead attempt.
    */
   durableCoordinator?: DurableMutationCoordinator;
   /** Provider site identifier recorded on the write-ahead intent (never a credential). */
@@ -1193,10 +1198,37 @@ export class ChargebeeLiveAdapter implements SubscriptionProvider {
     }
   }
 
-  /** PR-8: write-ahead gate (no-op unless a durable coordinator is configured). Returns the attempt id. */
+  /**
+   * PR-8: write-ahead gate (no-op unless a durable coordinator is
+   * configured). Returns the attempt id.
+   *
+   * PR-17 review correction D4: a DurableQuoteStore WITHOUT its
+   * coordinator is a misconfiguration, not a silent no-op — the
+   * commit would reach update_for_items with NO write-ahead
+   * attempt, defeating the ledger's at-most-once dispatch
+   * authorization in exactly the configuration durability was
+   * chosen for. It is refused here, after the live-commit gate and
+   * before any mutating call. The genuinely in-memory
+   * configuration (a plain QuoteStore and no coordinator) keeps
+   * its pre-PR-8 behavior, and the replay / stale-quote /
+   * indeterminate-retry refusals earlier in commitChangeQuote are
+   * unaffected (they perform no mutation either way).
+   */
   private beginDurableAttempt(validated: StoredQuote, input: LivePreviewInput, preDispatchFingerprint: string): string | undefined {
     const coordinator = this.opts.durableCoordinator;
-    if (!coordinator) return undefined;
+    if (!coordinator) {
+      if (this.store instanceof DurableQuoteStore) {
+        throw new SCQError(
+          "PROVIDER_ERROR",
+          "Refusing to commit: this adapter was configured with a DurableQuoteStore but no DurableMutationCoordinator " +
+            "(the durableCoordinator option). A mutating call without a write-ahead attempt is prohibited in the durable " +
+            "configuration — no provider mutation was issued. Supply the coordinator bound to the same durable store, " +
+            "or use the in-memory QuoteStore explicitly for non-durable operation.",
+          { blocked: "DURABLE_COORDINATOR_REQUIRED" },
+        );
+      }
+      return undefined;
+    }
     try {
       const attempt = coordinator.beginDispatch({
         quoteId: validated.quote_id,

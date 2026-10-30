@@ -37,7 +37,7 @@
 import { createRequire } from "node:module";
 import { createHash } from "node:crypto";
 import type Database from "better-sqlite3";
-import { SCQError, type MutationOutcome, type SubscriptionChangeReceipt, type VerificationEvidence } from "../core/types.js";
+import { SCQError, type MutationOutcome, type ReconciliationResult, type SubscriptionChangeReceipt, type VerificationEvidence } from "../core/types.js";
 import {
   QuoteStore,
   receiptIdentityDigest,
@@ -488,14 +488,24 @@ export class DurableQuoteStore extends QuoteStore {
 
   /** Persists one quote (row + receipt record) in a single transaction, with version CAS. */
   private persistQuote(quoteId: string, op: string): void {
-    this.faults?.beforePersist?.(op);
-    const quote = QuoteStore.prototype.get.call(this, quoteId) as StoredQuote | undefined;
-    if (!quote) return;
-    const expected = this.versions.get(quoteId) ?? 0;
-    const next = expected + 1;
-    const recordJson = encodeRecordJson(quote);
-    const recordSha = sha256(recordJson);
+    // PR-17 review correction D1: EVERY step of the persistence
+    // path — the pre-persist fault hook, the persistence encoding,
+    // and the transaction itself — is inside the fail-closed
+    // coverage. A failure in any of them poisons the store: the
+    // parent's in-memory mutation has already happened by the time
+    // write-through runs, and a store that cannot prove its memory
+    // matches disk must not serve that memory as durable (reads are
+    // poison-guarded below). Previously the hook and the encoding
+    // ran outside the try/catch, so a hook failure left the store
+    // unpoisoned AND its volatile state readable.
     try {
+      this.faults?.beforePersist?.(op);
+      const quote = QuoteStore.prototype.get.call(this, quoteId) as StoredQuote | undefined;
+      if (!quote) return;
+      const expected = this.versions.get(quoteId) ?? 0;
+      const next = expected + 1;
+      const recordJson = encodeRecordJson(quote);
+      const recordSha = sha256(recordJson);
       const tx = this.db.transaction(() => {
         if (expected === 0) {
           this.db.prepare(
@@ -588,6 +598,50 @@ export class DurableQuoteStore extends QuoteStore {
     }
   }
 
+  // -- QuoteStore read guards (PR-17 review correction D1) --------------------
+  //
+  // Every write-through override above mutates the parent's
+  // in-memory state FIRST and persists second. If persistence
+  // fails, the store is poisoned — but poison alone only stopped
+  // WRITES; the inherited reads kept serving the newer volatile
+  // state (a receipt that was never persisted could be returned by
+  // recordedReceipt, and with it by checkIdempotentReplay's §6.10
+  // replay in the adapters, as if it were durable — a restart then
+  // lost it). So every read / replay / enumeration egress is
+  // poison-guarded here: once a persistence failure has occurred,
+  // NO read on this instance serves state that may not be on disk.
+  // The only recovery is a restart from the database file, whose
+  // contents are exactly what actually committed. (The internal
+  // load/recovery path deliberately calls the parent's prototype
+  // methods directly, before any poisoning can exist; the attempt
+  // ledger reads below hit SQLite directly and always reflect
+  // durable truth.)
+
+  override get(quoteId: string): StoredQuote | undefined {
+    this.assertHealthy();
+    return QuoteStore.prototype.get.call(this, quoteId) as StoredQuote | undefined;
+  }
+
+  override all(): StoredQuote[] {
+    this.assertHealthy();
+    return QuoteStore.prototype.all.call(this) as StoredQuote[];
+  }
+
+  override recordedReceipt(quoteId: string): SubscriptionChangeReceipt | undefined {
+    this.assertHealthy();
+    return QuoteStore.prototype.recordedReceipt.call(this, quoteId);
+  }
+
+  override receiptsWithReconciliation(status: ReconciliationResult["status"]): SubscriptionChangeReceipt[] {
+    this.assertHealthy();
+    return QuoteStore.prototype.receiptsWithReconciliation.call(this, status);
+  }
+
+  override serializeReceiptRecords(): string {
+    this.assertHealthy();
+    return QuoteStore.prototype.serializeReceiptRecords.call(this);
+  }
+
   // -- attempt ledger -----------------------------------------------------------
 
   private rowToAttempt(row: Record<string, unknown>): StoredAttempt {
@@ -632,12 +686,12 @@ export class DurableQuoteStore extends QuoteStore {
    * DISPATCHING is), or an INDETERMINATE terminal attempt that an
    * operator has not explicitly resolved.
    */
-  findBlockingAttempt(quoteId: string, subscriptionId: string): StoredAttempt | undefined {
+  findBlockingAttempt(quoteId: string, subscriptionId: string, excludeAttemptId?: string): StoredAttempt | undefined {
     const rows = this.db.prepare(
       `SELECT * FROM attempts WHERE (quote_id = ? OR subscription_id = ?) AND (
          state = 'DISPATCHING' OR (state = 'INDETERMINATE' AND operator_review_state != 'RESOLVED')
-       ) ORDER BY created_at LIMIT 1`,
-    ).get(quoteId, subscriptionId) as Record<string, unknown> | undefined;
+       )${excludeAttemptId !== undefined ? " AND attempt_id != ?" : ""} ORDER BY created_at LIMIT 1`,
+    ).get(...(excludeAttemptId !== undefined ? [quoteId, subscriptionId, excludeAttemptId] : [quoteId, subscriptionId])) as Record<string, unknown> | undefined;
     return rows ? this.rowToAttempt(rows) : undefined;
   }
 
@@ -645,8 +699,14 @@ export class DurableQuoteStore extends QuoteStore {
    * THE write-ahead gate. In ONE immediate transaction:
    *   - refuses when the idempotency key is already bound to a
    *     DIFFERENT request hash (key reuse with different parameters);
+   *   - refuses when the key is bound to a different quote /
+   *     subscription / provider / site (D2: a key is never
+   *     re-associated, whatever the bound attempt's state);
    *   - returns the existing attempt when the same key + same
-   *     request is presented again (the original attempt stands);
+   *     request is presented again (the original attempt stands) —
+   *     except a CONFIRMED_NON_EXECUTION attempt, which may be
+   *     re-armed ONLY after the blocking-attempt exclusion is
+   *     re-checked in this same transaction (D2);
    *   - refuses when a blocking attempt exists for this quote or
    *     subscription;
    *   - supersedes any PREPARED (never-dispatched) attempt for the
@@ -676,6 +736,25 @@ export class DurableQuoteStore extends QuoteStore {
               { attemptId: existing.attemptId, existingRequestHash: existing.requestHash, requestHash: hash },
             );
           }
+          // PR-17 review correction D2: the key is bound to ONE
+          // quote / subscription / provider / site, not merely to a
+          // request hash. The same key + identical request presented
+          // under a different quote, subscription, provider, or site
+          // is a collision, never a re-association — in ANY state of
+          // the bound attempt.
+          if (
+            existing.quoteId !== intent.quoteId ||
+            existing.subscriptionId !== intent.subscriptionId ||
+            existing.provider !== intent.provider ||
+            (existing.site ?? undefined) !== (intent.site ?? undefined)
+          ) {
+            throw new DispatchBlockedError(
+              `Idempotency key ${intent.idempotencyKey} is already bound to a different quote/subscription/provider/site ` +
+                `(attempt ${existing.attemptId}: quote ${existing.quoteId}, subscription ${existing.subscriptionId}, provider ${existing.provider}, site ${existing.site ?? "(none)"}); ` +
+                `it cannot be re-associated with quote ${intent.quoteId}, subscription ${intent.subscriptionId}, provider ${intent.provider}, site ${intent.site ?? "(none)"}.`,
+              { attemptId: existing.attemptId, quoteId: existing.quoteId, subscriptionId: existing.subscriptionId, provider: existing.provider, site: existing.site },
+            );
+          }
           if (existing.state === "DISPATCHING" || (existing.state === "INDETERMINATE" && existing.operatorReviewState !== "RESOLVED")) {
             throw new DispatchBlockedError(
               `Dispatch blocked: the attempt bound to this idempotency key (${existing.attemptId}) is ${existing.state} and unresolved — blind retry is prohibited.`,
@@ -689,6 +768,23 @@ export class DurableQuoteStore extends QuoteStore {
             // classification permits. The row is reset in-place
             // (the key stays bound to the same request hash) with
             // the re-dispatch recorded in the history.
+            //
+            // PR-17 review correction D2: BEFORE re-arming, the
+            // same-quote / same-subscription exclusion is re-checked
+            // under THIS SAME immediate transaction, excluding only
+            // this terminal row itself. Previously this branch
+            // returned before (and instead of) the exclusion query,
+            // so a retry of a confirmed-non-executed attempt could
+            // dispatch concurrently with another quote's unresolved
+            // mutation of the same subscription.
+            const blocking = this.findBlockingAttempt(intent.quoteId, intent.subscriptionId, existing.attemptId);
+            if (blocking) {
+              throw new DispatchBlockedError(
+                `Dispatch blocked: re-dispatch of the confirmed-non-execution attempt ${existing.attemptId} must wait — attempt ${blocking.attemptId} for quote ${blocking.quoteId} / subscription ${blocking.subscriptionId} is ${blocking.state}` +
+                  (blocking.state === "INDETERMINATE" ? " and unresolved — blind retry is prohibited until an operator resolves it after reconciliation." : " and has no terminal record."),
+                { attemptId: blocking.attemptId, state: blocking.state, rearmedAttemptId: existing.attemptId },
+              );
+            }
             this.db.prepare(`UPDATE attempts SET state='DISPATCHING', outcome=NULL, recovery_classification=NULL, version=version+1, updated_at=? WHERE attempt_id=?`).run(now, existing.attemptId);
             this.db.prepare(`INSERT INTO attempt_history (attempt_id, state, at, note) VALUES (?,?,?,?)`).run(existing.attemptId, "DISPATCHING", now, "re-dispatch authorized: prior attempt terminally CONFIRMED_NON_EXECUTION with the identical request");
             result = this.getAttempt(existing.attemptId);
@@ -837,6 +933,19 @@ export class DurableQuoteStore extends QuoteStore {
 
   /** persistQuote variant for use inside a caller-managed transaction (no nested transaction, no version double-count). */
   private persistQuoteInTx(quoteId: string, op: string): void {
+    // PR-17 review correction D1: same complete fail-closed
+    // coverage as persistQuote — a hook or encoding failure here
+    // propagates (rolling the caller's transaction back) AND
+    // poisons the store, so the already-mutated in-memory state is
+    // never served as durable by a later read.
+    try {
+      this.persistQuoteInTxInner(quoteId, op);
+    } catch (e) {
+      this.failPoison(op, e);
+    }
+  }
+
+  private persistQuoteInTxInner(quoteId: string, op: string): void {
     this.faults?.beforePersist?.(op);
     const quote = QuoteStore.prototype.get.call(this, quoteId) as StoredQuote | undefined;
     if (!quote) return;
@@ -883,8 +992,11 @@ export class DurableQuoteStore extends QuoteStore {
     identityConflicts: Array<Record<string, unknown>>;
     corruptRecords: Array<Record<string, unknown>>;
   } {
+    this.assertHealthy(); // D1: a poisoned store's report would describe volatile state as if durable
     const item = (a: StoredAttempt): Record<string, unknown> => {
       const quote = QuoteStore.prototype.get.call(this, a.quoteId) as StoredQuote | undefined;
+      const recorded = quote?.commit_receipt_recorded;
+      const committedClass = a.state === "COMMITTED_AND_VERIFIED" || a.state === "COMMITTED_UNVERIFIED";
       return {
         attemptId: a.attemptId,
         quoteId: a.quoteId,
@@ -895,9 +1007,19 @@ export class DurableQuoteStore extends QuoteStore {
           providerStateObserved: quote?.commit_outcome?.details ?? null,
         },
         established: {
-          mutationExecutionEstablished: a.state === "COMMITTED_AND_VERIFIED" || a.state === "COMMITTED_UNVERIFIED",
-          financialResultEstablished: a.state === "COMMITTED_AND_VERIFIED",
-          stateAttributableToThisMutation: a.state === "COMMITTED_AND_VERIFIED" || a.state === "COMMITTED_UNVERIFIED",
+          // PR-17 review correction D3: derived from the recorded
+          // evidence, not the outcome class alone. Execution is
+          // established only when a recorded receipt exists (a
+          // receipt is recorded solely from the response-received
+          // side — PR #16 L1); the financial result only by a
+          // verified recorded outcome; attribution from the
+          // receipt's own provenance/determinacy via
+          // attributionFromReceipt. For a non-committed attempt
+          // there is no attributable state at all, so attribution
+          // is false rather than unknown.
+          mutationExecutionEstablished: committedClass && recorded !== undefined,
+          financialResultEstablished: a.state === "COMMITTED_AND_VERIFIED" && recorded?.outcome === "COMMITTED_AND_VERIFIED",
+          stateAttributableToThisMutation: committedClass ? attributionFromReceipt(quote?.commit_receipt ?? recorded) : false,
         },
         operatorInterventionRequired: a.state === "INDETERMINATE" || a.state === "DISPATCHING",
         nextPermittedAction:
@@ -913,7 +1035,19 @@ export class DurableQuoteStore extends QuoteStore {
       quoteId: r.quoteId,
       receiptId: r.receiptId ?? null,
       outcome: r.outcome ?? "COMMITTED_UNVERIFIED",
-      established: { mutationExecutionEstablished: true, financialResultEstablished: false, stateAttributableToThisMutation: true },
+      established: {
+        // Execution is established by the record's existence: a
+        // receipt is recorded only from the response-received side
+        // (PR #16 L1). The financial result is NOT established —
+        // that is what this receipt's UNVERIFIED reconciliation
+        // records. Attribution is derived per-receipt (D3): a
+        // broken-bracket record reports false, bound provider
+        // actuals report true, and unprovenanced candidates report
+        // "unknown" — none of them default from the outcome class.
+        mutationExecutionEstablished: true,
+        financialResultEstablished: false,
+        stateAttributableToThisMutation: attributionFromReceipt(r),
+      },
       operatorInterventionRequired: true,
       nextPermittedAction: "Establish verification from an independent provider observation (establishVerification + verifyCommitReceipt), or leave unverified. Never re-dispatch.",
     }));
@@ -957,4 +1091,58 @@ export class DurableQuoteStore extends QuoteStore {
       db.close();
     }
   }
+}
+
+/**
+ * PR-17 review correction D3: whether the state a receipt OBSERVED
+ * is attributable to THIS mutation, derived from the receipt's own
+ * recorded evidence — never defaulted from its outcome class.
+ * COMMITTED_UNVERIFIED covers materially different records:
+ * figures bound to this operation (attributable), the PR #16 Z3
+ * broken-bracket record (an intervening write broke the
+ * response→re-read fingerprint bracket; the observed recurring
+ * state is explicitly NOT this commit's), and candidate figures
+ * with no independent observation (genuinely unknown). The return
+ * type is honest about that third case: `boolean | "unknown"`.
+ */
+export function attributionFromReceipt(receipt: SubscriptionChangeReceipt | undefined): boolean | "unknown" {
+  if (!receipt) return "unknown";
+  // A completed verification transition is an established-evidence
+  // judgment over exactly this question.
+  if (receipt.outcome === "COMMITTED_AND_VERIFIED" && receipt.reconciliation?.status === "OK") return true;
+  const effect = receipt.committedEffect;
+  const source = effect?.provenance?.committedSource;
+  if (source === "provider_actual" || source === "defined_equal_exact") {
+    // The committed figures ARE this operation's bound actuals.
+    return true;
+  }
+  if (source === "revalidated_preview" || source === "pre_mutation_estimate") {
+    // Quote-side provenance never establishes attribution.
+    return false;
+  }
+  if (source === "unestablished") {
+    const recurringFigureRecorded = effect?.recurring?.resultingAmount !== undefined;
+    if (recurringFigureRecorded && effect?.determinacy?.recurringFinancialEffect === "DETERMINED") {
+      // PR #16 (test 26.10a) shape: the whole-effect source label
+      // is "unestablished" because ONE dimension is, but the
+      // recurring figure was established from a bracket-closed
+      // independent re-read — the observed recurring state IS
+      // attributable to this commit; only the other dimension is
+      // unestablished.
+      return true;
+    }
+    if (!recurringFigureRecorded) {
+      // PR #16 Z3 broken-bracket shape (tests 26.14a/b): no
+      // recurring figure is recorded as this commit's precisely
+      // because attribution failed — the observed state is an
+      // intervening actor's, retained as unattributed context.
+      return false;
+    }
+    // Candidate figures present under UNKNOWN determinacy, with no
+    // independent state observation (PR #16, test 26.17 shape):
+    // attribution is not established in either direction.
+    return "unknown";
+  }
+  // No provenance recorded: unknown, explicitly — never defaulted.
+  return "unknown";
 }
