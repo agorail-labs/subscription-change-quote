@@ -11,6 +11,15 @@
  */
 export * from "./core/types.js";
 export { QuoteStore, establishVerification } from "./store/quote-store.js";
+export {
+  DurableQuoteStore,
+  DurableStoreError,
+  DurableRecoveryError,
+  DispatchBlockedError,
+  type StoredAttempt,
+  type MutationIntent,
+} from "./store/durable-store.js";
+export { DurableMutationCoordinator } from "./store/mutation-coordinator.js";
 export { StripeAdapter } from "./adapters/stripe-adapter.js";
 export { StripeSim } from "./adapters/stripe-sim.js";
 export { PaddleAdapter } from "./adapters/paddle-adapter.js";
