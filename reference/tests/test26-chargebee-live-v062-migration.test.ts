@@ -403,21 +403,67 @@ test("Test 26.11: the dispatch is lost BEFORE reaching the provider — INDETERM
 // 26.12 — Lost response, final state matches, attribution unresolved
 // ---------------------------------------------------------------------------
 
-test("Test 26.12: lost response with the intended set in effect — COMMITTED_UNVERIFIED (not verified): matching state alone proves neither the incurred result nor exclusive attribution", async () => {
-  const { adapter, mock } = makeAdapter({ loseUpdateResponse: true });
+test("Test 26.12: lost response with the intended set in effect — INDETERMINATE (PR-7 review L1): matching state does not establish that THIS request landed", async () => {
+  // DISCLOSED CHANGE (PR-7 review L1): this test previously asserted
+  // a COMMITTED_UNVERIFIED receipt. The review established that a
+  // changed subscription matching the intended result does not prove
+  // THIS request caused the change: the observations are identical
+  // if another actor applied the same item set while our request
+  // never landed (see 26.12b). An idempotency key sent with a lost
+  // request does not establish execution, and Chargebee supplies no
+  // per-operation read-back artifact in this adapter's validated
+  // surface — so with no successful response and no operation-bound
+  // execution evidence, the outcome is INDETERMINATE: the outcome is
+  // persisted (with the observed state as diagnostic context), NO
+  // committed receipt is recorded, and blind retry is refused.
+  // COMMITTED_UNVERIFIED remains for cases where a response WAS
+  // received (e.g. test21-c8, 26.10, 26.17).
+  const { adapter, mock, store, dispatches } = makeAdapter({ loseUpdateResponse: true });
   const quote = await adapter.createChangeQuote(SUB, PROPOSAL(21));
-  const receipt = await adapter.commitChangeQuote(quote.id);
-  assert.equal(receipt.status, "COMMITTED_UNVERIFIED");
-  assert.equal(receipt.outcome, "COMMITTED_UNVERIFIED");
-  assert.equal(receipt.reconciliation.status, "UNVERIFIED");
-  assert.deepEqual((receipt.reconciliation as any).undeterminedDimensions, ["immediateFinancialEffect", "recurringFinancialEffect"]);
-  assert.equal(receipt.committedEffect.immediate, undefined, "the incurred actual was in the lost response; no read-back exists");
-  assert.equal(receipt.committedEffect.recurring?.resultingAmount, undefined, "no recurring figure is recorded for this commit (PR #14 Z3)");
-  assert.equal(receipt.resultingSnapshot.items.find((i) => i.id === ADDON)?.quantity, 21, "the observed state is retained as context in the snapshot — context, not a committed figure");
+  await assert.rejects(
+    () => adapter.commitChangeQuote(quote.id),
+    (e: unknown) => e instanceof SCQError && (e.details as any)?.outcome === "INDETERMINATE" && (e.details as any)?.indeterminate === true,
+  );
+  assert.equal(store.get(quote.id)?.commit_outcome?.outcome, "INDETERMINATE", "the attempt leaves a typed outcome record");
+  assert.equal(store.get(quote.id)?.commit_receipt, undefined, "no committed receipt — landing by THIS request is not established");
+  assert.equal(mock.mutationCount, 1, "the mock did apply the update before losing the response — and the classification is still INDETERMINATE");
+  await assert.rejects(
+    () => adapter.commitChangeQuote(quote.id),
+    (e: unknown) => e instanceof SCQError && (e.details as any)?.outcome === "INDETERMINATE",
+  );
+  assert.equal(updateDispatches(dispatches).length, 1, "no second dispatch — the recorded INDETERMINATE refuses blind retry");
   assert.equal(mock.mutationCount, 1);
-  const replay = await adapter.commitChangeQuote(quote.id);
-  assert.deepEqual(replay, receipt, "§6.10: replay returns the recorded unverified receipt");
-  assert.equal(mock.mutationCount, 1);
+});
+
+test("Test 26.12b: observational equivalence — the request fails BEFORE application while an independent actor writes the SAME target state: INDETERMINATE, indistinguishable from 26.12", async () => {
+  // The mirror image of 26.12: our dispatch never reaches the
+  // provider's mutation path, but a separate actor applies exactly
+  // the intended item set, advancing resource_version. Every
+  // observation available to the adapter (intended set in effect,
+  // fingerprint moved) is identical to the applied-but-lost case —
+  // so both must classify INDETERMINATE with no committed receipt.
+  const { adapter, mock, store, dispatches } = makeAdapter({}, {
+    wrap: (mock) => async (req) => {
+      if (req.method === "POST" && req.url.includes("/update_for_items")) {
+        mock.applyExternalChange(ADDON, 21); // the independent actor lands the identical change
+        throw new Error("connection reset before provider application"); // our request never applied
+      }
+      return mock.transport(req);
+    },
+  });
+  const quote = await adapter.createChangeQuote(SUB, PROPOSAL(21));
+  await assert.rejects(
+    () => adapter.commitChangeQuote(quote.id),
+    (e: unknown) => e instanceof SCQError && (e.details as any)?.outcome === "INDETERMINATE" && (e.details as any)?.indeterminate === true,
+  );
+  assert.equal(store.get(quote.id)?.commit_outcome?.outcome, "INDETERMINATE");
+  assert.equal(store.get(quote.id)?.commit_receipt, undefined, "no committed receipt — the matching state is another actor's work");
+  assert.equal(mock.mutationCount, 0, "our request never reached the provider's mutation path");
+  await assert.rejects(
+    () => adapter.commitChangeQuote(quote.id),
+    (e: unknown) => e instanceof SCQError && (e.details as any)?.outcome === "INDETERMINATE",
+  );
+  assert.equal(updateDispatches(dispatches).length, 1, "no blind retry");
 });
 
 // ---------------------------------------------------------------------------
@@ -512,11 +558,20 @@ test("Test 26.15a: concurrent duplicate commits replay natively — the provider
   assert.equal(store.get(quote.id)?.commit_receipt?.committedEffect?.immediate?.net, 20000);
 });
 
-test("Test 26.15b: a same-key/different-parameters conflict refused at dispatch (provider 422) is CONFIRMED_NON_EXECUTION — recorded, and it does not block a later attempt", async () => {
-  let conflict = true;
+test("Test 26.15b: a 422 duplicate_request where the key was already consumed by a PRIOR processed request with different parameters — INDETERMINATE (PR-7 review L2), re-dispatch blocked pending reconciliation", async () => {
+  // DISCLOSED CHANGE (PR-7 review L2): this test previously asserted
+  // CONFIRMED_NON_EXECUTION. A 422 idempotency conflict establishes
+  // only that THIS attempt was rejected; it does NOT establish that
+  // the operation that originally consumed the key did not execute —
+  // here that prior request (different parameters: quantity 99) DID
+  // land. The quote therefore preserves the possibility of an
+  // earlier landing: the outcome is INDETERMINATE, no receipt is
+  // recorded, and a new dispatch is blocked pending reconciliation
+  // (the same guard as a recorded lost-dispatch INDETERMINATE).
   const { adapter, mock, store, dispatches } = makeAdapter({}, {
     wrap: (mock) => async (req) => {
-      if (conflict && req.method === "POST" && req.url.includes("/update_for_items")) {
+      if (req.method === "POST" && req.url.includes("/update_for_items")) {
+        mock.applyExternalChange(ADDON, 99); // the prior processed request that consumed this key, with different parameters
         return {
           status: 422,
           headers: {},
@@ -534,15 +589,64 @@ test("Test 26.15b: a same-key/different-parameters conflict refused at dispatch 
   const quote = await adapter.createChangeQuote(SUB, PROPOSAL(21));
   await assert.rejects(
     () => adapter.commitChangeQuote(quote.id),
-    (e: unknown) => e instanceof SCQError && e.code === "PROVIDER_ERROR" && (e.details as any)?.outcome === "CONFIRMED_NON_EXECUTION",
+    (e: unknown) => e instanceof SCQError && e.code === "PROVIDER_ERROR" && (e.details as any)?.outcome === "INDETERMINATE",
   );
-  assert.equal(store.get(quote.id)?.commit_outcome?.outcome, "CONFIRMED_NON_EXECUTION");
+  assert.equal(store.get(quote.id)?.commit_outcome?.outcome, "INDETERMINATE", "NOT confirmed non-execution — the key's original operation may have executed");
   assert.equal(store.get(quote.id)?.commit_receipt, undefined);
-  assert.equal(mock.mutationCount, 0, "the conflicting request never reached the provider's mutation path");
-  conflict = false;
-  const receipt = await adapter.commitChangeQuote(quote.id);
-  assert.equal(receipt.status, "COMMITTED", "a confirmed non-execution is definitive — a later attempt is not blocked by it");
-  assert.equal(updateDispatches(dispatches).length, 2);
+  assert.equal(mock.mutationCount, 0, "this attempt never reached the provider's mutation path — but the prior key-holder's change is in effect");
+  await assert.rejects(
+    () => adapter.commitChangeQuote(quote.id),
+    (e: unknown) => e instanceof SCQError && (e.details as any)?.outcome === "INDETERMINATE",
+  );
+  assert.equal(updateDispatches(dispatches).length, 1, "no re-dispatch pending reconciliation");
+});
+
+test("Test 26.15e: an HTTP 408 (request timeout) on the mutation is INDETERMINATE (PR-7 review L2) — a timeout is not evidence the request was never applied", async () => {
+  const { adapter, mock, store, dispatches } = makeAdapter({}, {
+    wrap: (mock) => async (req) => {
+      if (req.method === "POST" && req.url.includes("/update_for_items")) {
+        return { status: 408, headers: {}, json: { type: "invalid_request", api_error_code: "request_timeout", message: "request timed out", http_status_code: 408 } };
+      }
+      return mock.transport(req);
+    },
+  });
+  const quote = await adapter.createChangeQuote(SUB, PROPOSAL(21));
+  await assert.rejects(
+    () => adapter.commitChangeQuote(quote.id),
+    (e: unknown) => e instanceof SCQError && (e.details as any)?.outcome === "INDETERMINATE",
+  );
+  assert.equal(store.get(quote.id)?.commit_outcome?.outcome, "INDETERMINATE", "NOT confirmed non-execution — the request may have been applied before the timeout");
+  assert.equal(store.get(quote.id)?.commit_receipt, undefined);
+  assert.equal(mock.mutationCount, 0);
+  await assert.rejects(
+    () => adapter.commitChangeQuote(quote.id),
+    (e: unknown) => e instanceof SCQError && (e.details as any)?.outcome === "INDETERMINATE",
+  );
+  assert.equal(updateDispatches(dispatches).length, 1, "no blind retry after an ambiguous timeout");
+});
+
+test("Test 26.15f: an ambiguous HTTP 429 (rate limiting) on the mutation is INDETERMINATE (PR-7 review L2) — rate limiting does not establish non-execution", async () => {
+  const { adapter, mock, store, dispatches } = makeAdapter({}, {
+    wrap: (mock) => async (req) => {
+      if (req.method === "POST" && req.url.includes("/update_for_items")) {
+        return { status: 429, headers: {}, json: { type: "invalid_request", api_error_code: "too_many_requests", message: "rate limit exceeded", http_status_code: 429 } };
+      }
+      return mock.transport(req);
+    },
+  });
+  const quote = await adapter.createChangeQuote(SUB, PROPOSAL(21));
+  await assert.rejects(
+    () => adapter.commitChangeQuote(quote.id),
+    (e: unknown) => e instanceof SCQError && (e.details as any)?.outcome === "INDETERMINATE",
+  );
+  assert.equal(store.get(quote.id)?.commit_outcome?.outcome, "INDETERMINATE", "NOT confirmed non-execution — an ambiguous 429 carries no proof the request was never applied");
+  assert.equal(store.get(quote.id)?.commit_receipt, undefined);
+  assert.equal(mock.mutationCount, 0);
+  await assert.rejects(
+    () => adapter.commitChangeQuote(quote.id),
+    (e: unknown) => e instanceof SCQError && (e.details as any)?.outcome === "INDETERMINATE",
+  );
+  assert.equal(updateDispatches(dispatches).length, 1, "no blind retry after an ambiguous 429");
 });
 
 test("Test 26.15c: after the native 30-minute window the provider REPROCESSES the same key (client-level hazard) — which is why the adapter's own guards, not the native window, carry exactly-once", async () => {
@@ -632,6 +736,16 @@ test("Test 26.16: a definitive pre-effect rejection (HTTP 400) records CONFIRMED
   assert.equal(updateDispatches(dispatches).length, 1);
   const snap = await adapter.getSubscription(SUB);
   assert.equal(snap.items.find((i) => i.id === ADDON)?.quantity, 1, "provider state is untouched");
+  // Positive control for the L2 line: a demonstrable pre-effect
+  // rejection does NOT block a later attempt — the retry guard is
+  // reserved for INDETERMINATE outcomes. A second attempt dispatches
+  // again (and is again refused pre-effect by the provider).
+  await assert.rejects(
+    () => adapter.commitChangeQuote(quote.id),
+    (e: unknown) => e instanceof SCQError && (e.details as any)?.outcome === "CONFIRMED_NON_EXECUTION",
+  );
+  assert.equal(updateDispatches(dispatches).length, 2, "a confirmed non-execution leaves a later attempt unblocked");
+  assert.equal(mock.mutationCount, 0);
 });
 
 // ---------------------------------------------------------------------------

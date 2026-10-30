@@ -182,9 +182,13 @@
 //       Defect 3), INDETERMINATE (no receipt; the outcome is
 //       recorded in the store and any later commit attempt on the
 //       quote is refused before any read or mutation — no blind
-//       retry), CONFIRMED_NON_EXECUTION (pre-effect rejections:
-//       the provider refused the dispatched request before
-//       applying anything). HTTP 200 alone never verifies: the
+//       retry), CONFIRMED_NON_EXECUTION (restricted, per the PR-7
+//       review correction L2, to DEMONSTRABLE pre-effect failures —
+//       an explicit provider validation rejection, HTTP 400; a
+//       blanket 4xx rule is unsupported: 408 timeouts, ambiguous
+//       429s, unclassified 4xx, and 422 idempotency conflicts carry
+//       no proof the request was never applied and classify as
+//       INDETERMINATE). HTTP 200 alone never verifies: the
 //       intended item set must be established by an independent
 //       post-commit re-read, the financial actuals must be
 //       established (immediate from the mutating call's own
@@ -219,11 +223,26 @@
 //       Chargebee offers NO operation-level financial read-back (no
 //       unbilled-charge retrieval in this adapter's validated
 //       surface), so a lost response's immediate actual is
-//       UNRECOVERABLE from provider data: landing can be established
-//       from the re-read state, the financials cannot — the outcome
-//       is COMMITTED_UNVERIFIED with both dimensions UNKNOWN when
-//       the intended set is observed in effect, INDETERMINATE when
-//       it is not.
+//       UNRECOVERABLE from provider data. [PR-7 REVIEW CORRECTION
+//       L1, 2026-10-29: as first delivered, this adapter treated a
+//       re-read showing the intended set in effect on a moved
+//       fingerprint as establishing the landing, and recorded a
+//       COMMITTED_UNVERIFIED receipt. The review established that
+//       this proves only that the intended STATE is in effect, not
+//       that THIS request landed it — an independent actor applying
+//       the same item set is observationally indistinguishable
+//       (test26-12b), an idempotency key sent with a lost request
+//       does not establish execution, and no operation-bound
+//       provider landing signal was identified in Chargebee's
+//       validated surface. LOST-response outcomes are therefore
+//       INDETERMINATE whether or not the intended set is observed:
+//       outcome recorded (observed state retained as diagnostic
+//       context), NO receipt, blind retry refused.
+//       COMMITTED_UNVERIFIED is reserved for cases where a response
+//       WAS received — including a native idempotency REPLAY, whose
+//       returned response is the original operation's own response
+//       — and landing is thereby established while verification
+//       remains incomplete.]
 //     * Live commit remains DISABLED by default throughout; the
 //       commit path is exercised only against injected mocked
 //       transports. No real-network mutation is dispatched by any
@@ -1040,37 +1059,42 @@ export class ChargebeeLiveAdapter implements SubscriptionProvider {
       updateJson = res.json;
       idempotencyReplayed = res.idempotencyReplayed;
     } catch (e) {
-      if (
-        e instanceof ChargebeeHttpError &&
-        (e.indeterminate || e.httpStatus === 409 || (typeof e.httpStatus === "number" && e.httpStatus >= 500))
-      ) {
-        // Unknown-dispatch path: the request may have been processed
-        // (transport failure after dispatch; a 409 while the original
-        // operation is in flight under the same idempotency key; a
-        // 5xx, which Chargebee caches under the key without
-        // establishing whether the change applied). DO NOT re-issue
-        // the mutation. Reconcile from an independent state re-read:
-        // landing established + financials unverifiable is a
-        // COMMITTED_UNVERIFIED receipt (v0.6.2 — protocol Defect 3
-        // closed); landing not established is INDETERMINATE.
-        return this.reconcileAfterUnknownDispatch(validated, input, preDispatchFingerprint, e);
-      }
-      if (e instanceof ChargebeeHttpError && typeof e.httpStatus === "number" && e.httpStatus >= 400 && e.httpStatus < 500) {
-        // Pre-effect rejection (CORE-5): the provider refused the
-        // dispatched request BEFORE applying anything (validation
-        // errors; a 422 idempotency conflict, where THIS dispatch was
-        // refused because the key already names a different request).
-        // Non-execution of this dispatch is demonstrable from the
-        // provider's own refusal semantics — record it distinctly
-        // from the indeterminate class; it carries the opposite retry
-        // rule (a fresh attempt may be made; nothing landed).
+      if (e instanceof ChargebeeHttpError && e.httpStatus === 400) {
+        // Demonstrable pre-effect rejection (CORE-5, restricted per
+        // PR-7 review correction L2): an explicit provider validation
+        // rejection (HTTP 400) refuses the request BEFORE anything is
+        // applied, with no prior-operation ambiguity — non-execution
+        // is demonstrable from the provider's own semantics. Record
+        // it distinctly from the indeterminate class; it carries the
+        // opposite retry rule (a fresh attempt may be made; nothing
+        // landed). This is the ONLY status classified here as
+        // CONFIRMED_NON_EXECUTION: a blanket 4xx rule is unsupported
+        // (see the unknown-dispatch branch below).
         this.store.recordCommitOutcome(quoteId, {
           outcome: "CONFIRMED_NON_EXECUTION",
           at: this.now().toISOString(),
-          details: { httpStatus: e.httpStatus, apiErrorCode: e.apiErrorCode, reason: "the mutating request was rejected by the provider before effect" },
+          details: { httpStatus: e.httpStatus, apiErrorCode: e.apiErrorCode, reason: "the mutating request was rejected by the provider before effect (explicit validation rejection, HTTP 400)" },
         });
         const mapped = this.toSCQ(e, validated.subscription_id);
         throw new SCQError(mapped.code, mapped.message, { outcome: "CONFIRMED_NON_EXECUTION", httpStatus: e.httpStatus, apiErrorCode: e.apiErrorCode });
+      }
+      if (e instanceof ChargebeeHttpError) {
+        // Unknown-dispatch path: the request may have been processed
+        // and its execution cannot be established or excluded. This
+        // covers transport failures after dispatch (indeterminate),
+        // 5xx (cached under the idempotency key without establishing
+        // application), 409, HTTP 408 (a timeout is not evidence the
+        // request was never applied), ambiguous 429 rate-limit
+        // responses, unclassified 4xx, and 422 idempotency conflicts
+        // (duplicate_request establishes that THIS attempt was
+        // rejected — NOT that the operation that originally consumed
+        // the key did not execute; an earlier landing remains
+        // possible and re-dispatch is blocked pending
+        // reconciliation). DO NOT re-issue the mutation. Reconcile
+        // from an independent state re-read; every outcome on this
+        // path is INDETERMINATE with the outcome recorded and blind
+        // retry refused (PR-7 review corrections L1/L2).
+        return this.reconcileAfterUnknownDispatch(validated, input, preDispatchFingerprint, e);
       }
       throw this.toSCQ(e, validated.subscription_id);
     }
@@ -1078,30 +1102,33 @@ export class ChargebeeLiveAdapter implements SubscriptionProvider {
   }
 
   /**
-   * v0.6.2 (PR-7): reconciles a dispatch whose outcome is unknown
-   * (lost response / 409 in-flight / 5xx) from an independent
-   * post-dispatch state re-read, WITHOUT re-issuing the mutation.
+   * v0.6.2 (PR-7, as corrected by review L1/L2): reconciles a
+   * dispatch whose execution cannot be established (lost response,
+   * transport failure, 408, ambiguous 429, 409, 5xx, 422 idempotency
+   * conflict, unclassified 4xx) from an independent post-dispatch
+   * state re-read, WITHOUT re-issuing the mutation.
    *
-   * Landing is established when the re-read state shows the complete
-   * intended item set in effect AND the state fingerprint moved from
-   * the fingerprint this commit validated (some write landed). Where
-   * landing is established, the commit is KNOWN to have landed but
-   * its financial outcome is unverifiable: Chargebee provides no
-   * operation-level financial read-back in this adapter's validated
-   * surface (a subscription re-read carries no unbilled-charge
-   * actuals), the lost response carried the only immediate actual,
-   * and the re-read recurring level cannot be EXCLUSIVELY attributed
-   * to this commit (another actor could have produced the identical
-   * set) — so the receipt is COMMITTED_UNVERIFIED with BOTH
-   * dimensions UNKNOWN and NO figures recorded (the estimate is
-   * never substituted; PR #14 Z3). The observed state survives only
-   * as unattributed context in the resulting snapshot.
+   * EVERY outcome on this path is INDETERMINATE. The re-read is
+   * diagnostic only: it can show that the intended state is (or is
+   * not) in effect, but it cannot establish that THIS request landed
+   * it. A changed subscription matching the intended result is
+   * observationally identical to an independent actor applying the
+   * same item set while our request never applied (test26-12b); an
+   * idempotency key sent with a lost request does not establish
+   * execution; and no operation-bound provider signal proving
+   * landing was identified in Chargebee's validated surface (no
+   * per-operation read-back artifact exists here). The outcome is
+   * recorded in the store with the observed state as diagnostic
+   * context, NO committed receipt is recorded, and the guard at the
+   * top of commitChangeQuote refuses any later blind retry of this
+   * quote pending manual reconciliation.
    *
-   * Where landing is not established (state unchanged, state shows a
-   * different set, or the re-read itself failed), the outcome is
-   * INDETERMINATE: the outcome is recorded in the store, NO receipt
-   * is recorded, and the guard at the top of commitChangeQuote
-   * refuses any later blind retry of this quote.
+   * The response-received / response-lost line: COMMITTED_UNVERIFIED
+   * is reachable ONLY from establishLiveCommit, where the mutating
+   * call's response WAS received (a native idempotency replay
+   * returns the original operation's own response and counts as
+   * received). Nothing on this unknown-dispatch path produces a
+   * committed receipt.
    */
   private async reconcileAfterUnknownDispatch(
     validated: StoredQuote,
@@ -1112,60 +1139,33 @@ export class ChargebeeLiveAdapter implements SubscriptionProvider {
     const quoteId = validated.quote_id;
     let after: CbSubscription | undefined;
     try { after = await this.readSubscription(validated.subscription_id); } catch { after = undefined; }
-    const landed =
-      after !== undefined &&
-      itemSetMismatches(after.subscription_items ?? [], input.items).length === 0 &&
-      fingerprintOf(after) !== preDispatchFingerprint;
-    if (after !== undefined && landed) {
-      const quoted = validated.quoted_effect;
-      const effect: CommercialEffect = {
-        recurring: {
-          currency: after.currency_code ?? quoted.recurring?.currency ?? "USD",
-          ...(quoted.recurring?.previousAmount !== undefined ? { previousAmount: quoted.recurring.previousAmount } : {}),
-        },
-        effectiveAt: quoted.effectiveAt,
-        determinacy: { immediateFinancialEffect: "UNKNOWN", recurringFinancialEffect: "UNKNOWN" },
-        provenance: {
-          immediate:
-            "unestablished: the mutating call's response was lost, and Chargebee provides no operation-level financial read-back in this adapter's validated surface — the incurred actual cannot be recovered from provider data; the pre-mutation estimate is never substituted for it",
-          recurring:
-            "unestablished for this commit: the re-read state shows the intended item set in effect, but with the mutation response lost the observed level cannot be exclusively attributed to this commit (PR #14 Z3) — it is retained only as unattributed context in the resulting snapshot",
-          committedSource: "unestablished",
-        },
-      };
-      return this.recordOutcomeReceipt(validated, {
-        effect,
-        reconciliation: {
-          status: "UNVERIFIED",
-          reason:
-            "the mutation is known to have landed — exactly one mutating call was dispatched, its response was lost, " +
-            "and an independent post-dispatch re-read shows the complete intended item set in effect on a moved state " +
-            "fingerprint — but the financial outcome cannot be verified: the response carrying the immediate actual " +
-            "was lost and no provider read-back can recover it, and the observed recurring level cannot be " +
-            "exclusively attributed to this commit. No figure is recorded for either dimension; the observed " +
-            "state is retained as unattributed context in the resulting snapshot, pending manual reconciliation " +
-            "from provider records",
-          undeterminedDimensions: ["immediateFinancialEffect", "recurringFinancialEffect"],
-        },
-        status: "COMMITTED_UNVERIFIED",
-        outcome: "COMMITTED_UNVERIFIED",
-        snapshot: snapshotFrom(after),
-      });
-    }
+    const intendedSetObserved =
+      after !== undefined && itemSetMismatches(after.subscription_items ?? [], input.items).length === 0;
+    const fingerprintMoved = after !== undefined && fingerprintOf(after) !== preDispatchFingerprint;
     this.store.recordCommitOutcome(quoteId, {
       outcome: "INDETERMINATE",
       at: this.now().toISOString(),
       details: {
         reason: after === undefined
-          ? "the mutating request's response was lost and the post-dispatch state re-read failed"
-          : "the mutating request's response was lost and provider state does not establish the intended change",
+          ? "the dispatch's execution could not be established and the post-dispatch state re-read failed"
+          : intendedSetObserved && fingerprintMoved
+            ? "the dispatch's execution could not be established; the re-read shows the intended item set in effect on a moved fingerprint, but that observation does not establish that THIS request landed it (an independent actor's identical write is observationally indistinguishable)"
+            : "the dispatch's execution could not be established and provider state does not show the intended change",
+        // Observed state retained as DIAGNOSTIC CONTEXT only — it is
+        // not a committed effect and grounds no receipt.
+        observedIntendedSetInEffect: intendedSetObserved,
+        observedFingerprintMoved: fingerprintMoved,
+        observedResourceVersion: after?.resource_version ?? null,
         cause: cause.message,
       },
     });
     if (after === undefined) {
-      throw new SCQError("PROVIDER_ERROR", "Commit outcome is INDETERMINATE: the mutating request's response was lost and the post-dispatch provider state could not be re-read, so whether the change landed is not established. No receipt was recorded and no second mutation was issued. Reconcile manually from provider records before any retry.", { outcome: "INDETERMINATE", indeterminate: true, reconciled: false });
+      throw new SCQError("PROVIDER_ERROR", "Commit outcome is INDETERMINATE: the mutating dispatch's execution could not be established and the post-dispatch provider state could not be re-read. No receipt was recorded and no second mutation was issued. Reconcile manually from provider records before any retry.", { outcome: "INDETERMINATE", indeterminate: true, reconciled: false });
     }
-    throw new SCQError("PROVIDER_ERROR", "Commit outcome is INDETERMINATE: the mutating request's response was lost and provider state does not show the intended change. No receipt was recorded and no second mutation was issued. Reconcile manually before any retry.", { outcome: "INDETERMINATE", indeterminate: true, reconciled: false, intendedItemsLanded: false });
+    if (intendedSetObserved && fingerprintMoved) {
+      throw new SCQError("PROVIDER_ERROR", "Commit outcome is INDETERMINATE: the mutating dispatch's execution could not be established. Provider state shows the intended item set in effect, but a matching changed state does not establish that THIS request caused the change — the same observations arise if another actor applied the identical change while this request never landed, and Chargebee provides no operation-bound execution evidence in this adapter's validated surface. No receipt was recorded and no second mutation was issued. Reconcile manually from provider records before any retry.", { outcome: "INDETERMINATE", indeterminate: true, reconciled: false, intendedItemsLanded: true });
+    }
+    throw new SCQError("PROVIDER_ERROR", "Commit outcome is INDETERMINATE: the mutating dispatch's execution could not be established and provider state does not show the intended change. No receipt was recorded and no second mutation was issued. Reconcile manually before any retry.", { outcome: "INDETERMINATE", indeterminate: true, reconciled: false, intendedItemsLanded: false });
   }
 
   /**

@@ -59,9 +59,10 @@ was made.
   (thrown, outcome recorded in the store, **no receipt**, and a
   recorded INDETERMINATE refuses any later dispatch for that quote
   before reads or mutations — no blind retry), and
-  `CONFIRMED_NON_EXECUTION` (definitive pre-effect provider
-  refusals — HTTP 400, and 422 `duplicate_request` — recorded as
-  outcomes). Candidates follow the merged PR #10/#11 construction:
+  `CONFIRMED_NON_EXECUTION` (restricted to demonstrable pre-effect
+  refusals — an explicit provider validation rejection, HTTP 400 —
+  recorded as outcomes; see the L2 review correction below).
+  Candidates follow the merged PR #10/#11 construction:
   present in the committed effect under UNKNOWN determinacy with
   `committedSource: "unestablished"` provenance, so a later
   identity-bound verification has a record to verify against.
@@ -87,7 +88,7 @@ never used for that fact.
 | Committed recurring actual | — | Candidates only (when the re-read is unavailable) | **Yes** — strict sum of the re-read items' stated amounts |
 | Landed item set (ids + quantities) | — | Response subscription anchors the bracket | **Yes** — verified complete against the intended set |
 | Attribution (this commit vs an intervening writer) | — | Bracket anchor (fingerprint of the response subscription) | Bracket close (fingerprint equality with the re-read) |
-| Landing known at all (lost-response case) | — | Absent by definition | Intended set in effect after a lost response ⇒ known landed, **unverified** (financials and exclusive attribution unproven) |
+| Landing known at all (lost-response case) | — | Absent by definition | **Never establishes landing by this request** (review L1): intended set in effect is observationally equivalent to an independent actor's identical write ⇒ INDETERMINATE, observed state retained as diagnostic context only |
 | Pre-dispatch state / staleness | — | — | The validation read (resource_version precondition) |
 
 ## Failing-first evidence (pre-migration probes)
@@ -111,7 +112,7 @@ transport, proposal `CHANGE_QUANTITY pilot-addon-vision 1 → 21`:
 | Scenario | Before | After (PR-7) |
 |---|---|---|
 | Landed, response without financials | INDETERMINATE, no receipt | `COMMITTED_UNVERIFIED` receipt; recurring established from re-read, immediate UNKNOWN (test21-c8, test26.10a) |
-| Lost response, intended set in effect | INDETERMINATE, no receipt | `COMMITTED_UNVERIFIED`, no figures recorded; state retained as snapshot context only (test21-c6, test13-rec2, test26.12) |
+| Lost response, intended set in effect | INDETERMINATE, no receipt | INDETERMINATE, **outcome recorded** with the observed state as diagnostic context; no receipt — matching state does not establish that THIS request landed (review L1; test21-c6, test13-rec2, test13-T07, test26.12, equivalence case test26.12b) |
 | Lost response, landing unestablishable | INDETERMINATE, no record | INDETERMINATE, **outcome recorded**; retry refused pre-dispatch (test26.11, test26.15d) |
 | Provider silently ignores a dispatched update | INDETERMINATE, no record | INDETERMINATE with outcome record (response claims success the unchanged state contradicts) |
 | Mandatory addon attached by provider | INDETERMINATE, no receipt | `COMMITTED_AND_VERIFIED` + VIOLATED receipt over the presented actuals (83400 incl. the addon's stated 2500) (test21-c9, test13-rec9 pattern) |
@@ -119,20 +120,28 @@ transport, proposal `CHANGE_QUANTITY pilot-addon-vision 1 → 21`:
 | Re-read omits items after landing | INDETERMINATE, no receipt | `COMMITTED_UNVERIFIED`; immediate established from response, recurring UNKNOWN — never a verified zero (test13-rec5) |
 | Re-read unavailable after response received | INDETERMINATE, no receipt | `COMMITTED_UNVERIFIED` with candidate figures (UNKNOWN determinacy); §6.10 replay + later identity-bound verification (test26.17) |
 | Intervening write (incl. round-trip restore) | n/a (misclassified or indeterminate) | `COMMITTED_UNVERIFIED`; no recurring figure recorded for this commit (Z3); response immediate survives (test26.14a/b) |
-| Definitive pre-effect rejection (400 / 422 conflict) | Generic provider error | `CONFIRMED_NON_EXECUTION` recorded; does not block a later attempt (test26.15b, test26.16) |
+| Definitive pre-effect rejection (HTTP 400 validation) | Generic provider error | `CONFIRMED_NON_EXECUTION` recorded; does not block a later attempt (test26.16, positive control) |
+| Ambiguous dispatch failure (408 timeout / 429 rate-limit / 422 idempotency conflict / unclassified 4xx) | Generic provider error (as first delivered: blanket 4xx ⇒ CONFIRMED_NON_EXECUTION) | INDETERMINATE, outcome recorded, re-dispatch blocked pending reconciliation (review L2; test26.15b, test26.15e, test26.15f) |
 | Committed determined zero | Absent | Present, DETERMINED (test26.1a) |
 | Quote / revalidation determinacy | Absent; drift checked without determinacy | Three-state + provenance; UNKNOWN refuses pre-mutation (test26.1b, 26.2, 26.8) |
 
 ## Regression matrix
 
 New file `reference/tests/test26-chargebee-live-v062-migration.test.ts`
-(33 tests) covers all 20 assignment rows through mocked transports
+(36 tests) covers all 20 assignment rows through mocked transports
 with a dispatch audit: rows 1 (26.1a/b), 2 (26.2), 3 (26.3a/b),
 4 (26.4a/b), 5 (26.5), 6 (26.6, incl. the amount_due == incurred
 coincidence), 7 (26.7a/b), 8 (26.8), 9 (26.9), 10 (26.10a/b/c),
-11 (26.11), 12 (26.12), 13 (26.13), 14 (26.14a/b), 15 (26.15a–d:
-concurrent-dispatch native replay, 422 conflict, post-window
-reprocessing hazard, evidence-free 200), 16 (26.16), 17 (26.17),
+11 (26.11: lost dispatch, landing unknown ⇒ INDETERMINATE),
+12 (26.12 + 26.12b: lost response with matching state ⇒
+INDETERMINATE — attribution unresolved, observational-equivalence
+regression, review L1), 13 (26.13), 14 (26.14a/b), 15 (26.15a–f:
+concurrent-dispatch native replay, 422 preexisting-key conflict ⇒
+INDETERMINATE, post-window reprocessing hazard, evidence-free 200,
+408 ⇒ INDETERMINATE, ambiguous 429 ⇒ INDETERMINATE — review L2),
+16 (26.16: genuine HTTP 400 pre-effect rejection ⇒
+CONFIRMED_NON_EXECUTION, later attempt unblocked — positive
+control), 17 (26.17),
 18 (26.18), 19 (26.19a/b/c), 20 (26.20 + the unmodified pilot
 suites), audit (26.21: audited dispatches == mocked-transport
 calls; exactly one mutating dispatch in a quote+commit+replay
@@ -149,30 +158,85 @@ make (figures and scenarios preserved):
 - `test13-chargebee-http.test.ts` (7): the PR #4 "Fix 2" section
   preamble (supersession note); T03 (whole-effect deep-equality →
   figure + determinacy + `provider_actual` source assertions —
-  figures identical); T07 (lost-response INDETERMINATE →
-  COMMITTED_UNVERIFIED + §6.10 replay of it); rec1 (re-read failure
+  figures identical); T07 (lost response → INDETERMINATE with the
+  outcome recorded and blind retry refused; PR-7 as first
+  delivered asserted COMMITTED_UNVERIFIED here — flipped back by
+  review correction L1, see below); rec1 (re-read failure
   → candidate-bearing COMMITTED_UNVERIFIED); rec2 (lost response +
-  amount-stripped re-read → COMMITTED_UNVERIFIED, no figures,
-  never OK); rec5
+  amount-stripped re-read → INDETERMINATE, outcome recorded, no
+  receipt; likewise flipped by L1 from PR-7's first-delivered
+  COMMITTED_UNVERIFIED); rec5
   (items omitted → COMMITTED_UNVERIFIED, recurring UNKNOWN, never
   verified zero); rec8 (quantity mismatch → VIOLATED over actuals);
   rec9 (mandatory addon → VIOLATED over actuals).
 - `test21-chargebee-pilot.test.ts` (3): c6 (lost response →
-  COMMITTED_UNVERIFIED, no figures); c8 (the Defect-3 case its own
+  INDETERMINATE, outcome recorded, no receipt, retry refused;
+  flipped by L1 from PR-7's first-delivered COMMITTED_UNVERIFIED);
+  c8 (the Defect-3 case its own
   note pre-declared would change → COMMITTED_UNVERIFIED typed
   receipt, recurring DETERMINED 80900, immediate UNKNOWN); c9
   (mandatory addon → attributable VIOLATED receipt, recurring
   83400).
 - `test22` (oracle) and `test23` (live-guard): **unmodified**.
 
+## Review corrections L1 / L2 (2026-10-29, at head after `afc2a18`)
+
+The independent review of PR-7 as first delivered (`afc2a18`)
+accepted the successful-response migration but blocked merge on
+two classification corrections. Both are implemented in the
+adapter, with failing-first evidence: the new/changed tests were
+run against `afc2a18` first and exactly the 8 targeted tests failed
+(26.12, 26.12b, 26.15b, 26.15e, 26.15f, 21-c6, 13-rec2, 13-T07) —
+26.12b's commit *resolved* with the buggy COMMITTED_UNVERIFIED
+receipt, and 408/429/422 recorded the buggy
+CONFIRMED_NON_EXECUTION.
+
+- **L1 — lost-response attribution.** A changed subscription
+  matching the intended result does not establish that THIS
+  request caused the change. The unknown-dispatch reconciliation
+  no longer converts a matching re-read into a committed receipt:
+  with no successful response and no independently bound
+  operation-level execution evidence, lost-response outcomes are
+  INDETERMINATE — outcome persisted with the observed state as
+  diagnostic context, NO committed receipt, blind retry refused.
+  **No operation-bound provider landing signal was identified**:
+  Chargebee's validated surface for this adapter offers no
+  per-operation read-back artifact, no operation identity on the
+  subscription resource, and `resource_version` is a millisecond
+  timestamp that any writer advances; an idempotency key sent with
+  a lost request does not establish execution. The
+  response-received / response-lost line: COMMITTED_UNVERIFIED is
+  retained ONLY where a response was received — the successful-
+  response financially-unverified cases (test21-c8, 26.10, 26.17,
+  test13-rec1/rec5). A native idempotency REPLAY returns the
+  original operation's own response and therefore counts as
+  response-received (26.15a stays verified-eligible); a lost
+  dispatch, a 409, a 5xx, and every L2 ambiguity below are
+  response-lost / execution-unestablished.
+- **L2 — non-execution classification.** CONFIRMED_NON_EXECUTION
+  is restricted to demonstrable pre-effect failures: an explicit
+  provider validation rejection (HTTP 400), which carries no
+  prior-operation ambiguity (26.16 remains the positive control,
+  and a later attempt is not blocked). HTTP 408, ambiguous 429,
+  unclassified 4xx, and 422 `duplicate_request` classify as
+  INDETERMINATE with the no-blind-retry guard: a 422 conflict
+  establishes rejection of the CURRENT attempt only — the key may
+  already belong to a prior processed request with different
+  parameters that DID execute (26.15b) — so re-dispatch for that
+  quote is blocked pending reconciliation, in the same spirit as
+  the recorded-INDETERMINATE dispatch refusal.
+
 ## Outcomes that remain UNVERIFIABLE through the real Chargebee API
 
-1. **The incurred financial result of a mutation whose response was
-   lost.** Chargebee exposes no operation-level financial read-back
-   bound to an `update_for_items` call (no per-operation
-   invoice/charge retrieval keyed to the mutation). A later state
-   read shows subscription state, not the proration actually
-   incurred. Such commits cap at `COMMITTED_UNVERIFIED`.
+1. **Whether a mutation whose response was lost landed at all —
+   and, a fortiori, its incurred financial result.** Chargebee
+   exposes no operation-level read-back bound to an
+   `update_for_items` call (no per-operation invoice/charge
+   retrieval keyed to the mutation, no operation identity on the
+   subscription). A later state read shows subscription state, not
+   who caused it or the proration actually incurred. Such commits
+   are INDETERMINATE (review L1) — not merely unverified: no
+   operation-bound provider landing signal exists to upgrade them.
 2. **Exclusive attribution of a landed state to this commit.**
    `resource_version` is a millisecond timestamp, not a CAS token
    or operation identity. Writes inside the same millisecond, and
@@ -185,11 +249,12 @@ make (figures and scenarios preserved):
 4. **Promotion of a figure-less UNVERIFIED receipt by later figures
    alone.** The store's verification is identity-bound: later
    evidence figures must equal the recorded receipt's identity
-   figures. A lost-response receipt records no figures (null
-   identity), so later figures cannot promote it — it requires
-   manual reconciliation (or a future core state-verification
-   hook). Candidate-bearing receipts (case 1's sibling, response
-   received) *can* be promoted, and test26.17 proves that path.
+   figures. A receipt that records no figures (null identity)
+   cannot be promoted by later figures — it requires manual
+   reconciliation (or a future core state-verification hook).
+   Candidate-bearing receipts (response received) *can* be
+   promoted, and test26.17 proves that path. (Lost-response
+   attempts record no receipt at all after L1 — item 1.)
 5. **A simulator-style per-operation mutation artifact.** The
    Chargebee API has no persisted per-operation record carrying
    execution financials + a state bracket (the simulator's
@@ -215,9 +280,12 @@ From the pilot's NO-GO conditions (issue #12):
 
 ## Verification (this branch)
 
-- Clean build (`rm -rf dist`): **346/346** tests pass (baseline
-  313 + 33 new). The 10 pre-migration failures observed mid-work
-  were exactly the 10 tests carrying disclosed updates.
+- Clean build (`rm -rf dist`): **349/349** tests pass (baseline
+  313 + 36 new; includes the L1/L2 review-correction round: +3
+  tests — 26.12b, 26.15e, 26.15f — and 5 flipped expectations
+  across test26/test21/test13, each disclosed in-file). The 10
+  pre-migration failures observed mid-work were exactly the 10
+  tests carrying disclosed updates.
 - `npm run smoke:pack`: OK. `npm run demo`: OK.
   `npm run demo:commit`: OK.
 - Provider-neutrality check (workflow grep): OK — core untouched.

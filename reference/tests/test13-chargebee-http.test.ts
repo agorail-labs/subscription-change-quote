@@ -592,13 +592,15 @@ test("Test 13-zero1 (unknown-vs-zero): a provider-STATED zero (both members pres
 // undeterminable actual outcome — INDETERMINATE with no receipt —
 // applied only while the frozen v0.6.1 receipt type could not
 // represent "committed but unverified" (protocol Defect 3). Under
-// the v0.6.2 taxonomy, a KNOWN landing with unestablished financials
-// records a COMMITTED_UNVERIFIED receipt (rec1/rec2/rec5), an
-// independently attributable contradiction records a VIOLATED
-// receipt (rec8/rec9), and INDETERMINATE is reserved for landings
-// that cannot be established at all (rec3/rec7, T07's lost-response
-// sibling cases in test26). Each changed test below carries its own
-// DISCLOSED CHANGE note.
+// the v0.6.2 taxonomy, a landing KNOWN from a received response
+// with unestablished financials records a COMMITTED_UNVERIFIED
+// receipt (rec1/rec5), an independently attributable contradiction
+// records a VIOLATED receipt (rec8/rec9), and INDETERMINATE covers
+// landings that cannot be established at all (rec3/rec7) —
+// including, per the PR-7 review correction L1, LOST-response
+// cases (rec2, T07): a re-read showing the intended state cannot
+// establish that THIS request landed it. Each changed test below
+// carries its own DISCLOSED CHANGE note.
 
 const FIX1_CTX = {
   currency: "USD",
@@ -728,18 +730,22 @@ test("Test 13-rec1 (PR #4 review; PR-7 classification): incomplete post-update r
   assert.equal(store.get(quote.id)?.commit_receipt?.status, "COMMITTED_UNVERIFIED");
 });
 
-test("Test 13-rec2 (PR #4 review; PR-7 classification): lost response; re-read shows the intended items but WITHOUT determinable amounts — COMMITTED_UNVERIFIED, no figures, never OK", async () => {
-  // DISCLOSED CHANGE (PR-7, v0.6.2): previously INDETERMINATE with
-  // no receipt (the PR #4 / Defect-3 posture). Under the migration
-  // the landing IS established — the independent re-read shows the
-  // complete intended item set in effect on a moved resource_version
-  // — so the outcome is the typed COMMITTED_UNVERIFIED receipt.
-  // What the PR #4 test protected is preserved in the stronger form:
-  // neither dimension carries a figure (the immediate actual was in
-  // the lost response; the re-read's amounts are stripped, and even
-  // unstripped they could not be EXCLUSIVELY attributed to this
-  // commit), and the reconciliation is UNVERIFIED — a missing
-  // resultingAmount still never reaches reconciliation as an OK.
+test("Test 13-rec2 (PR #4 review; PR-7 review L1 classification): lost response; re-read shows the intended items but WITHOUT determinable amounts — INDETERMINATE, outcome recorded, no receipt", async () => {
+  // DISCLOSED CHANGE (PR-7 review L1): PR-7 as first delivered
+  // classified this COMMITTED_UNVERIFIED, reasoning that the
+  // re-read established the landing. The review corrected that: the
+  // re-read shows the intended items in effect, but it cannot
+  // establish that THIS request landed them — an independent actor
+  // applying the same set produces identical observations
+  // (test26-12b), and no operation-bound execution evidence exists.
+  // The outcome is therefore INDETERMINATE: the outcome is recorded
+  // (observed state retained as diagnostic context), NO committed
+  // receipt is recorded, and blind retry is refused. What the
+  // PR #4 test protected is preserved: a missing resultingAmount
+  // never reaches reconciliation as an OK, and no figure is ever
+  // recorded for this commit. Scenario preserved (the mutation
+  // does land at the fake provider; its response is lost; the
+  // re-read's amounts are stripped).
   const fake = new FakeChargebee();
   const store = new QuoteStore();
   let updateApplied = false;
@@ -760,19 +766,18 @@ test("Test 13-rec2 (PR #4 review; PR-7 classification): lost response; re-read s
   const client = new ChargebeeClient({ site: "scq-test", apiKey: "test_key_redacted" }, lossyStrip);
   const adapter = new ChargebeeLiveAdapter(client, store, { liveCommitEnabled: true });
   const quote = await adapter.createChangeQuote("cb_live_test_1", qtyProposal());
-  const receipt = await adapter.commitChangeQuote(quote.id);
-  assert.equal(receipt.status, "COMMITTED_UNVERIFIED");
-  assert.equal(receipt.outcome, "COMMITTED_UNVERIFIED");
-  assert.equal(receipt.reconciliation.status, "UNVERIFIED");
-  assert.deepEqual((receipt.reconciliation as any).undeterminedDimensions, ["immediateFinancialEffect", "recurringFinancialEffect"]);
-  assert.equal(receipt.committedEffect.immediate, undefined, "no immediate figure — the lost response carried the only actual");
-  assert.equal(receipt.committedEffect.recurring?.resultingAmount, undefined, "no recurring figure is recorded for this commit (PR #14 Z3)");
-  assert.equal(receipt.committedEffect.determinacy?.immediateFinancialEffect, "UNKNOWN");
-  assert.equal(receipt.committedEffect.determinacy?.recurringFinancialEffect, "UNKNOWN");
+  await assert.rejects(
+    () => adapter.commitChangeQuote(quote.id),
+    (e: unknown) => e instanceof SCQError && (e.details as any)?.outcome === "INDETERMINATE" && (e.details as any)?.indeterminate === true,
+  );
+  assert.equal(store.get(quote.id)?.commit_outcome?.outcome, "INDETERMINATE");
+  assert.equal(store.get(quote.id)?.commit_receipt, undefined, "no committed receipt — landing by THIS request is not established");
   assert.equal(fake.mutationCount, 1, "exactly one mutation; no blind retry");
-  const replay = await adapter.commitChangeQuote(quote.id);
-  assert.deepEqual(replay, receipt, "§6.10: a repeated commit returns the recorded unverified receipt, never a re-mutation");
-  assert.equal(fake.mutationCount, 1);
+  await assert.rejects(
+    () => adapter.commitChangeQuote(quote.id),
+    (e: unknown) => e instanceof SCQError && (e.details as any)?.outcome === "INDETERMINATE",
+  );
+  assert.equal(fake.mutationCount, 1, "the recorded INDETERMINATE refuses a second dispatch");
 });
 
 test("Test 13-rec3 (PR #4 review): lost response and provider state does NOT show the intended change — the existing indeterminate refusal is preserved", async () => {
@@ -1109,22 +1114,24 @@ test("T06 (SIMULATED_PASS): commit repeated with same quote ID — no duplicate 
   assert.equal(fake.mutationCount, 1);
 });
 
-test("T07 (SIMULATED_PASS): provider processes commit, response is lost — landing established by re-read, financials unverifiable: COMMITTED_UNVERIFIED receipt (PR-7 behavior)", async () => {
-  // Behavior changed twice, each time on review. PR #4 round: the
-  // adapter stopped recovering a receipt from the re-read state plus
-  // the PRE-MUTATION ESTIMATE (reporting an unverified outcome as
-  // actual) and failed closed as INDETERMINATE with no receipt,
-  // because the frozen v0.6.1 receipt type could not represent
-  // "committed but unverified" (protocol Defect 3). PR-7 (v0.6.2):
-  // the receipt type now CAN represent it, and the re-read DOES
-  // establish the landing (complete intended set in effect on a
-  // moved resource_version) — so the outcome is a typed
-  // COMMITTED_UNVERIFIED receipt. The PR #4 protection survives
-  // intact: NO figure is recorded for either dimension (the
-  // immediate actual was in the lost response and no provider
-  // read-back can recover it; the observed recurring level cannot
-  // be exclusively attributed to this commit), the estimate is
-  // never substituted, and the reconciliation is UNVERIFIED.
+test("T07 (SIMULATED_PASS): provider processes commit, response is lost — INDETERMINATE: matching state does not establish that THIS request landed (PR-7 review L1)", async () => {
+  // Behavior changed on review, twice. PR #4 round: the adapter
+  // stopped recovering a receipt from the re-read state plus the
+  // PRE-MUTATION ESTIMATE and failed closed as INDETERMINATE with
+  // no receipt (the frozen v0.6.1 type had no committed-but-
+  // unverified state — protocol Defect 3). PR-7 as first delivered
+  // flipped this to a COMMITTED_UNVERIFIED receipt on the theory
+  // that the re-read established the landing. The PR-7 review (L1)
+  // corrected that theory: the re-read establishes that the
+  // intended state is in effect, not that THIS request caused it —
+  // an independent actor's identical write is observationally
+  // indistinguishable (test26-12b), and Chargebee provides no
+  // operation-bound execution evidence here. Final classification:
+  // INDETERMINATE — outcome recorded, NO receipt, blind retry
+  // refused. The PR #4 protections survive intact: no figure is
+  // recorded for either dimension and the estimate is never
+  // substituted. (COMMITTED_UNVERIFIED remains for cases where a
+  // response WAS received — rec1, test21-c8.)
   const fake = new FakeChargebee();
   const store = new QuoteStore();
   let loseOnce = true;
@@ -1136,19 +1143,19 @@ test("T07 (SIMULATED_PASS): provider processes commit, response is lost — land
   const client = new ChargebeeClient({ site: "scq-test", apiKey: "test_key_redacted" }, lossy);
   const adapter = new ChargebeeLiveAdapter(client, store, { liveCommitEnabled: true });
   const quote = await adapter.createChangeQuote("cb_live_test_1", qtyProposal());
-  const receipt = await adapter.commitChangeQuote(quote.id);
-  assert.equal(receipt.status, "COMMITTED_UNVERIFIED");
-  assert.equal(receipt.outcome, "COMMITTED_UNVERIFIED");
-  assert.equal(receipt.reconciliation.status, "UNVERIFIED");
-  assert.equal(receipt.committedEffect.immediate, undefined, "no immediate figure — the lost response carried the only actual; the estimate is never substituted");
-  assert.equal(receipt.committedEffect.recurring?.resultingAmount, undefined, "no recurring figure is recorded for this commit (PR #14 Z3)");
-  assert.deepEqual(receipt.committedEffect.determinacy, { immediateFinancialEffect: "UNKNOWN", recurringFinancialEffect: "UNKNOWN" });
+  await assert.rejects(
+    () => adapter.commitChangeQuote(quote.id),
+    (e: unknown) => e instanceof SCQError && (e.details as any)?.outcome === "INDETERMINATE" && (e.details as any)?.indeterminate === true,
+  );
   assert.equal(fake.mutationCount, 1, "exactly one provider mutation despite the lost response — never a blind second mutation");
-  assert.equal(fake.sub.subscription_items[0].quantity, 120, "the mutation DID land at the provider");
-  assert.equal(store.get(quote.id)?.commit_receipt?.status, "COMMITTED_UNVERIFIED");
-  const replay = await adapter.commitChangeQuote(quote.id);
-  assert.deepEqual(replay, receipt, "§6.10: a repeated commit returns the recorded unverified receipt");
-  assert.equal(fake.mutationCount, 1, "a repeated attempt still performs no second mutation");
+  assert.equal(fake.sub.subscription_items[0].quantity, 120, "the mutation DID land at the provider — and the classification is still INDETERMINATE, because the adapter cannot prove it was this request");
+  assert.equal(store.get(quote.id)?.commit_outcome?.outcome, "INDETERMINATE");
+  assert.equal(store.get(quote.id)?.commit_receipt, undefined, "no committed receipt is recorded for an unattributable landing");
+  await assert.rejects(
+    () => adapter.commitChangeQuote(quote.id),
+    (e: unknown) => e instanceof SCQError && (e.details as any)?.outcome === "INDETERMINATE",
+  );
+  assert.equal(fake.mutationCount, 1, "a repeated attempt still performs no second mutation — the recorded outcome refuses it pre-dispatch");
 });
 
 test("T08+T09 (SIMULATED_PASS): concurrent change between final preview and commit — TOCTOU lands, reconciliation reports VIOLATED, no rollback is claimed", async () => {

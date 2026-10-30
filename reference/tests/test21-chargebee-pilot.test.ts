@@ -214,34 +214,38 @@ test("Test 21-c5: conflicting idempotency — same native key with different par
   assert.equal(json.subscription.subscription_items.find((i: any) => i.item_price_id === ADDON).quantity, 21, "the conflicting call did not change state");
 });
 
-test("Test 21-c6: lost mutation response, intended set landed — COMMITTED_UNVERIFIED receipt, no blind retry, no duplicate mutation", async () => {
-  // DISCLOSED CHANGE (PR-7, v0.6.2): previously INDETERMINATE with
-  // no receipt (protocol Defect 3 — the frozen v0.6.1 receipt type
-  // had no committed-but-unverified state). The mock APPLIES the
-  // update before losing the response, and the adapter's
-  // post-dispatch re-read establishes the landing (complete intended
-  // set in effect, resource_version moved) — so under the v0.6.2
-  // taxonomy the outcome is a typed COMMITTED_UNVERIFIED receipt
-  // with BOTH financial dimensions UNKNOWN and no figures: the
-  // immediate actual was in the lost response, and the observed
-  // recurring level cannot be exclusively attributed to this commit
-  // (PR #14 Z3). INDETERMINATE is now reserved for landings that
-  // cannot be established at all (see test26 rows 11/12).
+test("Test 21-c6: lost mutation response, intended set in effect — INDETERMINATE, outcome recorded, no receipt, no blind retry (PR-7 review L1)", async () => {
+  // DISCLOSED CHANGE (PR-7 review L1): PR-7 as first delivered
+  // classified this COMMITTED_UNVERIFIED, reasoning that the
+  // post-dispatch re-read established the landing. The review
+  // corrected that: a changed subscription matching the intended
+  // result does not establish that THIS request caused the change —
+  // the identical observations arise if our request never applied
+  // and another actor applied the same item set (test26-12b is the
+  // observational-equivalence regression). With no successful
+  // response and no operation-bound execution evidence, the
+  // outcome is INDETERMINATE: persisted as an outcome record (with
+  // the observed state as diagnostic context), NO committed
+  // receipt, and blind retry refused. COMMITTED_UNVERIFIED remains
+  // for response-received cases (c8 below). The scenario and the
+  // mock behavior are unchanged — the mock still applies the update
+  // before losing the response; only the classification is
+  // corrected.
   const { adapter, mock, store } = makeAdapter({ loseUpdateResponse: true }, { commitEnabled: true });
   const quote = await adapter.createChangeQuote(SUB, PROPOSAL(21));
-  const receipt = await adapter.commitChangeQuote(quote.id);
-  assert.equal(receipt.status, "COMMITTED_UNVERIFIED");
-  assert.equal(receipt.outcome, "COMMITTED_UNVERIFIED");
-  assert.equal(receipt.reconciliation.status, "UNVERIFIED");
-  assert.equal(receipt.committedEffect.immediate, undefined);
-  assert.equal(receipt.committedEffect.recurring?.resultingAmount, undefined);
-  assert.deepEqual(receipt.committedEffect.determinacy, { immediateFinancialEffect: "UNKNOWN", recurringFinancialEffect: "UNKNOWN" });
-  assert.equal(store.get(quote.id)?.commit_receipt?.status, "COMMITTED_UNVERIFIED");
+  await assert.rejects(
+    () => adapter.commitChangeQuote(quote.id),
+    (e: unknown) => e instanceof SCQError && (e.details as any)?.outcome === "INDETERMINATE" && (e.details as any)?.indeterminate === true,
+  );
+  assert.equal(store.get(quote.id)?.commit_outcome?.outcome, "INDETERMINATE");
+  assert.equal(store.get(quote.id)?.commit_receipt, undefined, "no committed receipt — landing by THIS request is not established");
   assert.equal(mock.mutationCount, 1);
-  // A second attempt must NOT re-mutate: §6.10 replay returns the
-  // recorded unverified receipt.
-  const replay = await adapter.commitChangeQuote(quote.id);
-  assert.deepEqual(replay, receipt);
+  // A second attempt must NOT re-mutate: the recorded INDETERMINATE
+  // outcome refuses it before any dispatch.
+  await assert.rejects(
+    () => adapter.commitChangeQuote(quote.id),
+    (e: unknown) => e instanceof SCQError && (e.details as any)?.outcome === "INDETERMINATE",
+  );
   assert.equal(mock.mutationCount, 1, "still exactly one mutating call — no blind retry");
 });
 
