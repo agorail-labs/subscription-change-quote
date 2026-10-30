@@ -302,9 +302,9 @@ const QUOTE_TTL_MS = 5 * 60 * 1000;
  * documentation (apidocs chargebee.com/docs/api/error-handling)
  * assigns 400 to payment errors (type `payment`) and other
  * operation-stage failures as well as to request-validation errors.
- * A 400 qualifies here only when its api_error_code is one of these
- * specifically documented REQUEST-VALIDATION codes — both are
- * grouped by that documentation under "Invalid Request Errors"
+ * A 400 qualifies here only when its api_error_code matches this
+ * specifically documented REQUEST-VALIDATION code, grouped under
+ * "Invalid Request Errors"
  * (type `invalid_request`, HTTP 400), and the documentation states
  * that API calls fail at the first error encountered while
  * VALIDATING them, i.e. before the operation is processed:
@@ -317,7 +317,7 @@ const QUOTE_TTL_MS = 5 * 60 * 1000;
  * so it carries no prior-operation ambiguity: an idempotency key
  * previously consumed by a processed request surfaces as HTTP 422
  * (`duplicate_request` / `unable_to_process_request`), never as one
- * of this 400 validation code.
+ * this 400 validation code.
  *
  * Deliberately EXCLUDED (they fail closed to INDETERMINATE):
  *   - payment-type 400s (`payment_processing_failed`,
