@@ -290,6 +290,7 @@ import {
   checkAcceptanceEnvelope,
 } from "../core/scq-engine.js";
 import { QuoteStore, type StoredQuote } from "../store/quote-store.js";
+import { DispatchBlockedError, type DurableMutationCoordinator } from "../store/mutation-coordinator.js";
 import { ChargebeeClient, ChargebeeHttpError } from "./chargebee-http.js";
 
 const QUOTE_TTL_MS = 5 * 60 * 1000;
@@ -822,6 +823,20 @@ export type ChargebeeLiveAdapterOptions = {
   /** Default false. When false, commitChangeQuote refuses before any mutating call. */
   liveCommitEnabled?: boolean;
   now?: () => Date;
+  /**
+   * v0.6.2 (PR-8): optional durable mutation coordinator. When
+   * provided (together with a DurableQuoteStore as `store`), every
+   * dispatch is gated by the write-ahead mutation ledger: the
+   * intent commits durably BEFORE update_for_items is called, prior
+   * durable attempts are checked before any dispatch, and the
+   * attempt is settled from the quote's durable terminal record.
+   * A persistence failure throws — there is no silent fallback to
+   * in-memory behavior. When absent, behavior is exactly the
+   * pre-PR-8 in-memory behavior.
+   */
+  durableCoordinator?: DurableMutationCoordinator;
+  /** Provider site identifier recorded on the write-ahead intent (never a credential). */
+  providerSite?: string;
 };
 
 export class ChargebeeLiveAdapter implements SubscriptionProvider {
@@ -1102,6 +1117,16 @@ export class ChargebeeLiveAdapter implements SubscriptionProvider {
       throw new SCQError("PROVIDER_ERROR", "BLOCKED — LIVE COMMIT DISABLED (SCQ_LIVE_COMMIT_ENABLED is not 'true'). Quote and pre-mutation revalidation completed; no mutating call was made.", { blocked: "LIVE_COMMIT_DISABLED" });
     }
 
+    // v0.6.2 (PR-8): durable write-ahead gate. When a durable
+    // coordinator is configured, the mutation intent (exact request
+    // + deterministic idempotency key + pre-dispatch fingerprint)
+    // commits to the durable ledger and transitions to DISPATCHING
+    // BEFORE update_for_items is called; prior durable attempts for
+    // this quote/subscription are checked in the same transaction.
+    // A blocked attempt or a persistence failure throws here —
+    // before any provider mutation — and there is no fallback.
+    const durableAttemptId = this.beginDurableAttempt(validated, input, preDispatchFingerprint);
+
     let updateJson: any;
     let idempotencyReplayed = false;
     try {
@@ -1130,6 +1155,7 @@ export class ChargebeeLiveAdapter implements SubscriptionProvider {
           at: this.now().toISOString(),
           details: { httpStatus: e.httpStatus, apiErrorCode: e.apiErrorCode, reason: "the mutating request was rejected by the provider before effect (documented pre-effect validation rejection: HTTP 400 with an allowlisted validation api_error_code)" },
         });
+        this.settleDurableAttempt(durableAttemptId);
         const mapped = this.toSCQ(e, validated.subscription_id);
         throw new SCQError(mapped.code, mapped.message, { outcome: "CONFIRMED_NON_EXECUTION", httpStatus: e.httpStatus, apiErrorCode: e.apiErrorCode });
       }
@@ -1151,11 +1177,53 @@ export class ChargebeeLiveAdapter implements SubscriptionProvider {
         // from an independent state re-read; every outcome on this
         // path is INDETERMINATE with the outcome recorded and blind
         // retry refused (PR-7 review corrections L1/L2).
-        return this.reconcileAfterUnknownDispatch(validated, input, preDispatchFingerprint, e);
+        try {
+          return await this.reconcileAfterUnknownDispatch(validated, input, preDispatchFingerprint, e);
+        } finally {
+          this.settleDurableAttempt(durableAttemptId);
+        }
       }
+      this.settleDurableAttempt(durableAttemptId);
       throw this.toSCQ(e, validated.subscription_id);
     }
-    return this.establishLiveCommit(validated, input, preDispatchFingerprint, updateJson, idempotencyReplayed);
+    try {
+      return await this.establishLiveCommit(validated, input, preDispatchFingerprint, updateJson, idempotencyReplayed);
+    } finally {
+      this.settleDurableAttempt(durableAttemptId);
+    }
+  }
+
+  /** PR-8: write-ahead gate (no-op unless a durable coordinator is configured). Returns the attempt id. */
+  private beginDurableAttempt(validated: StoredQuote, input: LivePreviewInput, preDispatchFingerprint: string): string | undefined {
+    const coordinator = this.opts.durableCoordinator;
+    if (!coordinator) return undefined;
+    try {
+      const attempt = coordinator.beginDispatch({
+        quoteId: validated.quote_id,
+        subscriptionId: validated.subscription_id,
+        provider: "chargebee",
+        ...(this.opts.providerSite ? { site: this.opts.providerSite } : {}),
+        request: this.updateParams(input.items),
+        idempotencyKey: input.idempotencyKey,
+        preDispatchFingerprint,
+      });
+      return attempt.attemptId;
+    } catch (e) {
+      if (e instanceof DispatchBlockedError) {
+        throw new SCQError(
+          "PROVIDER_ERROR",
+          `Commit blocked by the durable mutation ledger: ${e.message} No provider mutation was issued.`,
+          { outcome: "INDETERMINATE", indeterminate: true, blocked: "DURABLE_ATTEMPT_UNRESOLVED" },
+        );
+      }
+      throw e;
+    }
+  }
+
+  /** PR-8: settle the ledger attempt from the quote's durable terminal record (no-op without a coordinator/attempt). */
+  private settleDurableAttempt(attemptId: string | undefined): void {
+    if (!attemptId || !this.opts.durableCoordinator) return;
+    this.opts.durableCoordinator.settleFromStore(attemptId);
   }
 
   /**
