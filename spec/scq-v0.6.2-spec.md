@@ -300,8 +300,23 @@ type SubscriptionChangeReceipt = {
 
 - A receipt MUST always carry both `quotedEffect` and `committedEffect`, regardless of
   guarantee mode.
-- For `EXACT`: `quotedEffect` MUST deep-equal `committedEffect` (see §3.11 for how the
-  committed side is established in EXACT mode).
+- For `EXACT`: equality between `quotedEffect` and `committedEffect` is defined over the
+  **covered, economically relevant effect dimensions** — it is NOT whole-object deep
+  equality. For each dimension under the applicable EXACT `GuaranteeCoverage`
+  (`immediateFinancialEffect`, `recurringFinancialEffect`, `termEffect`, `effectiveAt`),
+  the committed dimension's value, determinacy, and timing/term coverage MUST equal the
+  quoted dimension's. `JSON.stringify(quotedEffect) === JSON.stringify(committedEffect)`
+  is **not** a conformance criterion. Committed-role provenance
+  (`provenance.committedSource`, §3.11) exists only on the committed side: it MAY — and
+  where §3.11 applies, MUST — differ from the quoted effect, and per-dimension
+  provenance notes on the committed side MAY be refined with post-commit evidence,
+  without breaking EXACT equality, provided every covered dimension's value and
+  timing/term coverage are unchanged. *(v0.6.2 refinement — SPEC1: v0.6.1 §3.8 stated
+  this rule as whole-object deep equality, wording written before role-specific
+  committed provenance existed; after §3.11, the two requirements were jointly
+  unsatisfiable, because a conforming EXACT committed effect necessarily carries
+  committed-side provenance the quote lacks. Delta recorded in Appendix A; the stronger
+  question of authenticating the EXACT source remains OPEN — G-01.)*
 - For `REVALIDATE`: `quotedEffect` and `committedEffect` MAY legitimately differ; the
   receipt is the audit trail of both, not just the final number.
 - A receipt MUST NOT carry any field named `commercialEffect` or `revalidatedEffect`
@@ -449,10 +464,24 @@ type MutationOutcome =
 - **CONFIRMED_NON_EXECUTION** — the mutation provably never took effect: it was never
   dispatched (e.g. a fail-closed `QUOTE_NOT_DETERMINISTIC` refusal, which by construction
   precedes any mutating call and creates no mutation intent), or the provider provably
-  rejected it before any effect. Recovery: safe to retry **as a new quote**; no
-  provider-state reconciliation is required first. An adapter MUST NOT report
+  rejected it before any effect. Recovery: no provider-state reconciliation is required
+  first. For an attempt recorded in the durable ledger, exactly **one re-dispatch under
+  the same quote and the same idempotency key** is permitted per
+  CONFIRMED_NON_EXECUTION settlement, gated as §6.16 specifies (identical canonical
+  request and request hash; unchanged quote/subscription/provider/site binding;
+  same-subscription exclusion re-checked inside the authorizing transaction; and the
+  ordinary commit preconditions — expiry and subscription-fingerprint validation,
+  §6.2/§6.10 — applied to the re-dispatch presentation exactly as to a first dispatch,
+  so an expired or stale quote can never reach the re-dispatch gate). A caller MAY
+  instead abandon the quote and start a new one; what is prohibited is presenting a
+  different request or a different key as the same attempt, and any re-dispatch beyond
+  the one a settlement permits (a further re-dispatch requires a further independent
+  CONFIRMED_NON_EXECUTION settlement). An adapter MUST NOT report
   CONFIRMED_NON_EXECUTION for a mutation it dispatched unless the provider's rejection is
   demonstrably pre-effect under the adapter's documented classification rule.
+  *(Doctrine recorded as OPEN DECISION G-13 / U-13 for ratification at approval: the
+  alternative — requiring a fresh quote and key for every retry — is named there with
+  its tradeoff.)*
 - **INDETERMINATE** — the mutation was dispatched and its outcome cannot be established:
   response lost, landing unverifiable, post-commit read incomplete or contradictory.
   Receipt: **no success receipt** — silence in the receipt log must never be readable as
@@ -547,7 +576,11 @@ dimensions), not per financial dimension alone.
 (`defined_equal_exact`, §3.11) — committed := quoted — **only** where the quote-level
 coverage backs EXACT on every dimension and the commit actually dispatched under that
 contract. The authentication limit of that definitional source is recorded in §3.11 and
-gap register G-01.
+gap register G-01. "Committed := quoted" is the per-dimension reproduction this section
+has always scoped — the equality §3.9 defines over the covered dimensions. v0.6.1
+§3.8's whole-object deep-equality sentence does **not** carry forward: it predates
+role-specific committed provenance and is unsatisfiable alongside §3.11 (SPEC1,
+Appendix A).
 
 ### 4.2 REVALIDATE (default) *(v0.6.1 clarifications preserved; v0.6.2 enforcement added)*
 
@@ -801,8 +834,11 @@ develop parallel interpretations of §3.10/§3.11. The report-only diagnostic
   for effects the adapter itself produces.
 - **EXACT/REVALIDATE interaction:** the assessment is mode-independent. In EXACT mode the
   committed side is established definitionally (§3.11) and the same comparable/skipped
-  logic applies; in REVALIDATE mode the revalidated side is assessed in the quote role
-  (its `revalidated_preview` label is lineage metadata, not a claim of actuals).
+  logic applies — EXACT equality is the §3.9 covered-dimensions equality evaluated
+  through this assessment, never whole-object identity, so the committed side's
+  additional provenance (§3.11) is expected and is not a divergence; in REVALIDATE mode
+  the revalidated side is assessed in the quote role (its `revalidated_preview` label
+  is lineage metadata, not a claim of actuals).
 
 **6.14 (v0.6.2 NEW — committed evidence and reconciliation precedence)** Post-commit,
 `reconcileCommittedEffect` NEVER throws a pre-mutation refusal — the mutation has already
@@ -859,10 +895,15 @@ evidence into verified financial actuals (§6.16).
   context.
 - **Blind-retry prohibition.** After an INDETERMINATE outcome, no automated or manual
   retry of the mutation may occur until provider-state reconciliation has established
-  what landed. A retry, if the intended state provably did NOT land and a human
-  authorizes it, proceeds as a NEW quote — never as a re-issue of the same mutation.
+  what landed. An INDETERMINATE attempt is NEVER re-armed: if reconciliation establishes
+  the intended state provably did NOT land and a human authorizes the change again, it
+  proceeds as a NEW quote — never as a re-issue of the indeterminate attempt.
   Provider-native idempotency windows do not lift this prohibition: a time-limited
-  provider window is not proof a retry is safe.
+  provider window is not proof a retry is safe. The single bounded exception to
+  same-mutation re-issue is not an INDETERMINATE retry at all: a terminal
+  CONFIRMED_NON_EXECUTION attempt — whose non-execution was independently confirmed
+  pre-effect — may be re-dispatched once under the same quote and key under §6.16's
+  gates (§3.12; OPEN DECISION G-13).
 - **Upgrading a COMMITTED_UNVERIFIED receipt.** The transition to COMMITTED_AND_VERIFIED
   happens only through the store's establishment procedure
   (`establishVerification` → `verifyCommitReceipt`), which:
@@ -915,10 +956,30 @@ MUST persist quotes, receipts, and mutation attempts durably, such that:
   atomically (receipt + attempt terminal state in one transaction, or a no-receipt
   outcome).
 - **Idempotency-key and request-hash binding.** The idempotency key is unique per
-  attempt; the same key with a different request is a conflict, and the same key with
-  the identical request that already settled serves its recorded outcome without a new
-  dispatch. The canonical request hash (`requestHashOf` over the canonical form) binds
-  the stored intent to the exact request authorized.
+  attempt and bound to ONE quote / subscription / provider / site: the same key
+  presented under a different binding is a collision and is refused in any state of the
+  bound attempt, and the same key with a different request (hash mismatch) is likewise
+  refused. The same key with the identical request whose attempt settled in a terminal
+  COMMITTED_* state serves its recorded receipt/outcome without a new dispatch — a
+  committed attempt is NEVER re-armed. **Sole exception — confirmed non-execution:**
+  where the bound attempt settled CONFIRMED_NON_EXECUTION (non-execution independently
+  confirmed pre-effect, §3.12/§6.15), the ledger re-arms that same attempt row and
+  authorizes ONE new dispatch under the same quote and key, only when ALL of the
+  following hold, each verified inside the same persistence transaction: the canonical
+  request and its request hash are identical; the quote/subscription/provider/site
+  binding is unchanged and matches the durably stored quote; and the
+  same-subscription exclusion is re-checked (excluding only the attempt being
+  re-armed), so the re-dispatch cannot run concurrently with another quote's
+  unresolved attempt on that subscription. The re-dispatch is recorded in the
+  attempt's history. This gate sits BEHIND the ordinary commit preconditions: the
+  commit path validates quote expiry and the subscription fingerprint (§6.2/§6.10) on
+  every presentation, before dispatch authorization, so an expired or stale quote
+  refuses before the ledger is ever consulted for re-arming — a stale quote cannot
+  override those checks. A DISPATCHING attempt, or an INDETERMINATE attempt not yet
+  operator-resolved, blocks outright; an operator-resolved INDETERMINATE attempt is
+  still never re-armed — it authorizes no dispatch. The canonical
+  request hash (`requestHashOf` over the canonical form) binds the stored intent to
+  the exact request authorized. *(Doctrine: OPEN DECISION G-13 / U-13.)*
 - **Same-subscription concurrency.** A second dispatch for a subscription with an
   unresolved attempt MUST be refused; the exclusion is checked inside the persistence
   transaction, bound to the full identity (provider, site, subscription, quote), not
@@ -983,13 +1044,13 @@ and affected callers, is `research/v0.6.2-migration-guide.md` (informative). Sum
 | BC-3 | Stripe simulator `amount_due` mapping removed: `immediate` is now sourced from the preview's incurred figure, distinct from `amount_due`. | Historical Stripe-simulator quotes were recorded under the conflation and are not comparable to post-migration quotes. |
 | BC-4 | Paddle reconciliation basis: committed effects must be post-commit actuals bound to the mutation; results previously OK by lineage become UNVERIFIED until an independent actual establishes them. | The simulator exposes a post-commit actual read (persisted transaction retrieval); expect the one-time OK-rate drop to reflect honesty, not regression. |
 | BC-5 | `ReconciliationResult` union widened with UNVERIFIED; receipt `status` widened with COMMITTED_UNVERIFIED. | Intentionally loud: exhaustive switches fail to compile. Handle UNVERIFIED / COMMITTED_UNVERIFIED as "landed, finances unverified — operator follow-up," never as OK. |
-| BC-6 | Mutation-outcome reporting: failed/incomplete commits are classified INDETERMINATE vs CONFIRMED_NON_EXECUTION, with opposite retry rules. | Retry only CONFIRMED_NON_EXECUTION, as a new quote. INDETERMINATE requires provider-state reconciliation first (§6.15). |
+| BC-6 | Mutation-outcome reporting: failed/incomplete commits are classified INDETERMINATE vs CONFIRMED_NON_EXECUTION, with opposite retry rules. | INDETERMINATE is never re-armed and requires provider-state reconciliation first (§6.15). CONFIRMED_NON_EXECUTION permits ONE same-quote, same-key re-dispatch under §6.16's gates (identical request/hash, unchanged binding, in-transaction exclusion re-check, ordinary expiry/fingerprint preconditions) — doctrine recorded as OPEN DECISION G-13/U-13 for ratification at approval. |
 
 ---
 
 ## 9. Unresolved Issues (carried into external review)
 
-U-1…U-8 are carried from v0.6.1 §9 unchanged in substance; U-9…U-12 are new in this
+U-1…U-8 are carried from v0.6.1 §9 unchanged in substance; U-9…U-13 are new in this
 candidate and cross-reference the gap register (`research/v0.6.2-release-gaps.md`), which
 carries their full entries, severities, and recommended resolutions.
 
@@ -1034,6 +1095,14 @@ carries their full entries, severities, and recommended resolutions.
   does not authenticate its creation time or issuer against a privileged writer. It is a
   pilot-harness control, NOT a protocol mechanism, and nothing in this candidate makes
   origin-manifest evidence a normative input to any §6 rule.
+- **U-13 (NEW) — Confirmed-non-execution re-dispatch doctrine awaits ratification**
+  (gap G-13, OPEN DECISION). This candidate specifies the implemented doctrine
+  (§3.12/§6.15/§6.16): one same-quote, same-key re-dispatch per CONFIRMED_NON_EXECUTION
+  settlement, gated on identical request/hash, unchanged binding, an in-transaction
+  same-subscription exclusion re-check, and the ordinary expiry/fingerprint
+  preconditions. The alternative — a fresh quote and key for every retry — buys
+  freshness at the cost of a separately reviewed implementation change; the approval
+  review ratifies one doctrine or directs the other.
 
 ---
 
@@ -1051,12 +1120,12 @@ carries their full entries, severities, and recommended resolutions.
 | §3.5 ActionCapabilities | Unchanged. |
 | §3.6 Consistency types | Unchanged. ATOMIC still never reported. |
 | §3.7 Quote | Unchanged fields; quote effects now carry determinacy + provenance (§3.10/§3.11). |
-| §3.8 Receipt | Modified: `ReconciliationResult` gains UNVERIFIED; `status` widened with COMMITTED_UNVERIFIED; `outcome` and optional `receiptId` added; replay clarified to the ORIGINAL recorded receipt. |
+| §3.8 Receipt | Modified (candidate §3.9): `ReconciliationResult` gains UNVERIFIED; `status` widened with COMMITTED_UNVERIFIED; `outcome` and optional `receiptId` added; replay clarified to the ORIGINAL recorded receipt; **EXACT equality refined (SPEC1)** — v0.6.1 §3.8's whole-object "MUST deep-equal" is replaced by §3.9's covered-dimensions equality, because §3.11's committed-role provenance (committed-side only) makes whole-object equality unsatisfiable for conforming EXACT receipts; whole-object deep equality is explicitly NOT a conformance criterion. |
 | §3.9 Error codes | One addition: `CONFLICTING_RECEIPT_IDENTITY`. No code removed or renamed. |
 | (v0.6.1 had no CommercialEffect definition) | NEW §3.8: CommercialEffect defined; `immediate` = incurred obligation, distinguished from invoice total / amount due / amount due net of credits / next-invoice estimate / recurring / cash collected; next-invoice facts stay in providerMetadata by convention. |
 | (new) | NEW §3.10: three-state determinacy, purity, N/A licensing (field absence + single-action context + citation; recurring never N/A; multi-change unlicensable), legacy UNKNOWN reading, finding order, snapshot determinacy. |
 | (new) | NEW §3.11: committed-figure provenance sources; only provider_actual / defined_equal_exact establish; label ≠ authentication (OPEN DECISION G-01). |
-| (new) | NEW §3.12: four-class mutation-outcome taxonomy with retry rules. |
+| (new) | NEW §3.12: four-class mutation-outcome taxonomy with retry rules — including the confirmed-non-execution re-dispatch doctrine (one same-quote, same-key re-dispatch per CONFIRMED_NON_EXECUTION settlement, §6.16 gates; SPEC2 correction — an earlier draft of this candidate said "as a new quote", contradicting the merged ledger; doctrine is OPEN DECISION G-13/U-13). |
 | (new) | NEW §3.13/§6.12: provider-neutral post-commit state-verification contract (verdicts, coverage, multiset tuples, partial/malformed handling, scheduled-cancel timing incl. premature-termination and SV6 classification, constant-false boundary fields). |
 | §4.1 EXACT scope | Unchanged; v0.6.2 note ties EXACT establishment to §3.11. |
 | §4.2 REVALIDATE | Clarifications preserved; NEW fail-closed determinacy paragraph (§6.13 summary). |
@@ -1064,10 +1133,10 @@ carries their full entries, severities, and recommended resolutions.
 | §5 Coverage resolution | Unchanged. |
 | §6.1–6.10 | Unchanged (6.10 replay wording aligned to "original recorded receipt"). |
 | §6.11 Reconciliation | Extended by §6.14: precedence VIOLATED > UNVERIFIED > OK; no-envelope case stated explicitly; legacy receipts never re-reconciled to OK. |
-| (new) | NEW §6.12 state verification; NEW §6.13 fail-closed enforcement (shared assessment, refusal shape, no-intent guarantee); NEW §6.15 outcomes/attribution/recovery/upgrade procedure; NEW §6.16 durable behavior (SQLite/WAL informative only). |
+| (new) | NEW §6.12 state verification; NEW §6.13 fail-closed enforcement (shared assessment, refusal shape, no-intent guarantee); NEW §6.15 outcomes/attribution/recovery/upgrade procedure; NEW §6.16 durable behavior (SQLite/WAL informative only), including the key/hash binding rules with the sole CONFIRMED_NON_EXECUTION re-dispatch exception (SPEC2). |
 | §7 Multi-change | Unchanged, plus the N/A-licensing consequence note. |
 | §8 Schema diff | Superseded by this Appendix and §8's BC-1…BC-6 summary. |
-| §9 Unresolved | U-1…U-8 carried; U-9…U-12 added, each cross-referencing the gap register. |
+| §9 Unresolved | U-1…U-8 carried; U-9…U-13 added, each cross-referencing the gap register. |
 
 ## Appendix B — Normative rule index (identifiers used by the traceability matrix)
 
@@ -1093,7 +1162,10 @@ DETERMINED requires an establishing source · **V62-ENV-06** recorded-receipt re
 performs no revalidation.
 
 Committed evidence (§3.11/§6.14): **V62-EVD-01** only provider_actual /
-defined_equal_exact establish · **V62-EVD-02** preview/estimate sources never establish ·
+defined_equal_exact establish · **V62-EVD-07** EXACT equality is covered-dimensions
+equality (§3.9): covered values/determinacy/timing must match; whole-object deep
+equality is NOT a criterion and committed-side provenance/evidence metadata may — and
+where §3.11 requires, must — differ · **V62-EVD-02** preview/estimate sources never establish ·
 **V62-EVD-03** precedence: established VIOLATED > UNVERIFIED > OK · **V62-EVD-04**
 no-envelope OK only over established actuals · **V62-EVD-05** legacy receipts never
 re-reconciled to OK · **V62-EVD-06** provenance label is not authentication.
@@ -1123,7 +1195,9 @@ Durable behavior (§6.16): **V62-DUR-01** verbatim original-receipt replay after
 **V62-DUR-02** receipt identity digest; conflicts refuse, originals preserved ·
 **V62-DUR-03** whole-set coherence validation at recovery; corrupt sets refused whole ·
 **V62-DUR-04** write-ahead intent + DISPATCHING in one transaction; at-most-once dispatch
-per authorization · **V62-DUR-05** idempotency-key uniqueness and request-hash binding ·
+per authorization · **V62-DUR-05** idempotency-key uniqueness and request-hash binding; terminal COMMITTED_*
+serves its recorded outcome and is never re-armed; CONFIRMED_NON_EXECUTION is the sole
+bounded re-dispatch exception (one re-dispatch per settlement, §6.16 gates) ·
 **V62-DUR-06** same-subscription exclusion enforced in-transaction · **V62-DUR-07**
 DISPATCHING recovers INDETERMINATE, never auto-retried · **V62-DUR-08** coordinator/store
 binding enforced at wiring · **V62-DUR-09** recorded receipts immutable; transitions
