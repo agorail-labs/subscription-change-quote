@@ -673,8 +673,14 @@ test("Test 35.20 (matrix 20): a pre-effect BC-1 refusal under durable wiring cre
   store.close();
 
   // After a restart there is still nothing unresolved to recover,
-  // and the refusal did not poison the quote: with a healthy
-  // transport the same quote commits cleanly.
+  // and the BC-1 refusal did not poison the quote: with a healthy
+  // transport the same quote proceeds exactly as a fresh quote
+  // would. PR-14 MIGRATION: where that formerly meant a clean
+  // commit, the quote now reaches the NEXT refusal stage — the
+  // authorization preservation gate — which is itself the proof
+  // the BC-1 refusal left no blocking residue (no attempt, no
+  // INDETERMINATE outcome, no stale lock): a poisoned quote would
+  // have failed earlier or differently.
   const store2 = new DurableQuoteStore(path, { recoveryGraceMs: 0 });
   const report = store2.recoveryReport();
   assert.ok(report.unresolvedAttempts.every((a) => a.quoteId !== quote.id), "no unresolved attempt survives the restart");
@@ -685,42 +691,64 @@ test("Test 35.20 (matrix 20): a pre-effect BC-1 refusal under durable wiring cre
     durableCoordinator: new DurableMutationCoordinator(store2),
     providerSite: "pilot-test",
   });
-  const receipt = await adapter2.commitChangeQuote(quote.id);
-  assert.equal(receipt.outcome, "COMMITTED_AND_VERIFIED");
-  assert.equal(mock.mutationCount, 1);
+  await assert.rejects(
+    () => adapter2.commitChangeQuote(quote.id),
+    (e: unknown) => e instanceof SCQError && e.code === "AUTHORIZATION_PRESERVATION_UNENFORCEABLE",
+    "the unpoisoned quote reaches the preservation gate — the current terminal refusal for live-adapter update commits",
+  );
+  assert.equal(mock.mutationCount, 0, "no mutation was dispatched at any point");
   store2.close();
 });
 
 test("Test 35.31 (matrix 31): a durable restart preserves UNKNOWN determinacy and the COMMITTED_UNVERIFIED outcome verbatim", async () => {
+  // PR-14 MIGRATION: this row's subject is the DURABLE STORE's
+  // verbatim preservation of a recorded COMMITTED_UNVERIFIED
+  // receipt across a restart. Its original setup produced the
+  // receipt by dispatching through the live adapter with a
+  // doctored re-read (test26.10c's pattern); the adapter no longer
+  // dispatches, so the receipt is seeded through the durable
+  // store's own recording API with exactly the 26.10c construction
+  // (immediate DETERMINED from the operation response; recurring
+  // UNKNOWN with NO figure — never reconstructed). The adapter
+  // commit's refusal is asserted first; every preservation
+  // assertion below is the original one.
   const path = tmpDb();
   const mock = new PilotMockChargebee();
-  // Doctor (test26.10c's pattern): after the update lands, the
-  // post-commit RE-READ's items lose their stated amounts, so the
-  // recurring actual is UNKNOWN and the commit records
-  // COMMITTED_UNVERIFIED.
-  let updated = false;
-  const transport: HttpTransport = async (req) => {
-    const res = await mock.transport(req);
-    if (req.method === "POST" && req.url.includes("/update_for_items")) {
-      updated = true;
-      return res;
-    }
-    if (updated && req.method === "GET" && req.url.includes("/subscriptions/") && res.json) {
-      const j = structuredClone(res.json) as { subscription?: { subscription_items?: Array<Record<string, unknown>> } };
-      for (const it of j.subscription?.subscription_items ?? []) delete it.amount;
-      return { ...res, json: j };
-    }
-    return res;
-  };
   const store = new DurableQuoteStore(path, { recoveryGraceMs: 0 });
-  const client = new ChargebeeClient({ site: "pilot-test", apiKey: "pilot-mock-key" }, transport);
+  const client = new ChargebeeClient({ site: "pilot-test", apiKey: "pilot-mock-key" }, mock.transport as HttpTransport);
   const adapter = new ChargebeeLiveAdapter(client, store, {
     liveCommitEnabled: true,
     durableCoordinator: new DurableMutationCoordinator(store),
     providerSite: "pilot-test",
   });
   const quote = await adapter.createChangeQuote(LIVE_SUB, LIVE_PROPOSAL);
-  const receipt = await adapter.commitChangeQuote(quote.id);
+  await assert.rejects(
+    () => adapter.commitChangeQuote(quote.id),
+    (e: unknown) => e instanceof SCQError && e.code === "AUTHORIZATION_PRESERVATION_UNENFORCEABLE",
+    "PR-14: the adapter commit itself refuses pre-dispatch — the receipt below is a store fixture",
+  );
+  const storedQuote = store.get(quote.id)!;
+  const snapshot = await adapter.getSubscription(LIVE_SUB);
+  const receipt = store.recordCommitReceipt(quote.id, {
+    receiptId: "rcpt_test35_31_fixture",
+    quoteId: quote.id,
+    subscriptionRef: LIVE_SUB,
+    status: "COMMITTED_UNVERIFIED",
+    outcome: "COMMITTED_UNVERIFIED",
+    resultingSnapshot: snapshot,
+    quotedEffect: storedQuote.quoted_effect,
+    committedEffect: {
+      immediate: { net: 20000 },
+      recurring: { currency: "USD" },
+      determinacy: { immediateFinancialEffect: "DETERMINED", recurringFinancialEffect: "UNKNOWN" },
+      provenance: { committedSource: "provider_actual" },
+    },
+    guaranteeMode: storedQuote.effective_guarantee_mode,
+    consistencyGuarantee: "BEST_EFFORT",
+    multiChangeConsistency: storedQuote.multi_change_consistency,
+    reconciliation: { status: "UNVERIFIED" },
+    committedAt: new Date().toISOString(),
+  } as any)!;
   assert.equal(receipt.outcome, "COMMITTED_UNVERIFIED");
   assert.equal(determinacyOf(receipt.committedEffect).recurringFinancialEffect, "UNKNOWN");
   store.close();

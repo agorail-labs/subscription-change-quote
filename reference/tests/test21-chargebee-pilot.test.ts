@@ -159,6 +159,29 @@ test("Test 21-n6: scheduled changes surface as a warning with termEffect UNKNOWN
 // Commit-path matrix (mocked transport ONLY; flag enabled for the mock)
 // ---------------------------------------------------------------------------
 
+/**
+ * PR-14 migration helper (Issue #22, Finding 1): the commit-path
+ * tests that previously drove dispatch outcomes through the pilot
+ * mock now assert the authorization preservation refusal. Armed
+ * mock faults are preserved in each scenario: the point is that
+ * the fault class can no longer occur because the commit refuses
+ * BEFORE the only dispatch — CONFIRMED_NON_EXECUTION semantics,
+ * zero mutations, no receipt. The classification machinery remains
+ * implemented in the dispatch path and covered by the simulator
+ * and store suites.
+ */
+async function expectPreservationRefusal(adapter: ChargebeeLiveAdapter, quoteId: string): Promise<void> {
+  await assert.rejects(
+    () => adapter.commitChangeQuote(quoteId),
+    (e: unknown) =>
+      e instanceof SCQError &&
+      e.code === "AUTHORIZATION_PRESERVATION_UNENFORCEABLE" &&
+      (e.details as any)?.outcome === "CONFIRMED_NON_EXECUTION" &&
+      (e.details as any)?.indeterminate !== true,
+    "the commit must refuse pre-dispatch with the preservation code and CONFIRMED_NON_EXECUTION semantics",
+  );
+}
+
 test("Test 21-c1: commit gate — with the flag disabled, quote + revalidation complete and NO mutating call is made", async () => {
   const { adapter, mock } = makeAdapter();
   const quote = await adapter.createChangeQuote(SUB, PROPOSAL(21));
@@ -187,24 +210,37 @@ test("Test 21-c3: expired quote refuses the commit before mutation", async () =>
 });
 
 test("Test 21-c4: successful mocked commit records actuals; duplicate commit replays the original receipt (§6.10)", async () => {
+  // PR-14 MIGRATION: the successful mocked commit is the unsafe
+  // operation itself (full-list replacement under OPERATION
+  // authorization) and now refuses pre-dispatch. The §6.10 property
+  // is preserved in refusal form: the duplicate commit returns the
+  // identical refusal deterministically, no receipt exists to
+  // replay, and the quote never reaches COMMITTED. Original-receipt
+  // replay for successful commits remains implemented and covered
+  // by the simulator and store suites.
   const { adapter, mock, store } = makeAdapter({}, { commitEnabled: true });
   const quote = await adapter.createChangeQuote(SUB, PROPOSAL(21));
-  const receipt = await adapter.commitChangeQuote(quote.id);
-  assert.equal(receipt.status, "COMMITTED");
-  assert.equal(receipt.reconciliation.status, "OK");
-  assert.equal(receipt.committedEffect.immediate?.net, 20000);
-  assert.equal(receipt.committedEffect.recurring?.resultingAmount, 80900);
-  const replay = await adapter.commitChangeQuote(quote.id);
-  assert.deepEqual(replay, receipt, "replay returns the original receipt");
-  assert.equal(mock.mutationCount, 1, "exactly one mutating call across commit + replay");
-  assert.equal(store.get(quote.id)?.status, "COMMITTED");
+  await expectPreservationRefusal(adapter, quote.id);
+  await expectPreservationRefusal(adapter, quote.id);
+  assert.equal(mock.mutationCount, 0, "no mutating call across commit + retry");
+  assert.equal(store.get(quote.id)?.commit_receipt, undefined, "no receipt is recorded for a refused commit");
+  assert.notEqual(store.get(quote.id)?.status, "COMMITTED");
 });
 
 test("Test 21-c5: conflicting idempotency — same native key with different parameters is a 422, not a second mutation", async () => {
+  // PR-14 MIGRATION: this test's subject is the mocked provider's
+  // NATIVE idempotency behavior at the transport level, which is
+  // unchanged. Previously the adapter's own commit consumed the
+  // key; the adapter now refuses pre-dispatch (asserted first —
+  // the key is NOT consumed by SCQ), so the key-consuming first
+  // call is made directly through the client, exactly as the
+  // conflicting second call already was.
   const { adapter, mock, client } = makeAdapter({}, { commitEnabled: true });
   const quote = await adapter.createChangeQuote(SUB, PROPOSAL(21));
-  await adapter.commitChangeQuote(quote.id);
+  await expectPreservationRefusal(adapter, quote.id);
+  assert.equal(mock.mutationCount, 0, "the refused commit consumed no idempotency key and dispatched nothing");
   const key = `scq-${quote.id}`.slice(0, 100);
+  await client.updateForItems(SUB, { subscription_items: [{ item_price_id: PLAN, quantity: 1 }, { item_price_id: ADDON, quantity: 21 }] }, key);
   await assert.rejects(
     () => client.updateForItems(SUB, { subscription_items: [{ item_price_id: ADDON, quantity: 99 }] }, key),
     (e: unknown) => e instanceof ChargebeeHttpError && e.httpStatus === 422,
@@ -231,33 +267,36 @@ test("Test 21-c6: lost mutation response, intended set in effect — INDETERMINA
   // mock behavior are unchanged — the mock still applies the update
   // before losing the response; only the classification is
   // corrected.
+  // PR-14 MIGRATION: the mock still applies-then-loses by design,
+  // but no dispatch reaches it — the commit refuses pre-dispatch.
+  // The recorded outcome is CONFIRMED_NON_EXECUTION (never
+  // INDETERMINATE: nothing was dispatched), mutation count is 0
+  // (not 1), and the second attempt refuses with the identical
+  // preservation refusal rather than the INDETERMINATE guard. The
+  // L1 classification remains implemented for dispatched paths and
+  // covered at the store/ledger level (test27, rh-04/05, test47.10).
   const { adapter, mock, store } = makeAdapter({ loseUpdateResponse: true }, { commitEnabled: true });
   const quote = await adapter.createChangeQuote(SUB, PROPOSAL(21));
-  await assert.rejects(
-    () => adapter.commitChangeQuote(quote.id),
-    (e: unknown) => e instanceof SCQError && (e.details as any)?.outcome === "INDETERMINATE" && (e.details as any)?.indeterminate === true,
-  );
-  assert.equal(store.get(quote.id)?.commit_outcome?.outcome, "INDETERMINATE");
-  assert.equal(store.get(quote.id)?.commit_receipt, undefined, "no committed receipt — landing by THIS request is not established");
-  assert.equal(mock.mutationCount, 1);
-  // A second attempt must NOT re-mutate: the recorded INDETERMINATE
-  // outcome refuses it before any dispatch.
-  await assert.rejects(
-    () => adapter.commitChangeQuote(quote.id),
-    (e: unknown) => e instanceof SCQError && (e.details as any)?.outcome === "INDETERMINATE",
-  );
-  assert.equal(mock.mutationCount, 1, "still exactly one mutating call — no blind retry");
+  await expectPreservationRefusal(adapter, quote.id);
+  assert.equal(store.get(quote.id)?.commit_outcome?.outcome, "CONFIRMED_NON_EXECUTION");
+  assert.equal(store.get(quote.id)?.commit_receipt, undefined, "no committed receipt");
+  assert.equal(mock.mutationCount, 0, "no mutating call — the armed response loss never occurs");
+  await expectPreservationRefusal(adapter, quote.id);
+  assert.equal(mock.mutationCount, 0, "still no mutating call — the refusal is deterministic");
 });
 
 test("Test 21-c7: provider 200 with silently unapplied change — no verified receipt, outcome indeterminate", async () => {
+  // PR-14 MIGRATION: the silently-unapplied 200 can no longer be
+  // produced — no dispatch reaches the mock. The protection (no
+  // verified receipt for an unapplied change) is preserved in its
+  // strongest form: no receipt at all, zero mutations, and the
+  // pre-dispatch refusal class instead of the post-dispatch
+  // indeterminate one.
   const { adapter, mock, store } = makeAdapter({ silentIgnoreUpdate: true }, { commitEnabled: true });
   const quote = await adapter.createChangeQuote(SUB, PROPOSAL(21));
-  await assert.rejects(
-    () => adapter.commitChangeQuote(quote.id),
-    (e: unknown) => e instanceof SCQError && (e.details as any)?.indeterminate === true && Array.isArray((e.details as any)?.itemSetMismatches),
-  );
+  await expectPreservationRefusal(adapter, quote.id);
   assert.equal(store.get(quote.id)?.commit_receipt, undefined);
-  assert.equal(mock.mutationCount, 1);
+  assert.equal(mock.mutationCount, 0, "no dispatch reached the mock");
 });
 
 test("Test 21-c8: post-commit financial uncertainty (incomplete update response) — COMMITTED_UNVERIFIED typed receipt (Defect 3 closed by PR-7)", async () => {
@@ -272,18 +311,17 @@ test("Test 21-c8: post-commit financial uncertainty (incomplete update response)
   // is established — only the immediate actual is unavailable, so
   // the receipt is COMMITTED_UNVERIFIED with the immediate
   // dimension UNKNOWN (never the estimate substituted, never OK).
+  // PR-14 MIGRATION: the incomplete response can no longer occur —
+  // no dispatch reaches the mock — so no COMMITTED_UNVERIFIED
+  // receipt is produced. The Defect 3 type and its classification
+  // remain implemented in the dispatch path and covered by the
+  // simulator suites; through this adapter the unverifiable-landing
+  // state is now prevented rather than represented.
   const { adapter, mock, store } = makeAdapter({ incompleteUpdateResponse: true }, { commitEnabled: true });
   const quote = await adapter.createChangeQuote(SUB, PROPOSAL(21));
-  const receipt = await adapter.commitChangeQuote(quote.id);
-  assert.equal(receipt.status, "COMMITTED_UNVERIFIED");
-  assert.equal(receipt.outcome, "COMMITTED_UNVERIFIED");
-  assert.equal(receipt.reconciliation.status, "UNVERIFIED");
-  assert.deepEqual((receipt.reconciliation as any).undeterminedDimensions, ["immediateFinancialEffect"]);
-  assert.equal(receipt.committedEffect.immediate, undefined);
-  assert.equal(receipt.committedEffect.determinacy?.immediateFinancialEffect, "UNKNOWN");
-  assert.equal(receipt.committedEffect.recurring?.resultingAmount, 80900, "the recurring actual is established from the independent re-read");
-  assert.equal(store.get(quote.id)?.commit_receipt?.status, "COMMITTED_UNVERIFIED");
-  assert.equal(mock.mutationCount, 1);
+  await expectPreservationRefusal(adapter, quote.id);
+  assert.equal(store.get(quote.id)?.commit_receipt, undefined, "no receipt is recorded for a refused commit");
+  assert.equal(mock.mutationCount, 0, "no dispatch reached the mock");
 });
 
 test("Test 21-c9: mandatory addon attached by the provider on update — attributable VIOLATED receipt (the landed set is not the quoted set)", async () => {
@@ -298,15 +336,20 @@ test("Test 21-c9: mandatory addon attached by the provider on update — attribu
   // (83400) includes the mandatory addon's stated amount. The landed
   // set is still never reported as the quoted set — it is reported
   // as a verified violation of it.
+  // PR-14 MIGRATION: the provider-side attach can no longer occur
+  // through this adapter — no dispatch reaches the mock, so the
+  // mandatory addon is never attached and no landed set exists to
+  // record as violated. This is the preservation hazard class of
+  // Issue #22 Finding 1 seen from the other side (an unrequested
+  // item entering the subscription through the commit's own
+  // dispatch): the gate removes the class by refusing the dispatch.
+  // Attributable-VIOLATED receipt semantics remain implemented and
+  // covered by the simulator suites.
   const { adapter, mock, store } = makeAdapter({ mandatoryAddonOnUpdate: "pilot-addon-mandatory" }, { commitEnabled: true });
   const quote = await adapter.createChangeQuote(SUB, PROPOSAL(21));
-  const receipt = await adapter.commitChangeQuote(quote.id);
-  assert.equal(receipt.status, "COMMITTED");
-  assert.equal(receipt.outcome, "COMMITTED_AND_VERIFIED");
-  assert.equal(receipt.reconciliation.status, "VIOLATED");
-  assert.match((receipt.reconciliation as any).reason, /extra item pilot-addon-mandatory/);
-  assert.equal(receipt.committedEffect.recurring?.resultingAmount, 83400, "59900 plan + 21000 addon + the mandatory addon's stated 2500, as actually landed");
-  assert.equal(receipt.committedEffect.immediate?.net, 20000);
-  assert.equal(store.get(quote.id)?.commit_receipt?.reconciliation.status, "VIOLATED");
-  assert.equal(mock.mutationCount, 1);
+  await expectPreservationRefusal(adapter, quote.id);
+  assert.equal(store.get(quote.id)?.commit_receipt, undefined, "no receipt is recorded for a refused commit");
+  assert.equal(mock.mutationCount, 0, "no dispatch reached the mock — the addon was never attached");
+  const snap = await adapter.getSubscription(SUB);
+  assert.equal(snap.items.some((i) => i.id === "pilot-addon-mandatory"), false, "the mandatory addon is absent from provider state");
 });

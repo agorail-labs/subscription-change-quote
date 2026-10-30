@@ -3,6 +3,7 @@ import assert from "node:assert/strict";
 import { mkdtempSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { SCQError } from "../src/core/types.js";
 import { ChargebeeClient, type HttpTransport } from "../src/live/chargebee-http.js";
 import { ChargebeeLiveAdapter } from "../src/live/chargebee-scq-adapter.js";
 import { PilotMockChargebee, type PilotMockFaults } from "../src/live/pilot/mock-transport.js";
@@ -42,6 +43,14 @@ function durableAdapter(path: string, mock: PilotMockChargebee) {
 }
 
 test("Test 28.1: quote persists before return; commit is write-ahead gated; after a restart the original receipt replays with no second dispatch", async () => {
+  // PR-14 MIGRATION: the durable quote persistence half is
+  // unchanged (the quote is present from disk after restart #1).
+  // The commit half changes: the preservation gate refuses BEFORE
+  // the write-ahead ledger, so no attempt is ever created and no
+  // receipt exists to replay — restart #2 proves the refusal
+  // itself is the deterministic cross-restart behavior (identical
+  // code, zero attempts, zero mutations). The write-ahead ledger's
+  // own behavior remains covered by test27/rh-04/05/10/11.
   const path = tmpDb();
   const mock = new PilotMockChargebee();
   const first = durableAdapter(path, mock);
@@ -51,37 +60,52 @@ test("Test 28.1: quote persists before return; commit is write-ahead gated; afte
   // Restart #1: a fresh store + adapter over the same database and
   // the same (mock) provider. The quote must be present from disk.
   const second = durableAdapter(path, mock);
-  const receipt = await second.adapter.commitChangeQuote(quote.id);
-  assert.equal(receipt.outcome, "COMMITTED_AND_VERIFIED");
-  assert.equal(mock.mutationCount, 1);
-  const attempts = second.store.attemptsForQuote(quote.id);
-  assert.equal(attempts.length, 1);
-  assert.equal(attempts[0].state, "COMMITTED_AND_VERIFIED");
-  assert.equal(attempts[0].site, "pilot-test");
-  assert.ok(attempts[0].requestHash.length === 64);
+  await assert.rejects(
+    () => second.adapter.commitChangeQuote(quote.id),
+    (e: unknown) => e instanceof SCQError && e.code === "AUTHORIZATION_PRESERVATION_UNENFORCEABLE" && (e.details as any)?.outcome === "CONFIRMED_NON_EXECUTION",
+  );
+  assert.equal(mock.mutationCount, 0, "no mutation was dispatched");
+  assert.equal(second.store.attemptsForQuote(quote.id).length, 0, "the gate precedes the ledger — no attempt was created");
+  assert.equal(second.store.get(quote.id)?.commit_receipt, undefined, "no receipt was recorded");
   second.store.close();
 
-  // Restart #2: replay serves the ORIGINAL receipt from disk; the
-  // provider sees no second mutation.
+  // Restart #2: the refusal replays deterministically from the
+  // persisted quote; the provider sees no mutation.
   const third = durableAdapter(path, mock);
-  const replayed = await third.adapter.commitChangeQuote(quote.id);
-  assert.deepEqual(replayed, receipt);
-  assert.equal(mock.mutationCount, 1, "replay after restart dispatched nothing");
+  await assert.rejects(
+    () => third.adapter.commitChangeQuote(quote.id),
+    (e: unknown) => e instanceof SCQError && e.code === "AUTHORIZATION_PRESERVATION_UNENFORCEABLE",
+  );
+  assert.equal(mock.mutationCount, 0, "no mutation after restart either");
+  assert.equal(third.store.attemptsForQuote(quote.id).length, 0);
   third.store.close();
 });
 
 test("Test 28.2: a lost response under durable wiring settles the attempt INDETERMINATE, and after restart the commit stays blocked with no second dispatch", async () => {
+  // PR-14 MIGRATION: the lose-response fault is never exercised —
+  // the gate refuses before the ledger and before dispatch, so no
+  // attempt exists to settle INDETERMINATE and no response exists
+  // to lose. After restart the commit refuses identically (never
+  // a blind retry: zero mutations throughout). INDETERMINATE
+  // settlement under durable wiring remains covered at the ledger
+  // level (test27, rh-04/05/13).
   const path = tmpDb();
   const mock = new PilotMockChargebee({ loseUpdateResponse: true } as PilotMockFaults);
   const first = durableAdapter(path, mock);
   const quote = await first.adapter.createChangeQuote(SUB, PROPOSAL(21));
-  await assert.rejects(() => first.adapter.commitChangeQuote(quote.id), /INDETERMINATE/);
-  assert.equal(first.store.attemptsForQuote(quote.id)[0].state, "INDETERMINATE");
+  await assert.rejects(
+    () => first.adapter.commitChangeQuote(quote.id),
+    (e: unknown) => e instanceof SCQError && e.code === "AUTHORIZATION_PRESERVATION_UNENFORCEABLE" && (e.details as any)?.indeterminate !== true,
+  );
+  assert.equal(first.store.attemptsForQuote(quote.id).length, 0, "no attempt was created — the gate precedes the ledger");
   first.store.close();
 
   const second = durableAdapter(path, mock);
-  await assert.rejects(() => second.adapter.commitChangeQuote(quote.id), /INDETERMINATE/);
-  assert.equal(mock.mutationCount, 1, "no blind retry after restart");
+  await assert.rejects(
+    () => second.adapter.commitChangeQuote(quote.id),
+    (e: unknown) => e instanceof SCQError && e.code === "AUTHORIZATION_PRESERVATION_UNENFORCEABLE",
+  );
+  assert.equal(mock.mutationCount, 0, "no dispatch before or after restart");
   second.store.close();
 });
 

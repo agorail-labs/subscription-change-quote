@@ -3,6 +3,7 @@ import assert from "node:assert/strict";
 import { mkdtempSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { SCQError } from "../src/core/types.js";
 import type {
   PostCommitObservedSnapshot,
   ProviderObservation,
@@ -460,16 +461,37 @@ function liveAdapter(faults: PilotMockFaults = {}, opts: { commitEnabled?: boole
 }
 
 test("Test 31.22 (row 22, NEW + COMPATIBILITY): lost response followed by a matching state — the hook reports the state observed, and the attempt STAYS INDETERMINATE with no receipt (L1)", async () => {
+  // PR-14 MIGRATION: the live adapter no longer dispatches, so the
+  // lost-response attempt this row exercised cannot be produced
+  // through it (the commit refuses at the preservation gate —
+  // asserted first). The row's subject is the SEPARATION between
+  // the hook's state verdict and the attempt's classification, so
+  // the unresolved attempt is seeded through the store's own
+  // outcome API — the exact write the unknown-dispatch path
+  // performs — and the provider state is moved to the matching
+  // target by an external change (which is precisely L1's point:
+  // the observations are identical whether our dispatch or another
+  // actor landed them). Every hook and classification assertion
+  // below is the original one.
   const { adapter, mock, store } = liveAdapter({ loseUpdateResponse: true });
   const quote = await adapter.createChangeQuote(SUB, LIVE_PROPOSAL(21));
-  await assert.rejects(() => adapter.commitChangeQuote(quote.id), /INDETERMINATE/);
-  assert.equal(mock.mutationCount, 1);
+  await assert.rejects(
+    () => adapter.commitChangeQuote(quote.id),
+    (e: unknown) => e instanceof SCQError && e.code === "AUTHORIZATION_PRESERVATION_UNENFORCEABLE",
+    "PR-14: the adapter commit itself refuses pre-dispatch",
+  );
+  mock.applyExternalChange(ADDON, 21); // the matching state — provenance deliberately ambiguous (L1)
+  store.recordCommitOutcome(quote.id, {
+    outcome: "INDETERMINATE",
+    at: new Date().toISOString(),
+    details: { reason: "test31.22 (PR-14 fixture): seeded exactly as the unknown-dispatch path records an unresolved attempt" },
+  });
+  assert.equal(mock.mutationCount, 0, "no SCQ dispatch occurred — the state change is the external fixture's");
   assert.equal(store.recordedReceipt(quote.id), undefined, "no receipt exists for the unresolved attempt");
   assert.equal(store.get(quote.id)?.commit_outcome?.outcome, "INDETERMINATE");
 
-  // The provider state now matches the intent exactly (the mock
-  // applied the change before losing the response). Run the shared
-  // hook over that independently read state:
+  // The provider state now matches the intent exactly. Run the
+  // shared hook over that independently read state:
   const observedSnap = await adapter.getSubscription(SUB);
   const stored = store.get(quote.id)!;
   const stateResult = verifyPostCommitState(
@@ -491,28 +513,38 @@ test("Test 31.22 (row 22, NEW + COMPATIBILITY): lost response followed by a matc
   // another actor applied the identical change.
   assert.equal(store.recordedReceipt(quote.id), undefined, "a matching state does not create a receipt");
   assert.equal(store.get(quote.id)?.commit_outcome?.outcome, "INDETERMINATE");
-  await assert.rejects(() => adapter.commitChangeQuote(quote.id), /INDETERMINATE/, "blind retry remains refused");
-  assert.equal(mock.mutationCount, 1, "no second dispatch occurred");
+  await assert.rejects(() => adapter.commitChangeQuote(quote.id), /INDETERMINATE/, "blind retry remains refused — the INDETERMINATE guard, not the preservation gate, answers a retry of an unresolved attempt");
+  assert.equal(mock.mutationCount, 0, "no dispatch occurred at any point");
 });
 
 test("Test 31.23 (row 23, COMPATIBILITY): an intervening actor breaks the attribution bracket — the hook's state MISMATCH is NOT translated into a financial VIOLATED", async () => {
-  const { adapter, store } = liveAdapter({}, {
-    wrap: (mock) => async (req) => {
-      const res = await mock.transport(req);
-      if (req.method === "POST" && req.url.includes("/update_for_items")) mock.applyExternalChange(ADDON, 5);
-      return res;
-    },
-  });
+  // PR-14 MIGRATION: the intervening write was formerly triggered
+  // by our own dispatch; the adapter no longer dispatches (the
+  // commit refuses at the preservation gate — asserted first), so
+  // the actor's write is applied directly and the hook is run over
+  // an independent re-read of the resulting state. The row's point
+  // is preserved in its strongest form: the hook still reports the
+  // state contradiction (MISMATCH, unattributed), and there is no
+  // committed receipt at all for the contradiction to be
+  // mistranslated into a financial VIOLATED on — the quote's only
+  // recorded outcome is the pre-dispatch CONFIRMED_NON_EXECUTION.
+  // Z1–Z3 bracket semantics remain implemented in the dispatch
+  // path and covered at the store level.
+  const { adapter, mock, store } = liveAdapter();
   const quote = await adapter.createChangeQuote(SUB, LIVE_PROPOSAL(21));
-  const receipt = await adapter.commitChangeQuote(quote.id);
-  assert.equal(receipt.outcome, "COMMITTED_UNVERIFIED");
-  assert.equal(receipt.reconciliation.status, "UNVERIFIED", "not VIOLATED: the contradiction is unattributed context");
-  assert.equal(receipt.committedEffect.recurring?.resultingAmount, undefined, "Z3: no established recurring figure under a broken bracket");
+  await assert.rejects(
+    () => adapter.commitChangeQuote(quote.id),
+    (e: unknown) => e instanceof SCQError && e.code === "AUTHORIZATION_PRESERVATION_UNENFORCEABLE",
+  );
+  assert.equal(store.get(quote.id)?.commit_receipt, undefined, "no committed receipt exists — nothing carries a financial classification for this quote");
+  assert.equal(store.get(quote.id)?.commit_outcome?.outcome, "CONFIRMED_NON_EXECUTION");
+  mock.applyExternalChange(ADDON, 5); // the intervening actor's write
+  const observedSnap = await adapter.getSubscription(SUB);
 
-  // The shared hook, run over the same observed state, DOES report
-  // the state contradiction — state truth and financial
-  // classification are separate questions, and only the adapter's
-  // operation-bound bracket evidence may connect them.
+  // The shared hook, run over the observed state, DOES report the
+  // state contradiction — state truth and financial classification
+  // are separate questions, and only operation-bound bracket
+  // evidence may connect them.
   const stateResult = verifyPostCommitState(
     {
       proposal: store.get(quote.id)!.proposal,
@@ -521,7 +553,7 @@ test("Test 31.23 (row 23, COMPATIBILITY): an intervening actor breaks the attrib
         { id: ADDON, quantity: 21 },
       ],
     },
-    { snapshot: receipt.resultingSnapshot, source: "test31: the receipt's recorded post-commit snapshot" }
+    { snapshot: observedSnap, source: "test31: independent re-read after the intervening actor's write" }
   );
   assert.equal(stateResult.verdict, "MISMATCH");
   assert.equal(stateResult.stateAttributableToThisOperation, false);

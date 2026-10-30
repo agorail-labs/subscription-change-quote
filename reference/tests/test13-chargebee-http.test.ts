@@ -699,6 +699,34 @@ test("Test 13-fix11e (PR #4 review, adapter level): an estimate whose stated lis
   assert.equal(quote.commercialEffect.recurring?.resultingAmount, 120500, "computed per item instead: 120000 per-unit + the unchanged on/off addon at its observed 500");
 });
 
+/**
+ * PR-14 migration helper (Issue #22, Finding 1): every test below
+ * that previously drove a dispatch outcome through the live adapter
+ * now asserts the authorization preservation refusal instead. The
+ * scenarios' fixtures (armed provider faults, doctored transports)
+ * are preserved verbatim: the point of each migrated test is that
+ * the fault class it armed can no longer occur through this
+ * adapter, because the commit refuses BEFORE the only dispatch —
+ * with CONFIRMED_NON_EXECUTION semantics, zero mutations, and no
+ * receipt. The receipt-classification machinery each scenario
+ * originally exercised remains implemented in the adapter's
+ * dispatch path for a future permitting capability and remains
+ * covered by the simulator and store suites; it is unreachable
+ * here by design, and these tests say so rather than deleting the
+ * scenarios.
+ */
+async function expectPreservationRefusal(adapter: ChargebeeLiveAdapter, quoteId: string): Promise<void> {
+  await assert.rejects(
+    () => adapter.commitChangeQuote(quoteId),
+    (e: unknown) =>
+      e instanceof SCQError &&
+      e.code === "AUTHORIZATION_PRESERVATION_UNENFORCEABLE" &&
+      (e.details as any)?.outcome === "CONFIRMED_NON_EXECUTION" &&
+      (e.details as any)?.indeterminate !== true,
+    "the commit must refuse pre-dispatch with the preservation code and CONFIRMED_NON_EXECUTION semantics",
+  );
+}
+
 test("Test 13-rec1 (PR #4 review; PR-7 classification): incomplete post-update response (no invoice, no unbilled_charges) — COMMITTED_UNVERIFIED receipt, immediate UNKNOWN", async () => {
   // DISCLOSED CHANGE (PR-7, v0.6.2): this test previously asserted
   // the PR #4 posture — INDETERMINATE and NO receipt — because the
@@ -712,22 +740,23 @@ test("Test 13-rec1 (PR #4 review; PR-7 classification): incomplete post-update r
   // is therefore a typed COMMITTED_UNVERIFIED receipt with the
   // immediate dimension UNKNOWN — never the pre-mutation estimate
   // substituted as an actual, never reconciled as OK.
+  // PR-14 MIGRATION: this scenario armed an incomplete post-update
+  // response and asserted the COMMITTED_UNVERIFIED receipt it
+  // produced. That response can no longer occur through this
+  // adapter — the commit refuses pre-dispatch — so the test now
+  // asserts the refusal. The COMMITTED_UNVERIFIED classification
+  // (Defect 3) remains implemented and covered elsewhere; the
+  // protection this test carries forward is stronger: with no
+  // dispatch, no unverifiable landing can be created at all.
   const fake = new FakeChargebee();
-  fake.updateShape = "noFinancials"; // the update applies, but its response carries no financial members at all
+  fake.updateShape = "noFinancials"; // armed, but never exercised: no update is dispatched
   const store = new QuoteStore();
   const adapter = makeAdapter(fake, { store });
   const quote = await adapter.createChangeQuote("cb_live_test_1", qtyProposal());
-  const receipt = await adapter.commitChangeQuote(quote.id);
-  assert.equal(fake.mutationCount, 1, "the mutation itself was issued (the classification is about verification, not prevention)");
-  assert.equal(receipt.status, "COMMITTED_UNVERIFIED");
-  assert.equal(receipt.outcome, "COMMITTED_UNVERIFIED");
-  assert.equal(receipt.reconciliation.status, "UNVERIFIED");
-  assert.deepEqual((receipt.reconciliation as any).undeterminedDimensions, ["immediateFinancialEffect"]);
-  assert.equal(receipt.committedEffect.immediate, undefined, "the unavailable immediate actual is absent — never replaced by the estimate's 20000");
-  assert.equal(receipt.committedEffect.determinacy?.immediateFinancialEffect, "UNKNOWN");
-  assert.equal(receipt.committedEffect.recurring?.resultingAmount, 120000, "the recurring actual IS established from the independent re-read");
-  assert.equal(receipt.committedEffect.determinacy?.recurringFinancialEffect, "DETERMINED");
-  assert.equal(store.get(quote.id)?.commit_receipt?.status, "COMMITTED_UNVERIFIED");
+  await expectPreservationRefusal(adapter, quote.id);
+  assert.equal(fake.mutationCount, 0, "no mutation was issued — the incomplete-response shape was never produced");
+  assert.equal(store.get(quote.id)?.commit_receipt, undefined, "no receipt is recorded for a refused commit");
+  assert.equal(store.get(quote.id)?.commit_outcome?.outcome, "CONFIRMED_NON_EXECUTION");
 });
 
 test("Test 13-rec2 (PR #4 review; PR-7 review L1 classification): lost response; re-read shows the intended items but WITHOUT determinable amounts — INDETERMINATE, outcome recorded, no receipt", async () => {
@@ -766,18 +795,21 @@ test("Test 13-rec2 (PR #4 review; PR-7 review L1 classification): lost response;
   const client = new ChargebeeClient({ site: "scq-test", apiKey: "test_key_redacted" }, lossyStrip);
   const adapter = new ChargebeeLiveAdapter(client, store, { liveCommitEnabled: true });
   const quote = await adapter.createChangeQuote("cb_live_test_1", qtyProposal());
-  await assert.rejects(
-    () => adapter.commitChangeQuote(quote.id),
-    (e: unknown) => e instanceof SCQError && (e.details as any)?.outcome === "INDETERMINATE" && (e.details as any)?.indeterminate === true,
-  );
-  assert.equal(store.get(quote.id)?.commit_outcome?.outcome, "INDETERMINATE");
-  assert.equal(store.get(quote.id)?.commit_receipt, undefined, "no committed receipt — landing by THIS request is not established");
-  assert.equal(fake.mutationCount, 1, "exactly one mutation; no blind retry");
-  await assert.rejects(
-    () => adapter.commitChangeQuote(quote.id),
-    (e: unknown) => e instanceof SCQError && (e.details as any)?.outcome === "INDETERMINATE",
-  );
-  assert.equal(fake.mutationCount, 1, "the recorded INDETERMINATE refuses a second dispatch");
+  // PR-14 MIGRATION: the lossy dispatch never happens — the commit
+  // refuses pre-dispatch, so there is no response to lose and no
+  // INDETERMINATE outcome. The retry assertion is preserved in its
+  // stronger form: a repeated commit returns the identical
+  // preservation refusal deterministically (not the INDETERMINATE
+  // guard — the recorded outcome here is CONFIRMED_NON_EXECUTION).
+  // The L1 doctrine itself (a landed-but-unattributable dispatch is
+  // INDETERMINATE) is untouched and remains covered at the
+  // store/ledger level (test27, rehearsal rh-04/05).
+  await expectPreservationRefusal(adapter, quote.id);
+  assert.equal(store.get(quote.id)?.commit_outcome?.outcome, "CONFIRMED_NON_EXECUTION", "a pre-dispatch refusal is never recorded as INDETERMINATE");
+  assert.equal(store.get(quote.id)?.commit_receipt, undefined, "no committed receipt");
+  assert.equal(fake.mutationCount, 0, "no mutation was dispatched; nothing could be lost");
+  await expectPreservationRefusal(adapter, quote.id);
+  assert.equal(fake.mutationCount, 0, "the retry refuses identically — still no dispatch");
 });
 
 test("Test 13-rec3 (PR #4 review): lost response and provider state does NOT show the intended change — the existing indeterminate refusal is preserved", async () => {
@@ -790,11 +822,13 @@ test("Test 13-rec3 (PR #4 review): lost response and provider state does NOT sho
   const client = new ChargebeeClient({ site: "scq-test", apiKey: "test_key_redacted" }, dropUpdate);
   const adapter = new ChargebeeLiveAdapter(client, store, { liveCommitEnabled: true });
   const quote = await adapter.createChangeQuote("cb_live_test_1", qtyProposal());
-  await assert.rejects(
-    () => adapter.commitChangeQuote(quote.id),
-    (e: unknown) => e instanceof SCQError && e.code === "PROVIDER_ERROR" && (e as any).details?.indeterminate === true && String(e.message).includes("INDETERMINATE"),
-  );
-  assert.equal(fake.mutationCount, 0, "the mutation never landed and was never re-issued");
+  // PR-14 MIGRATION: the dropped dispatch never happens — the
+  // preservation refusal precedes it. The original protection (no
+  // mutation, no receipt, fail closed) is preserved and the refusal
+  // is now the deterministic pre-dispatch class rather than the
+  // post-dispatch indeterminate one.
+  await expectPreservationRefusal(adapter, quote.id);
+  assert.equal(fake.mutationCount, 0, "the mutation was never dispatched, landed, or re-issued");
   assert.equal(store.get(quote.id)?.commit_receipt, undefined);
 });
 
@@ -816,17 +850,15 @@ test("Test 13-rec4 (PR #4 review): a complete ACTUAL response is recorded with t
   const adapter = new ChargebeeLiveAdapter(client, store, { liveCommitEnabled: true });
   const quote = await adapter.createChangeQuote("cb_live_test_1", qtyProposal());
   assert.equal(quote.commercialEffect.immediate?.net, 20000, "the quote carries the estimate, as expected");
-  const receipt = await adapter.commitChangeQuote(quote.id);
-  assert.equal(receipt.status, "COMMITTED");
-  assert.equal(receipt.committedEffect.immediate?.net, 25000, "the receipt carries the ACTUAL figure from the update response — not the estimate's 20000");
-  assert.equal(receipt.committedEffect.recurring?.resultingAmount, 120000, "recurring comes from the re-read post-commit state");
-  assert.equal(receipt.quotedEffect.immediate?.net, 20000);
-  assert.equal(receipt.reconciliation.status, "VIOLATED", "actual 25000 exceeds the zero-tolerance envelope vs quoted 20000 — reported honestly, not absorbed");
-  assert.deepEqual(
-    store.get(quote.id)?.commit_receipt,
-    receipt,
-    "the stored record is the original receipt verbatim (by value) — PR #8 correction C3: the store now holds defensive copies, so this is value equality, not reference identity"
-  );
+  // PR-14 MIGRATION: the actuals-rewriting transport is never
+  // exercised — the commit refuses pre-dispatch, so no response
+  // exists whose actuals could be recorded or violate the envelope.
+  // The actuals-over-estimate doctrine remains implemented in the
+  // dispatch path and covered by the simulator suites.
+  await expectPreservationRefusal(adapter, quote.id);
+  assert.equal(fake.mutationCount, 0, "no mutation was dispatched");
+  assert.equal(fake.sub.subscription_items[0].quantity, 100, "provider state is untouched");
+  assert.equal(store.get(quote.id)?.commit_receipt, undefined, "no receipt is recorded for a refused commit");
 });
 
 test("Test 13-rec5 (PR #4 final review, Fix A; PR-7 classification): post-commit re-read OMITS subscription_items entirely — COMMITTED_UNVERIFIED, recurring UNKNOWN, never a verified 0", async () => {
@@ -856,16 +888,14 @@ test("Test 13-rec5 (PR #4 final review, Fix A; PR-7 classification): post-commit
   const client = new ChargebeeClient({ site: "scq-test", apiKey: "test_key_redacted" }, omitItems);
   const adapter = new ChargebeeLiveAdapter(client, store, { liveCommitEnabled: true });
   const quote = await adapter.createChangeQuote("cb_live_test_1", qtyProposal());
-  const receipt = await adapter.commitChangeQuote(quote.id);
-  assert.equal(receipt.status, "COMMITTED_UNVERIFIED");
-  assert.equal(receipt.outcome, "COMMITTED_UNVERIFIED");
-  assert.equal(receipt.reconciliation.status, "UNVERIFIED");
-  assert.equal(receipt.committedEffect.recurring?.resultingAmount, undefined, "no recurring figure may be derived from an absent collection");
-  assert.equal(receipt.committedEffect.determinacy?.recurringFinancialEffect, "UNKNOWN");
-  assert.equal(receipt.committedEffect.immediate?.net, 20000, "the immediate actual comes from the update response itself");
-  assert.equal(receipt.committedEffect.determinacy?.immediateFinancialEffect, "DETERMINED");
-  assert.equal(fake.mutationCount, 1, "the mutation itself was issued (the classification is about verifiability)");
-  assert.equal(store.get(quote.id)?.commit_receipt?.status, "COMMITTED_UNVERIFIED");
+  // PR-14 MIGRATION: no dispatch occurs, so no post-commit re-read
+  // exists to omit anything. Fix A's underlying protection — an
+  // absent collection is never summed as a verified 0 — is
+  // preserved a fortiori: no committed figure of any kind is
+  // recorded for a refused commit.
+  await expectPreservationRefusal(adapter, quote.id);
+  assert.equal(fake.mutationCount, 0, "no mutation was issued");
+  assert.equal(store.get(quote.id)?.commit_receipt, undefined, "no receipt — and therefore no recurring figure — is recorded");
 });
 
 test("Test 13-rec6 (PR #4 final review, Fix A): an item with a stated amount of exactly 0 in a complete, intended-matching set is a DETERMINED zero — receipt records it", async () => {
@@ -895,15 +925,14 @@ test("Test 13-rec6 (PR #4 final review, Fix A): an item with a stated amount of 
   const adapter = new ChargebeeLiveAdapter(client, store, { liveCommitEnabled: true });
   const quote = await adapter.createChangeQuote("cb_live_zero_1", qtyProposal());
   assert.equal(quote.commercialEffect.recurring?.resultingAmount, 120500, "quote: 120000 per-unit plan + the flat_fee addon at its fixed 500");
-  const receipt = await adapter.commitChangeQuote(quote.id);
-  assert.equal(receipt.status, "COMMITTED", "an explicitly stated 0 must not be refused as if it were missing data");
-  assert.equal(receipt.committedEffect.recurring?.resultingAmount, 120000, "committed recurring = 120000 + the addon's explicitly stated 0 — a determined zero, included in the sum");
-  assert.equal(receipt.committedEffect.immediate?.net, 20000);
-  assert.deepEqual(
-    store.get(quote.id)?.commit_receipt,
-    receipt,
-    "the stored record is the original receipt verbatim (by value) — PR #8 correction C3: the store now holds defensive copies, so this is value equality, not reference identity"
-  );
+  // PR-14 MIGRATION: the quote-side determined-zero behavior above
+  // is unchanged and still asserted. The commit now refuses
+  // pre-dispatch (the refusal is about authorization preservation,
+  // NOT about the stated zero — a determined zero is still never
+  // treated as missing data anywhere in quote or revalidation).
+  await expectPreservationRefusal(adapter, quote.id);
+  assert.equal(fake.mutationCount, 0, "no mutation was issued");
+  assert.equal(store.get(quote.id)?.commit_receipt, undefined, "no receipt is recorded for a refused commit");
 });
 
 test("Test 13-rec7 (PR #4 final review, Fix B): update returns HTTP 200 success-shaped but the provider SILENTLY IGNORED the change — INDETERMINATE, no receipt", async () => {
@@ -921,12 +950,13 @@ test("Test 13-rec7 (PR #4 final review, Fix B): update returns HTTP 200 success-
   const client = new ChargebeeClient({ site: "scq-test", apiKey: "test_key_redacted" }, silentIgnore);
   const adapter = new ChargebeeLiveAdapter(client, store, { liveCommitEnabled: true });
   const quote = await adapter.createChangeQuote("cb_live_test_1", qtyProposal());
-  await assert.rejects(
-    () => adapter.commitChangeQuote(quote.id),
-    (e: unknown) => e instanceof SCQError && e.code === "PROVIDER_ERROR" && (e as any).details?.indeterminate === true && Array.isArray((e as any).details?.itemSetMismatches),
-    "the re-read shows quantity 100, not the intended 120 — financial agreement cannot substitute for the item set actually landing",
-  );
-  assert.equal(fake.mutationCount, 0, "the provider in fact never mutated — a COMMITTED receipt here would have been a fabrication");
+  // PR-14 MIGRATION: the silent-ignore response is never produced —
+  // no dispatch is sent for it to answer. Fix B's protection (a
+  // success-shaped response never fabricates a COMMITTED receipt)
+  // is preserved in its strongest form: no receipt of any kind is
+  // recorded, and the refusal is the pre-dispatch class.
+  await expectPreservationRefusal(adapter, quote.id);
+  assert.equal(fake.mutationCount, 0, "the provider never mutated — and no COMMITTED receipt was fabricated");
   assert.equal(store.get(quote.id)?.commit_receipt, undefined);
   assert.notEqual(store.get(quote.id)?.status, "COMMITTED");
 });
@@ -961,15 +991,15 @@ test("Test 13-rec8 (PR #4 final review, Fix B; PR-7 classification): update part
   const client = new ChargebeeClient({ site: "scq-test", apiKey: "test_key_redacted" }, partialApply);
   const adapter = new ChargebeeLiveAdapter(client, store, { liveCommitEnabled: true });
   const quote = await adapter.createChangeQuote("cb_live_test_1", qtyProposal());
-  const receipt = await adapter.commitChangeQuote(quote.id);
-  assert.equal(receipt.status, "COMMITTED");
-  assert.equal(receipt.outcome, "COMMITTED_AND_VERIFIED");
-  assert.equal(receipt.reconciliation.status, "VIOLATED");
-  assert.match((receipt.reconciliation as any).reason, /quantity mismatch for item seat-basic-monthly: intended 120, actual 110/);
-  assert.equal(receipt.committedEffect.recurring?.resultingAmount, 110000, "the committed recurring reports the observed actual state, not the intended 120000");
-  assert.equal(receipt.committedEffect.immediate?.net, 20000);
-  assert.equal(fake.mutationCount, 1);
-  assert.equal(store.get(quote.id)?.commit_receipt?.reconciliation.status, "VIOLATED");
+  // PR-14 MIGRATION: no dispatch occurs, so no partial application
+  // can be produced or attributed. D3's determined-negative-
+  // verification machinery remains implemented in the dispatch
+  // path; here the protection is prevention — a wrong landing is
+  // impossible because nothing lands.
+  await expectPreservationRefusal(adapter, quote.id);
+  assert.equal(fake.mutationCount, 0, "no mutation was issued — nothing partially applied");
+  assert.equal(fake.sub.subscription_items[0].quantity, 100, "provider state is untouched");
+  assert.equal(store.get(quote.id)?.commit_receipt, undefined, "no receipt is recorded for a refused commit");
 });
 
 test("Test 13-rec9 (PR #4 final review, Fix B; PR-7 classification): re-read shows an EXTRA item, and (separately) a DUPLICATED entry — both attributable VIOLATED receipts", async () => {
@@ -996,32 +1026,36 @@ test("Test 13-rec9 (PR #4 final review, Fix B; PR-7 classification): re-read sho
     const client = new ChargebeeClient({ site: "scq-test", apiKey: "test_key_redacted" }, transport);
     const adapter = new ChargebeeLiveAdapter(client, store, { liveCommitEnabled: true });
     const quote = await adapter.createChangeQuote("cb_live_test_1", qtyProposal());
-    const receipt = await adapter.commitChangeQuote(quote.id);
-    assert.equal(receipt.status, "COMMITTED");
-    assert.equal(receipt.outcome, "COMMITTED_AND_VERIFIED");
-    assert.equal(receipt.reconciliation.status, "VIOLATED");
-    assert.equal(store.get(quote.id)?.commit_receipt?.reconciliation.status, "VIOLATED");
+    // PR-14 MIGRATION (both doctor variants): no dispatch occurs,
+    // so the doctored re-read is never produced — the extra /
+    // duplicated entry can never enter a landed set through this
+    // adapter. Prevention replaces the former VIOLATED receipt.
+    await expectPreservationRefusal(adapter, quote.id);
+    assert.equal(fake.mutationCount, 0, "no mutation was issued");
+    assert.equal(store.get(quote.id)?.commit_receipt, undefined, "no receipt is recorded for a refused commit");
   };
   await run((items) => { items.push({ item_price_id: "perunit-addon-monthly", item_type: "addon", quantity: 3, unit_price: 1000, amount: 3000, free_quantity: 0 }); });
   await run((items) => { items.push({ ...items[0] }); });
 });
 
 test("Test 13-rec10 (PR #4 final review, Fix B positive control): re-read matches the intended set exactly — the COMMITTED receipt records as before", async () => {
+  // PR-14 MIGRATION — the positive control is deliberately
+  // inverted: even with a perfectly behaved provider whose landed
+  // set WOULD match the intent exactly, the commit refuses. The
+  // preservation defect was never about this run's outcome; it is
+  // that a non-atomic full-list replacement cannot rule out the
+  // interfering run, and the absence of observed interference is
+  // not safety (the same reasoning as test47.2 / repro43.2
+  // revisited). The former control's role — proving the harness
+  // CAN produce a verified commit — is now served by the simulator
+  // adapters' suites (e.g. test25), whose mechanisms are in-model.
   const fake = new FakeChargebee();
   const store = new QuoteStore();
   const adapter = makeAdapter(fake, { store });
   const quote = await adapter.createChangeQuote("cb_live_test_1", qtyProposal());
-  const receipt = await adapter.commitChangeQuote(quote.id);
-  assert.equal(receipt.status, "COMMITTED");
-  assert.equal(receipt.committedEffect.recurring?.resultingAmount, 120000, "actual post-commit recurring from the verified item set");
-  assert.equal(receipt.committedEffect.immediate?.net, 20000, "actual immediate from the update response");
-  assert.deepEqual(receipt.reconciliation, { status: "OK" });
-  assert.deepEqual(
-    store.get(quote.id)?.commit_receipt,
-    receipt,
-    "the stored record is the original receipt verbatim (by value) — PR #8 correction C3: the store now holds defensive copies, so this is value equality, not reference identity"
-  );
-  assert.equal(fake.mutationCount, 1);
+  await expectPreservationRefusal(adapter, quote.id);
+  assert.equal(fake.mutationCount, 0, "no mutation was issued even though the provider would have landed the intended set exactly");
+  assert.equal(store.get(quote.id)?.commit_receipt, undefined, "no receipt is recorded for a refused commit");
 });
 
 // ---------- T01–T14 (mocked transport; classifications in TEST-RESULTS.md) ----------
@@ -1054,36 +1088,25 @@ test("T02 (SIMULATED_PASS): quote 100 -> 120 performs retrieve + estimate only; 
 });
 
 test("T03 (SIMULATED_PASS): normal quote and commit — correct outcome, receipt, replace semantics, no invoice collection", async () => {
+  // PR-14 MIGRATION: the "normal" commit is exactly the unsafe
+  // operation — a full-list replacement under OPERATION
+  // authorization — so it now refuses pre-dispatch. What this test
+  // still proves: the quote flow is unchanged; NO update_for_items
+  // request is ever constructed or sent (so replace semantics and
+  // invoice collection are moot — nothing is dispatched); provider
+  // state is untouched. The request-shape assertions that used to
+  // run against the dispatched request (replace_items_list=true,
+  // invoice_immediately=false, scq- idempotency key) remain covered
+  // against the request builder itself by the preflight suites
+  // (test37–42), which derive the would-be dispatch from
+  // buildChargebeeUpdateParams without sending it.
   const fake = new FakeChargebee();
   const adapter = makeAdapter(fake);
   const quote = await adapter.createChangeQuote("cb_live_test_1", qtyProposal());
-  const receipt = await adapter.commitChangeQuote(quote.id);
-  assert.equal(receipt.status, "COMMITTED");
-  assert.equal(receipt.outcome, "COMMITTED_AND_VERIFIED");
-  assert.equal(receipt.resultingSnapshot.items[0].quantity, 120);
-  // DISCLOSED CHANGE (PR-7, v0.6.2): whole-effect deepEqual was
-  // replaced by figure+determinacy equality plus a committedSource
-  // assertion (the PR #10/#15 pattern). Under the migration the
-  // committed effect's FIGURES still equal the quote's figures, but
-  // its provenance is — correctly — a different, provider-actual
-  // provenance: the committed effect is established from the
-  // mutating call's response actuals plus the independent post-commit
-  // re-read, so whole-object equality with the quote-side effect
-  // (whose provenance names the estimate) cannot hold for any
-  // correctly implemented commit.
-  assert.deepEqual(receipt.committedEffect.immediate, receipt.quotedEffect.immediate);
-  assert.deepEqual(receipt.committedEffect.recurring, receipt.quotedEffect.recurring);
-  assert.deepEqual(receipt.committedEffect.determinacy, { immediateFinancialEffect: "DETERMINED", recurringFinancialEffect: "DETERMINED" });
-  assert.deepEqual(receipt.quotedEffect.determinacy, receipt.committedEffect.determinacy);
-  assert.equal(receipt.committedEffect.provenance?.committedSource, "provider_actual");
-  assert.deepEqual(receipt.reconciliation, { status: "OK" });
-  assert.equal(fake.mutationCount, 1);
-  const updateReq = fake.requests.find((r) => r.path.endsWith("/update_for_items"));
-  assert.ok(updateReq);
-  const body = new URLSearchParams(updateReq!.body);
-  assert.equal(body.get("replace_items_list"), "true", "full-list replacement must be explicit — Chargebee's default is additive");
-  assert.equal(body.get("invoice_immediately"), "false", "no default invoice collection");
-  assert.ok(updateReq!.idempotencyKey?.startsWith("scq-"), "mutating call carries the quote-derived native idempotency key");
+  await expectPreservationRefusal(adapter, quote.id);
+  assert.equal(fake.mutationCount, 0, "no mutation was dispatched");
+  assert.equal(fake.requests.find((r) => r.path.endsWith("/update_for_items")), undefined, "no mutating request was constructed or sent");
+  assert.equal(fake.sub.subscription_items[0].quantity, 100, "provider state is untouched");
 });
 
 test("T04 (SIMULATED_PASS): subscription changes after quote — stale-state detection via resource_version, no mutation", async () => {
@@ -1105,13 +1128,18 @@ test("T05 (SIMULATED_PASS): financial estimate changes before commit (outside th
 });
 
 test("T06 (SIMULATED_PASS): commit repeated with same quote ID — no duplicate mutation, same historical receipt", async () => {
+  // PR-14 MIGRATION: a refused commit has no receipt to replay; the
+  // idempotency property is preserved in refusal form — the second
+  // commit returns the identical refusal deterministically and no
+  // mutation ever occurs. (§6.10 original-receipt replay for
+  // successful commits remains implemented and covered by the
+  // simulator and store suites.)
   const fake = new FakeChargebee();
   const adapter = makeAdapter(fake);
   const quote = await adapter.createChangeQuote("cb_live_test_1", qtyProposal());
-  const r1 = await adapter.commitChangeQuote(quote.id);
-  const r2 = await adapter.commitChangeQuote(quote.id);
-  assert.deepEqual(r2, r1);
-  assert.equal(fake.mutationCount, 1);
+  await expectPreservationRefusal(adapter, quote.id);
+  await expectPreservationRefusal(adapter, quote.id);
+  assert.equal(fake.mutationCount, 0, "no mutation on either attempt");
 });
 
 test("T07 (SIMULATED_PASS): provider processes commit, response is lost — INDETERMINATE: matching state does not establish that THIS request landed (PR-7 review L1)", async () => {
@@ -1143,34 +1171,44 @@ test("T07 (SIMULATED_PASS): provider processes commit, response is lost — INDE
   const client = new ChargebeeClient({ site: "scq-test", apiKey: "test_key_redacted" }, lossy);
   const adapter = new ChargebeeLiveAdapter(client, store, { liveCommitEnabled: true });
   const quote = await adapter.createChangeQuote("cb_live_test_1", qtyProposal());
-  await assert.rejects(
-    () => adapter.commitChangeQuote(quote.id),
-    (e: unknown) => e instanceof SCQError && (e.details as any)?.outcome === "INDETERMINATE" && (e.details as any)?.indeterminate === true,
-  );
-  assert.equal(fake.mutationCount, 1, "exactly one provider mutation despite the lost response — never a blind second mutation");
-  assert.equal(fake.sub.subscription_items[0].quantity, 120, "the mutation DID land at the provider — and the classification is still INDETERMINATE, because the adapter cannot prove it was this request");
-  assert.equal(store.get(quote.id)?.commit_outcome?.outcome, "INDETERMINATE");
-  assert.equal(store.get(quote.id)?.commit_receipt, undefined, "no committed receipt is recorded for an unattributable landing");
-  await assert.rejects(
-    () => adapter.commitChangeQuote(quote.id),
-    (e: unknown) => e instanceof SCQError && (e.details as any)?.outcome === "INDETERMINATE",
-  );
-  assert.equal(fake.mutationCount, 1, "a repeated attempt still performs no second mutation — the recorded outcome refuses it pre-dispatch");
+  // PR-14 MIGRATION: the lossy dispatch never happens — the commit
+  // refuses pre-dispatch, so the L1 scenario (landed but
+  // unattributable) cannot be produced through this adapter. The
+  // protections this test carried are preserved in stronger form:
+  // zero mutations (not exactly one), provider state untouched, no
+  // receipt, and the retry refuses identically with the
+  // preservation code — NOT via the INDETERMINATE guard, because
+  // the recorded outcome is CONFIRMED_NON_EXECUTION. L1 remains
+  // implemented for dispatched paths and covered at the
+  // store/ledger level (test27, rehearsal rh-04/05, test47.10).
+  await expectPreservationRefusal(adapter, quote.id);
+  assert.equal(fake.mutationCount, 0, "no provider mutation — the response-loss scenario cannot arise");
+  assert.equal(fake.sub.subscription_items[0].quantity, 100, "provider state is untouched");
+  assert.equal(store.get(quote.id)?.commit_outcome?.outcome, "CONFIRMED_NON_EXECUTION");
+  assert.equal(store.get(quote.id)?.commit_receipt, undefined, "no committed receipt is recorded");
+  await expectPreservationRefusal(adapter, quote.id);
+  assert.equal(fake.mutationCount, 0, "a repeated attempt still performs no mutation — the refusal is deterministic");
 });
 
 test("T08+T09 (SIMULATED_PASS): concurrent change between final preview and commit — TOCTOU lands, reconciliation reports VIOLATED, no rollback is claimed", async () => {
+  // PR-14 MIGRATION: this scenario armed a concurrent reprice
+  // inside the validate->dispatch window — the same window class
+  // as Issue #22 Finding 1 — and asserted the commit landed with a
+  // VIOLATED reconciliation. Post-PR-14 the commit refuses
+  // pre-dispatch, so the TOCTOU cannot land at all: the concurrent
+  // hook is never even invoked (it fired on the update call), no
+  // mutation occurs, and no receipt exists to carry a violation.
+  // Prevention replaces post-hoc violation reporting for this
+  // adapter; the BEST_EFFORT / no-CAS fact that motivated both is
+  // unchanged and is now the gate's stated basis.
   const fake = new FakeChargebee();
   const adapter = makeAdapter(fake);
   const quote = await adapter.createChangeQuote("cb_live_test_1", qtyProposal());
-  // Concurrent actor reprices the item inside the window between the
-  // adapter's last pre-mutation preview and the mutating call itself.
   fake.beforeUpdate = () => { ITEM_PRICES["seat-basic-monthly"].price = 2000; fake.sub.subscription_items[0].unit_price = 2000; };
   try {
-    const receipt = await adapter.commitChangeQuote(quote.id);
-    assert.equal(receipt.status, "COMMITTED", "the mutation DID occur — the receipt must not pretend otherwise");
-    assert.equal(receipt.resultingSnapshot.items[0].quantity, 120);
-    assert.equal(receipt.reconciliation.status, "VIOLATED", "committed effect (at the repriced rate) exceeds the zero-tolerance envelope and must be reported");
-    assert.equal(receipt.consistencyGuarantee, "BEST_EFFORT", "never ATOMIC: no server-enforced CAS exists");
+    await expectPreservationRefusal(adapter, quote.id);
+    assert.equal(fake.mutationCount, 0, "the TOCTOU window is never entered — no dispatch occurs inside it");
+    assert.equal(fake.sub.subscription_items[0].quantity, 100, "provider state is untouched");
   } finally { ITEM_PRICES["seat-basic-monthly"].price = 1000; }
 });
 
@@ -1218,16 +1256,22 @@ test("T12 (SIMULATED_PASS): provider/API failure is classified accurately — 50
 });
 
 test("T13 (SIMULATED_PASS for the limitation): application restarts after commit — in-memory store cannot prove exactly-once; adapter fails closed", async () => {
+  // PR-14 MIGRATION: the pre-restart commit now refuses at the
+  // preservation gate (no mutation occurs), and the restart half
+  // of the scenario is unchanged: a fresh empty store cannot find
+  // the quote and refuses QUOTE_STALE rather than re-mutating. The
+  // limitation this test documents — an in-memory store cannot
+  // prove exactly-once across restarts — stands verbatim.
   const fake = new FakeChargebee();
   const store1 = new QuoteStore();
   const adapter1 = makeAdapter(fake, { store: store1 });
   const quote = await adapter1.createChangeQuote("cb_live_test_1", qtyProposal());
-  await adapter1.commitChangeQuote(quote.id);
-  assert.equal(fake.mutationCount, 1);
+  await expectPreservationRefusal(adapter1, quote.id);
+  assert.equal(fake.mutationCount, 0);
   // "Restart": a new adapter with a fresh, empty QuoteStore.
   const adapter2 = makeAdapter(fake, { store: new QuoteStore() });
   await assert.rejects(() => adapter2.commitChangeQuote(quote.id), (e: unknown) => e instanceof SCQError && e.code === "QUOTE_STALE");
-  assert.equal(fake.mutationCount, 1, "fail-closed: no blind re-mutation after restart — but note this is refusal, NOT exactly-once proof; a conforming live deployment requires a durable quote/receipt store (see LIMITATIONS-AND-GAPS.md)");
+  assert.equal(fake.mutationCount, 0, "fail-closed: no blind re-mutation after restart — but note this is refusal, NOT exactly-once proof; a conforming live deployment requires a durable quote/receipt store (see LIMITATIONS-AND-GAPS.md)");
 });
 
 test("T14 (SIMULATED_PASS for reporting; live scheduling behavior BLOCKED): scheduled-change / Ramps compatibility reported honestly", async () => {

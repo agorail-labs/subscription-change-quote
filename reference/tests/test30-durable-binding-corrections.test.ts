@@ -85,10 +85,19 @@ test("Test 30.1 (D5): an adapter whose coordinator is bound to a different durab
     durableCoordinator: new DurableMutationCoordinator(storeB),
     providerSite: "pilot-test",
   });
+  // PR-14 MIGRATION (refusal precedence): the preservation gate
+  // sits ahead of the write-ahead gate, so the misbound adapter's
+  // commit refuses with the preservation code before the binding
+  // check is reached. D5's safety properties are preserved
+  // verbatim (refusal before any mutation; zero orphan attempts in
+  // either database — asserted below), and the binding checks
+  // remain implemented in beginDispatch/beginDurableAttempt and
+  // exercised directly at the store/coordinator level by
+  // 30.3/30.4/30.5.
   await assert.rejects(
     () => misbound.commitChangeQuote(quote.id),
-    isMismatchRefusal,
-    "a coordinator bound to a different durable store must be refused as a binding mismatch, before dispatch",
+    (e: unknown) => e instanceof SCQError && e.code === "AUTHORIZATION_PRESERVATION_UNENFORCEABLE",
+    "the earlier preservation gate refuses the commit (precedence over the binding check behind it)",
   );
   assert.equal(mock.mutationCount, 0, "no mutating call may occur under a split-ledger configuration");
   assert.equal(storeB.attemptsForQuote(quote.id).length, 0, "Store B must contain zero orphan attempts for a quote it does not hold");
@@ -121,10 +130,14 @@ test("Test 30.2 (D5): a coordinator bound to a plain in-memory QuoteStore, suppl
     durableCoordinator: inMemoryCoordinator,
     providerSite: "pilot-test",
   });
+  // PR-14 MIGRATION (refusal precedence): as 30.1 — the
+  // preservation gate refuses before the binding check is reached;
+  // the zero-mutation / zero-attempt properties below are D5's and
+  // are preserved verbatim.
   await assert.rejects(
     () => misbound.commitChangeQuote(quote.id),
-    isMismatchRefusal,
-    "a coordinator whose store is not the adapter's DurableQuoteStore must be refused as a binding mismatch",
+    (e: unknown) => e instanceof SCQError && e.code === "AUTHORIZATION_PRESERVATION_UNENFORCEABLE",
+    "the earlier preservation gate refuses the commit (precedence over the binding check behind it)",
   );
   assert.equal(mock.mutationCount, 0, "no mutating call may occur with a non-durable coordinator store");
   assert.equal(storeA.attemptsForQuote(quote.id).length, 0);
@@ -182,6 +195,16 @@ test("Test 30.5 (D5): beginDispatch whose provider does not match the durably st
 // --- D5 positive control: the correctly bound configuration still commits ---
 
 test("Test 30.6 (D5 control): a coordinator bound to the SAME DurableQuoteStore object as the adapter commits end-to-end under the write-ahead ledger", async () => {
+  // PR-14 MIGRATION: the positive control's premise — a correctly
+  // bound adapter committing end-to-end — is superseded for
+  // OPERATION-authorized update commits: correct binding no longer
+  // leads to a dispatch, because the preservation gate refuses
+  // first. The control now proves the complementary fact: the
+  // refusal is NOT a binding artifact — the correctly bound
+  // configuration refuses identically, with zero attempts in the
+  // shared database. End-to-end ledger behavior under correct
+  // binding remains covered at the coordinator level (test27,
+  // rh-04/05/10/11).
   const path = tmpDb();
   const mock = new PilotMockChargebee();
   const store = openStore(path);
@@ -192,11 +215,12 @@ test("Test 30.6 (D5 control): a coordinator bound to the SAME DurableQuoteStore 
     providerSite: "pilot-test",
   });
   const quote = await adapter.createChangeQuote(SUB, PROPOSAL(21));
-  const receipt = await adapter.commitChangeQuote(quote.id);
-  assert.equal(receipt.outcome, "COMMITTED_AND_VERIFIED");
-  assert.equal(mock.mutationCount, 1);
-  const attempts = store.attemptsForQuote(quote.id);
-  assert.equal(attempts.length, 1, "intent and receipt live in the same database");
-  assert.equal(attempts[0].state, "COMMITTED_AND_VERIFIED");
+  await assert.rejects(
+    () => adapter.commitChangeQuote(quote.id),
+    (e: unknown) => e instanceof SCQError && e.code === "AUTHORIZATION_PRESERVATION_UNENFORCEABLE",
+    "even the correctly bound configuration refuses at the preservation gate",
+  );
+  assert.equal(mock.mutationCount, 0);
+  assert.equal(store.attemptsForQuote(quote.id).length, 0, "no attempt was created in the shared database");
   store.close();
 });
