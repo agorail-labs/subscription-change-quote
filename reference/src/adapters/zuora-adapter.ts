@@ -31,6 +31,8 @@ import {
   reconcileCommittedEffect,
   determinacyOf,
   validateCommit,
+  validateProposalRuntime,
+  validateStoredQuoteRuntime,
 } from "../core/scq-engine.js";
 import { QuoteStore, type StoredQuote } from "../store/quote-store.js";
 import { ZuoraSim, ZuoraSimError, type OrderAction, type ZuoraOrder, type ZuoraSubscription } from "./zuora-sim.js";
@@ -692,6 +694,11 @@ export class ZuoraAdapter implements SubscriptionProvider {
     subscriptionId: string,
     proposal: SubscriptionChangeProposal
   ): Promise<SubscriptionChangeQuote> {
+    // PR-15 (Finding 2): the shared runtime validator runs FIRST —
+    // before any provider read, preview, or mutation — so malformed
+    // caller input refuses identically on every adapter. This
+    // adapter's provider-specific checks below run after it.
+    validateProposalRuntime(proposal);
     let sub: ZuoraSubscription;
     try {
       sub = this.sim.get(subscriptionId);
@@ -849,6 +856,14 @@ export class ZuoraAdapter implements SubscriptionProvider {
       throw toSCQError(e, quote.subscription_id);
     }
     const validated = validateCommit(this.store, quoteId, String(currentSub.version));
+
+    // PR-15 (Finding 2): the STORED record is validated before it
+    // feeds any gate below — the same shared rules as quote
+    // creation, applied to the persisted proposal and the stored
+    // effective guarantee mode. Placement: after §6.10 replay, the
+    // recorded-INDETERMINATE guard, and validateCommit (their
+    // precedence is preserved), before any re-preview or mutation.
+    validateStoredQuoteRuntime(validated);
 
     const input = validated.provider_preview_input as ZuoraPreviewInput;
     const proposal = validated.proposal;

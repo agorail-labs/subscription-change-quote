@@ -293,6 +293,8 @@ import {
   reconcileCommittedEffect,
   resolveGuaranteeMode,
   validateCommit,
+  validateProposalRuntime,
+  validateStoredQuoteRuntime,
   checkAcceptanceEnvelope,
 } from "../core/scq-engine.js";
 import { verifyPostCommitState } from "../core/state-verification.js";
@@ -353,35 +355,21 @@ function scopeValueForMessage(raw: unknown): string {
 }
 
 /**
- * PR-14 REVIEW CORRECTION (Finding 2): runtime validation of a
- * proposal's authorization-scope declaration at quote creation.
- * TypeScript types do not exist at runtime: as first delivered,
- * only the exact string "TARGET_REPLACEMENT" was refused, and any
- * other unknown value ("UNRESTRICTED", a wrong-case string, a
- * number, an object) was accepted and recorded verbatim. The
- * rules now, exhaustively:
- *   - absent (undefined/null)  => OPERATION (the default);
- *   - "OPERATION"              => accepted;
- *   - "TARGET_REPLACEMENT"     => refused as UNSUPPORTED_CHANGE
- *     (pre-existing behavior: the declaration is unsupported in
- *     this version — never honored, never silently downgraded);
- *   - ANY other value          => refused as INVALID_PROPOSAL,
- *     the codebase's invalid-caller-input refusal at quote
- *     creation (the same code this adapter throws for a malformed
- *     proposal). No quote is stored and no provider call is made.
- * The commit path applies the same recognition rules to the
- * STORED record before any gate logic (see the gate below).
+ * PR-14 REVIEW CORRECTION (Finding 2) — SUPERSEDED AS THE
+ * CREATION-TIME MECHANISM BY PR-15: the exhaustive runtime
+ * validation of a proposal's authorization-scope declaration
+ * (absent/null => OPERATION; "OPERATION" accepted;
+ * "TARGET_REPLACEMENT" refused as UNSUPPORTED_CHANGE; any other
+ * value INVALID_PROPOSAL) now lives in the SHARED validator,
+ * core/scq-engine.ts's validateProposalRuntime, which
+ * createChangeQuote invokes at its entry — one authoritative
+ * implementation for all five adapters instead of a local copy
+ * here. The rules and refusal codes are unchanged. The COMMIT
+ * path's stored-record scope validation remains in the PR-14
+ * gate block below (it validates both stored declaration sites
+ * with outcome recording — a superset the shared commit-time
+ * validation defers to; see validateStoredQuoteRuntime).
  */
-function validateScopeDeclarationAtCreation(raw: unknown): AuthorizationScope {
-  if (raw === undefined || raw === null) return "OPERATION";
-  if (raw === "TARGET_REPLACEMENT") {
-    throw new SCQError("UNSUPPORTED_CHANGE", "TARGET_REPLACEMENT authorization is not supported: no adapter in this build gives wholesale target-state replacement reviewed authorization semantics, and the declaration is never silently downgraded to OPERATION. Refused before any provider call.", { authorizationScope: raw });
-  }
-  if (raw !== "OPERATION") {
-    throw new SCQError("INVALID_PROPOSAL", `authorizationScope ${scopeValueForMessage(raw)} is not a recognized authorization scope. A proposal may declare OPERATION (or omit the field, which defaults to OPERATION); TARGET_REPLACEMENT is refused as unsupported, and any other value is invalid input. Refused before any provider call; no quote is stored.`, { authorizationScope: raw });
-  }
-  return "OPERATION";
-}
 
 /**
  * PR-7 review correction L3: the ONLY Chargebee api_error_codes for
@@ -1055,6 +1043,13 @@ export class ChargebeeLiveAdapter implements SubscriptionProvider {
   }
 
   async createChangeQuote(subscriptionId: string, proposal: SubscriptionChangeProposal): Promise<SubscriptionChangeQuote> {
+    // PR-15 (Finding 2): the shared runtime validator runs FIRST —
+    // before any provider read, estimate, or local shape check —
+    // so malformed caller input (structure, guarantee mode,
+    // envelope, scope declaration) refuses identically on every
+    // adapter. This adapter's provider-specific checks below run
+    // after it, unchanged.
+    validateProposalRuntime(proposal);
     if (proposal.changes.length === 0) throw new SCQError("INVALID_PROPOSAL", "proposal.changes must contain at least one change");
     if (proposal.changes.length > 1) {
       throw new SCQError("UNSUPPORTED_CHANGE", "The experimental live Chargebee adapter validates single-change proposals only; multi-change live behavior is UNVERIFIED and is refused before any provider call.", { changes: proposal.changes.map((c) => c.action).join("+") });
@@ -1066,15 +1061,17 @@ export class ChargebeeLiveAdapter implements SubscriptionProvider {
     // PR-14: TARGET_REPLACEMENT authorization is not honored by any
     // adapter in this PR — its consent, migration, and receipt
     // semantics are unreviewed. A proposal declaring it is refused
-    // here, before any provider call: never honored, never silently
+    // before any provider call: never honored, never silently
     // downgraded to OPERATION. OPERATION (declared or defaulted) is
     // the only scope a quote can be created under.
-    // PR-14 REVIEW CORRECTION (Finding 2): the declaration is
-    // validated at RUNTIME, exhaustively — an unknown value
-    // ("UNRESTRICTED", wrong case, non-string) is invalid input
-    // (INVALID_PROPOSAL), not a scope this adapter happens not to
-    // check for. Only the validated result is recorded below.
-    const authorizationScope = validateScopeDeclarationAtCreation(proposal.authorizationScope);
+    // PR-15: that refusal — and the exhaustive runtime validation
+    // of the declaration (PR-14 review correction, Finding 2) —
+    // now comes from the shared validator at this method's entry
+    // (validateProposalRuntime), the single source for all five
+    // adapters. Validation has established the declaration is
+    // absent/null or OPERATION, so the effective scope derives
+    // directly here; only the validated result is recorded below.
+    const authorizationScope: AuthorizationScope = proposal.authorizationScope ?? "OPERATION";
     // Refuse unsupported effective intents BEFORE any provider call at all
     // (stronger than the spec's "before preview/mutation" floor).
     enforceEffectiveIntent(proposal.effectiveIntent, ["IMMEDIATE"]);
@@ -1248,6 +1245,20 @@ export class ChargebeeLiveAdapter implements SubscriptionProvider {
     const input = stored0.provider_preview_input as LivePreviewInput;
     const current = await this.readSubscription(stored0.subscription_id);
     const validated = validateCommit(this.store, quoteId, chargebeeSubscriptionFingerprint(current), this.now);
+    // PR-15 (Finding 2): the STORED record is validated before it
+    // feeds any gate below — the same shared rules as quote
+    // creation, applied to the persisted proposal and the stored
+    // effective guarantee mode. Placement preserves the existing
+    // precedence: §6.10 replay and the recorded-INDETERMINATE
+    // guard above, expiry/fingerprint in validateCommit, then this
+    // validation, then the revalidation envelope gate, the
+    // live-commit-enabled check, the PR-14 preservation gate, and
+    // only then the durable write-ahead gate. The authorization
+    // scope is DEFERRED to the PR-14 gate block below, which
+    // validates both stored declaration sites with
+    // CONFIRMED_NON_EXECUTION outcome recording (a superset of
+    // the shared single-site check; test47.17/47.18 pin it).
+    validateStoredQuoteRuntime(validated, { deferAuthorizationScopeToAdapterGate: true });
     const proposal = validated.proposal;
     const preDispatchFingerprint = chargebeeSubscriptionFingerprint(current);
 

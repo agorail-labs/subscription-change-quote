@@ -133,6 +133,359 @@ export function validateCommit(
 }
 
 /**
+ * PR-15 (Issue #22, Finding 2): RUNTIME proposal validation — the
+ * shared, provider-neutral validator every adapter applies.
+ *
+ * TypeScript unions do not validate runtime input: a proposal can
+ * arrive as parsed JSON, a deserialized persisted record, or an
+ * unsafe cast, carrying values the types claim impossible. Before
+ * this PR the runtime trusted the types, and the failures were
+ * silent-pass shaped (PR #23, repro44):
+ *  - a misspelled guaranteeMode ("REVALDIATE") was returned
+ *    verbatim by resolveGuaranteeMode and satisfied NEITHER branch
+ *    of enforceGuaranteeRequest — EXACT's coverage check and
+ *    REVALIDATE's envelope requirement were both skipped, and the
+ *    commit paths' mode branches fell through the same way;
+ *  - malformed envelope bounds (NaN, negative, string-typed) were
+ *    compared numerically: every comparison against NaN is false,
+ *    so a drifted revalidation silently PASSED its envelope;
+ *  - an authorizationScope declaration was validated only inside
+ *    the Chargebee-live adapter (PR #24); the simulator adapters
+ *    never read the field, so an unimplemented broader
+ *    authorization was silently accepted there.
+ *
+ * `validateProposalRuntime` is the ONE authoritative validator.
+ * Every adapter calls it at the entry of createChangeQuote —
+ * before any provider read, preview, estimate, or mutation — and
+ * `validateStoredQuoteRuntime` applies the same rules to the
+ * STORED record at commit time (see its comment). Adapters keep
+ * their provider-specific capability checks AFTER this shared
+ * validation; the rules are not duplicated per adapter.
+ *
+ * Refusal codes follow the codebase's established taxonomy:
+ * malformed caller input is INVALID_PROPOSAL; a RECOGNIZED but
+ * unimplemented declaration (TARGET_REPLACEMENT authorization) is
+ * UNSUPPORTED_CHANGE — the same code PR #24's live-adapter refusal
+ * used — never a silent downgrade and never execution.
+ *
+ * Deliberate non-restrictions (recorded in
+ * research/pr-15-runtime-proposal-validation.md): envelope bounds
+ * must be finite and nonnegative but are NOT required to be
+ * integers or safe integers (whether minor-unit bounds should be
+ * integral is a normative question for the v0.6.2 candidate, not a
+ * restriction this PR imposes); a CHANGE_QUANTITY quantity must be
+ * a finite, nonnegative number — zero is left to provider
+ * semantics, while a negative or non-finite "quantity" denotes no
+ * quantity at all; unknown fields are rejected only inside the
+ * acceptance envelope, whose field set the protocol closes.
+ */
+
+const CHANGE_ACTION_VALUES: ReadonlySet<string> = new Set(["CHANGE_QUANTITY", "CHANGE_PLAN", "CHANGE_CADENCE", "CANCEL"]);
+const EFFECTIVE_INTENT_TYPE_VALUES: ReadonlySet<string> = new Set(["IMMEDIATE", "TERM_END", "DATE"]);
+const CADENCE_VALUES: ReadonlySet<string> = new Set(["MONTHLY", "ANNUAL"]);
+const ENVELOPE_FIELD_NAMES = ["maxImmediateNetIncrease", "maxImmediateCreditDecrease", "maxRecurringIncrease"] as const;
+
+/** Renders an arbitrary runtime value for an error message, safely (never throws). */
+function runtimeValueForMessage(raw: unknown): string {
+  if (typeof raw === "string") return JSON.stringify(raw);
+  try {
+    return JSON.stringify(raw) ?? String(raw);
+  } catch {
+    return String(raw);
+  }
+}
+
+/**
+ * The shape problem with a supplied acceptance envelope, or null
+ * if the envelope is shape-valid. An ABSENT envelope (undefined)
+ * is shape-valid: whether an envelope must be PRESENT is a
+ * separate rule (the REVALIDATE presence rule), judged by the
+ * caller with the proposal's mode and actions in hand. A supplied
+ * envelope must be a plain object carrying ONLY the supported
+ * tolerance fields, and every supplied bound must be a finite,
+ * nonnegative number: NaN would silently disable the comparison
+ * it bounds (every comparison against NaN is false), a string
+ * bound coerces unpredictably, a negative "tolerance" inverts the
+ * check's meaning, and an unknown field may be a misspelled bound
+ * whose intended tolerance would otherwise be silently dropped.
+ * Malformed bounds are NEVER coerced to zero.
+ */
+export function envelopeShapeProblem(envelope: unknown): string | null {
+  if (envelope === undefined) return null;
+  if (typeof envelope !== "object" || envelope === null || Array.isArray(envelope)) {
+    return `the acceptance envelope must be an object carrying tolerance bounds; got ${runtimeValueForMessage(envelope)}`;
+  }
+  const record = envelope as Record<string, unknown>;
+  for (const key of Object.keys(record)) {
+    if (!(ENVELOPE_FIELD_NAMES as readonly string[]).includes(key)) {
+      return `the acceptance envelope carries unsupported field "${key}" (supported fields: ${ENVELOPE_FIELD_NAMES.join(", ")}) — an unknown field is never silently ignored, because it may be a misspelled bound whose tolerance would otherwise be dropped`;
+    }
+  }
+  for (const field of ENVELOPE_FIELD_NAMES) {
+    const value = ownEnvelopeBound(record, field);
+    if (value === undefined) continue;
+    if (typeof value !== "number" || !Number.isFinite(value) || value < 0) {
+      return `acceptance envelope bound ${field} must be a finite, nonnegative number (minor units); got ${runtimeValueForMessage(value)} — a malformed bound is never coerced to zero`;
+    }
+  }
+  return null;
+}
+
+/**
+ * PR-15 correction (P15-2): reads a bound through the envelope's
+ * OWN properties only. The unknown-field check above iterates
+ * Object.keys (own names), but a plain `record[field]` read walks
+ * the prototype chain — an INHERITED bound (e.g. an envelope built
+ * on a prototype carrying maxRecurringIncrease) would be validated
+ * and compared as if the caller had stated it, silently enlarging
+ * the permitted drift. An inherited property is not part of the
+ * envelope the caller supplied: it states no bound, validates
+ * nothing, and tolerates nothing. Every envelope read in this
+ * module goes through this helper or through the sanitized
+ * projection below.
+ */
+function ownEnvelopeBound(record: Record<string, unknown>, field: (typeof ENVELOPE_FIELD_NAMES)[number]): unknown {
+  return Object.prototype.hasOwnProperty.call(record, field) ? record[field] : undefined;
+}
+
+/**
+ * PR-15 correction (P15-2): the SANITIZED envelope — a fresh
+ * object carrying ONLY the envelope's own, supported bounds. For a
+ * shape-valid envelope every own bound is already known valid
+ * (assertEnvelopeShapeValid / envelopeShapeProblem ran first), so
+ * the copy preserves semantics exactly while severing the
+ * prototype chain: downstream comparisons consume this form and
+ * can never observe an inherited property. Applied at the single
+ * shared comparison entry (compareDeterminedDimensions), so the
+ * quote-time gate, post-commit reconciliation, and the fireable
+ * projection path all compare the same sanitized form.
+ *
+ * FINAL correction (P15-2 completion): the copy is a
+ * NULL-PROTOTYPE object (Object.create(null)), not an ordinary
+ * `{}`. An ordinary object inherits from Object.prototype, so if
+ * that prototype is polluted (Object.prototype.maxRecurring-
+ * Increase set), an ABSENT bound on the sanitized copy would
+ * still read as the polluted value at any ordinary property read.
+ * The null prototype removes the last chain: an absent bound is
+ * absent, full stop. Defense in depth: compareDeterminedDimensions
+ * additionally reads bounds own-properties-only (ownEnvelopeBound)
+ * rather than trusting construction alone.
+ */
+function sanitizedEnvelope(envelope: AcceptanceEnvelope): AcceptanceEnvelope {
+  const record = envelope as Record<string, unknown>;
+  const out = Object.create(null) as AcceptanceEnvelope;
+  for (const field of ENVELOPE_FIELD_NAMES) {
+    const value = ownEnvelopeBound(record, field);
+    if (value !== undefined) out[field] = value as number;
+  }
+  return out;
+}
+
+/** Throws INVALID_PROPOSAL naming the shape problem, if any. An absent envelope is not a shape problem. */
+function assertEnvelopeShapeValid(envelope: unknown): asserts envelope is AcceptanceEnvelope | undefined {
+  const problem = envelopeShapeProblem(envelope);
+  if (problem) {
+    throw new SCQError("INVALID_PROPOSAL", `Invalid acceptance envelope: ${problem}.`, { envelopeProblem: problem });
+  }
+}
+
+function validateProposalRuntimeInternal(
+  proposal: unknown,
+  validateAuthorizationScope: boolean
+): asserts proposal is SubscriptionChangeProposal {
+  const invalid = (why: string, details?: unknown): never => {
+    throw new SCQError("INVALID_PROPOSAL", `Invalid proposal: ${why}.`, details);
+  };
+
+  if (typeof proposal !== "object" || proposal === null || Array.isArray(proposal)) {
+    invalid(`a proposal must be an object with changes and effectiveIntent; got ${runtimeValueForMessage(proposal)}`);
+  }
+  const p = proposal as Record<string, unknown>;
+
+  // --- changes[]: a non-empty array of well-formed change specs.
+  if (!Array.isArray(p.changes) || p.changes.length === 0) {
+    invalid("proposal.changes must be a non-empty array of change specs");
+  }
+  const changes = p.changes as unknown[];
+  for (let i = 0; i < changes.length; i++) {
+    const rawChange = changes[i];
+    if (typeof rawChange !== "object" || rawChange === null || Array.isArray(rawChange)) {
+      invalid(`changes[${i}] must be a change-spec object`);
+    }
+    const change = rawChange as Record<string, unknown>;
+    if (typeof change.action !== "string" || !CHANGE_ACTION_VALUES.has(change.action)) {
+      invalid(`changes[${i}].action ${runtimeValueForMessage(change.action)} is not a supported change action (${[...CHANGE_ACTION_VALUES].join(", ")}) — a valid-but-provider-unsupported action is the provider's UNSUPPORTED_CHANGE decision, but an unknown action value is malformed input`, { action: change.action ?? null });
+    }
+    switch (change.action) {
+      case "CHANGE_QUANTITY": {
+        if (typeof change.itemId !== "string" || change.itemId.length === 0) {
+          invalid(`changes[${i}] (CHANGE_QUANTITY) requires a non-empty string itemId`);
+        }
+        if (typeof change.quantity !== "number" || !Number.isFinite(change.quantity) || change.quantity < 0) {
+          invalid(`changes[${i}] (CHANGE_QUANTITY) requires quantity to be a finite, nonnegative number; got ${runtimeValueForMessage(change.quantity)}`, { quantity: change.quantity ?? null });
+        }
+        break;
+      }
+      case "CHANGE_PLAN": {
+        if (typeof change.itemId !== "string" || change.itemId.length === 0) {
+          invalid(`changes[${i}] (CHANGE_PLAN) requires a non-empty string itemId`);
+        }
+        if (typeof change.offeringRef !== "string" || change.offeringRef.length === 0) {
+          invalid(`changes[${i}] (CHANGE_PLAN) requires a non-empty string offeringRef`);
+        }
+        break;
+      }
+      case "CHANGE_CADENCE": {
+        if (typeof change.cadence !== "string" || !CADENCE_VALUES.has(change.cadence)) {
+          invalid(`changes[${i}] (CHANGE_CADENCE) requires cadence to be one of ${[...CADENCE_VALUES].join(", ")}; got ${runtimeValueForMessage(change.cadence)}`, { cadence: change.cadence ?? null });
+        }
+        break;
+      }
+      case "CANCEL":
+        break; // The established CANCEL form carries no required fields.
+    }
+  }
+
+  // --- effectiveIntent: a supported shape; DATE carries a valid
+  // timestamp representation. (Whether a provider can HONOR the
+  // intent stays the provider's UNSUPPORTED_CHANGE decision.)
+  const intent = p.effectiveIntent;
+  if (typeof intent !== "object" || intent === null || Array.isArray(intent)) {
+    invalid("proposal.effectiveIntent is required and must be an object");
+  }
+  const intentType = (intent as Record<string, unknown>).type;
+  if (typeof intentType !== "string" || !EFFECTIVE_INTENT_TYPE_VALUES.has(intentType)) {
+    invalid(`proposal.effectiveIntent.type ${runtimeValueForMessage(intentType)} is not a supported effective intent (${[...EFFECTIVE_INTENT_TYPE_VALUES].join(", ")})`, { effectiveIntentType: intentType ?? null });
+  }
+  if (intentType === "DATE") {
+    const at = (intent as Record<string, unknown>).at;
+    if (typeof at !== "string" || at.length === 0 || Number.isNaN(Date.parse(at))) {
+      invalid(`proposal.effectiveIntent { type: "DATE" } requires "at" to be a valid timestamp string; got ${runtimeValueForMessage(at)}`, { at: at ?? null });
+    }
+  }
+
+  // --- guaranteeMode: omitted defaults to REVALIDATE; the two
+  // literals are the only recognized values. An explicit null is
+  // NOT an omission — it is an invalid value (the pre-PR-15 `??`
+  // defaulting silently read it as one).
+  const mode = p.guaranteeMode;
+  if (mode !== undefined && mode !== "EXACT" && mode !== "REVALIDATE") {
+    invalid(`guaranteeMode ${runtimeValueForMessage(mode)} is not a recognized guarantee mode — the only values are "EXACT" and "REVALIDATE" (omit the field for the REVALIDATE default); a malformed mode must never fall through both modes' enforcement`, { guaranteeMode: mode ?? null });
+  }
+  const effectiveMode = mode === undefined ? "REVALIDATE" : (mode as GuaranteeMode);
+
+  // --- acceptanceEnvelope: SHAPE only. The established PRESENCE
+  // rule (REVALIDATE requires an envelope unless every change is
+  // CANCEL) deliberately stays in enforceGuaranteeRequest, which
+  // every adapter calls during createChangeQuote AFTER its
+  // effectiveIntent support checks: a proposal that is both
+  // envelope-less AND intent-unsupported refuses
+  // UNSUPPORTED_CHANGE for the intent (test25.19 pins that
+  // precedence), and duplicating the presence rule here — ahead
+  // of every adapter check — would invert it. Presence is still
+  // enforced at quote creation with the same INVALID_PROPOSAL
+  // code, and at commit the envelope gates refuse a missing
+  // envelope themselves (checkAcceptanceEnvelope requires an
+  // envelope object; a stored REVALIDATE quote's gates never see
+  // a silent absence).
+  assertEnvelopeShapeValid(p.acceptanceEnvelope);
+
+  // --- authorizationScope: absent (or null, PR #24's established
+  // reading of an undeclared scope) defaults to OPERATION;
+  // OPERATION is the only scope this release executes;
+  // TARGET_REPLACEMENT is recognized but unsupported in this
+  // release — refused as UNSUPPORTED_CHANGE wherever it is
+  // declared, never silently accepted and never downgraded; any
+  // other value or runtime type is invalid input.
+  if (validateAuthorizationScope) {
+    const scope = p.authorizationScope;
+    if (scope !== undefined && scope !== null) {
+      if (scope === "TARGET_REPLACEMENT") {
+        throw new SCQError(
+          "UNSUPPORTED_CHANGE",
+          "TARGET_REPLACEMENT authorization is not supported: no adapter in this build gives wholesale target-state replacement reviewed authorization semantics, and the declaration is never silently downgraded to OPERATION.",
+          { authorizationScope: scope }
+        );
+      }
+      if (scope !== "OPERATION") {
+        invalid(`authorizationScope ${runtimeValueForMessage(scope)} is not a recognized authorization scope — the only values are "OPERATION" (or omission, which defaults to OPERATION) and "TARGET_REPLACEMENT" (recognized but unsupported in this release)`, { authorizationScope: scope });
+      }
+    }
+  }
+}
+
+/**
+ * The ONE authoritative runtime validator for caller-controlled
+ * proposals (PR-15). Asserts the proposal is a well-formed
+ * SubscriptionChangeProposal at RUNTIME — structure, change
+ * specs, effectiveIntent shape, guaranteeMode, acceptance-envelope
+ * shape, and the authorization-scope declaration. (Envelope
+ * PRESENCE stays in enforceGuaranteeRequest by design — see the
+ * ordering note at the envelope check below.)
+ * Throws SCQError (INVALID_PROPOSAL for malformed input,
+ * UNSUPPORTED_CHANGE for a recognized-but-unimplemented
+ * TARGET_REPLACEMENT declaration) and performs no provider call,
+ * so adapters invoke it before any provider read.
+ */
+export function validateProposalRuntime(proposal: unknown): asserts proposal is SubscriptionChangeProposal {
+  validateProposalRuntimeInternal(proposal, true);
+}
+
+/**
+ * PR-15: commit-time validation of a STORED quote record. Quote-
+ * creation validation is insufficient on its own: a persisted
+ * record can be tampered with, deserialized from an older shape,
+ * or seeded outside createChangeQuote, and the commit path
+ * consumes the stored proposal's guarantee mode, envelope, scope,
+ * and effective intent as enforcement inputs. This applies the
+ * SAME shared rules to the stored proposal and additionally
+ * requires the record's stored effective guarantee mode to be a
+ * recognized mode AND consistent with the stored proposal (the
+ * value createChangeQuote resolved) — a desynchronized record is
+ * invalid input, never reinterpreted as a permissive default.
+ *
+ * ORDERING (deliberate, uniform across adapters): callers invoke
+ * this AFTER checkIdempotentReplay (a recorded receipt replays
+ * verbatim per §6.10 — validation never refuses a legitimate
+ * replay), AFTER the recorded-INDETERMINATE guard (that refusal's
+ * precedence is preserved), and AFTER validateCommit (expiry and
+ * fingerprint refusals keep their precedence) — and BEFORE any
+ * re-preview that feeds a gate, any mutating dispatch, and any
+ * durable DISPATCHING attempt. The refusal is a pre-dispatch
+ * refusal with CONFIRMED_NON_EXECUTION semantics: nothing was
+ * dispatched, so it is never INDETERMINATE.
+ *
+ * `deferAuthorizationScopeToAdapterGate`: the Chargebee-live
+ * adapter passes true — its PR #14 preservation gate validates
+ * BOTH stored scope declaration sites (the record field and the
+ * stored proposal) with outcome recording, a superset of the
+ * single-site proposal check here, and that gate's recorded
+ * refusal semantics (test47.17/47.18) must not be preempted.
+ */
+export function validateStoredQuoteRuntime(
+  quote: StoredQuote,
+  options?: { deferAuthorizationScopeToAdapterGate?: boolean }
+): void {
+  validateProposalRuntimeInternal(quote?.proposal, !(options?.deferAuthorizationScopeToAdapterGate ?? false));
+  const storedMode: unknown = (quote as { effective_guarantee_mode?: unknown })?.effective_guarantee_mode;
+  if (storedMode !== "EXACT" && storedMode !== "REVALIDATE") {
+    throw new SCQError(
+      "INVALID_PROPOSAL",
+      `Commit refused before dispatch: the stored quote's effective guarantee mode ${runtimeValueForMessage(storedMode)} is not a recognized guarantee mode ("EXACT" or "REVALIDATE"). The stored record is invalid input; it is never reinterpreted as a default that weakens enforcement. No provider mutation was performed; this refusal is a CONFIRMED_NON_EXECUTION.`,
+      { outcome: "CONFIRMED_NON_EXECUTION", effectiveGuaranteeMode: storedMode ?? null }
+    );
+  }
+  const resolved = resolveGuaranteeMode(quote.proposal);
+  if (storedMode !== resolved) {
+    throw new SCQError(
+      "INVALID_PROPOSAL",
+      `Commit refused before dispatch: the stored quote's effective guarantee mode (${storedMode}) is desynchronized from its stored proposal, which resolves to ${resolved}. A record whose enforcement inputs disagree is invalid input; neither value is trusted over the other. No provider mutation was performed; this refusal is a CONFIRMED_NON_EXECUTION.`,
+      { outcome: "CONFIRMED_NON_EXECUTION", effectiveGuaranteeMode: storedMode, resolvedGuaranteeMode: resolved }
+    );
+  }
+}
+
+/**
  * v0.6.2 BC-1 — the shared fail-closed enforcement assessment.
  *
  * One per-dimension, per-side assessment drives BOTH the pre-mutation
@@ -363,13 +716,25 @@ function compareDeterminedDimensions(
   envelope: AcceptanceEnvelope,
   comparable: ReadonlySet<FinancialDimension>
 ): string | null {
+  // PR-15 correction (P15-2): compare the SANITIZED envelope —
+  // own bounds only — so a bound inherited through the caller's
+  // prototype chain can never enlarge the permitted drift here,
+  // whatever object the caller passed in.
+  const bounds = sanitizedEnvelope(envelope);
+  // FINAL correction (P15-2 completion): bounds are READ through
+  // ownEnvelopeBound as well. The sanitized copy is null-prototype
+  // (see sanitizedEnvelope), but the reads do not rely on that
+  // construction alone: an own-property read states the rule at
+  // the point of use and stays correct for any envelope-shaped
+  // object this function may ever be handed.
+  const boundsRecord = bounds as unknown as Record<string, unknown>;
   if (comparable.has("immediateFinancialEffect")) {
     const quotedNet = quoted.immediate!.net!;
     const revalidatedNet = compared.immediate!.net!;
     const netIncrease = revalidatedNet - quotedNet;
 
     if (netIncrease > 0) {
-      const allowed = envelope.maxImmediateNetIncrease ?? 0;
+      const allowed = (ownEnvelopeBound(boundsRecord, "maxImmediateNetIncrease") as number | undefined) ?? 0;
       if (netIncrease > allowed) {
         return `immediate.net increased by ${netIncrease} (quoted ${quotedNet} -> revalidated ${revalidatedNet}), exceeding maxImmediateNetIncrease=${allowed}`;
       }
@@ -379,7 +744,7 @@ function compareDeterminedDimensions(
       // reasonably want a tighter or looser tolerance on "I got charged less
       // than expected" than on being charged more.
       const creditDecrease = -netIncrease;
-      const allowed = envelope.maxImmediateCreditDecrease ?? 0;
+      const allowed = (ownEnvelopeBound(boundsRecord, "maxImmediateCreditDecrease") as number | undefined) ?? 0;
       if (creditDecrease > allowed) {
         return `immediate.net moved in the caller's favor by ${creditDecrease} (quoted ${quotedNet} -> revalidated ${revalidatedNet}), exceeding maxImmediateCreditDecrease=${allowed}`;
       }
@@ -391,7 +756,7 @@ function compareDeterminedDimensions(
     const revalidatedRecurring = compared.recurring!.resultingAmount!;
     const recurringIncrease = revalidatedRecurring - quotedRecurring;
     if (recurringIncrease > 0) {
-      const allowed = envelope.maxRecurringIncrease ?? 0;
+      const allowed = (ownEnvelopeBound(boundsRecord, "maxRecurringIncrease") as number | undefined) ?? 0;
       if (recurringIncrease > allowed) {
         return `recurring.resultingAmount increased by ${recurringIncrease} (quoted ${quotedRecurring} -> revalidated ${revalidatedRecurring}), exceeding maxRecurringIncrease=${allowed}`;
       }
@@ -399,6 +764,46 @@ function compareDeterminedDimensions(
   }
 
   return null;
+}
+
+/**
+ * PR-15: the FIREABLE projection of a malformed envelope, used ONLY
+ * by reconcileCommittedEffect's malformed-envelope classification.
+ * Each malformed bound is replaced by +Infinity — an internal
+ * "this check cannot fire" sentinel for that one bound, never a
+ * tolerance the caller stated and never reported as one — while
+ * valid bounds keep their values and absent bounds keep their
+ * zero-tolerance meaning. A non-object envelope has no
+ * interpretable bound at all, so no check can fire. The projection
+ * exists so a violation established through the interpretable
+ * bounds can still be reported truthfully; the classification that
+ * consumes it is never OK (see reconcileCommittedEffect).
+ */
+function fireableEnvelopeProjection(envelope: unknown): AcceptanceEnvelope {
+  const NEVER = Number.POSITIVE_INFINITY;
+  // FINAL correction (P15-2 completion): the projection is
+  // NULL-PROTOTYPE, like the sanitized envelope — it is an
+  // envelope-shaped object whose absent fields must stay absent
+  // under any Object.prototype pollution when it is later read
+  // for bounds (via compareDeterminedDimensions).
+  if (typeof envelope !== "object" || envelope === null || Array.isArray(envelope)) {
+    const none = Object.create(null) as AcceptanceEnvelope;
+    none.maxImmediateNetIncrease = NEVER;
+    none.maxImmediateCreditDecrease = NEVER;
+    none.maxRecurringIncrease = NEVER;
+    return none;
+  }
+  const record = envelope as Record<string, unknown>;
+  const out = Object.create(null) as AcceptanceEnvelope;
+  for (const field of ENVELOPE_FIELD_NAMES) {
+    // Own properties only (P15-2): an inherited bound is not part
+    // of the recorded envelope, so it neither fires nor is
+    // projected — it is absent, exactly as in validation.
+    const value = ownEnvelopeBound(record, field);
+    if (value === undefined) continue;
+    out[field] = typeof value === "number" && Number.isFinite(value) && value >= 0 ? value : NEVER;
+  }
+  return out;
 }
 
 /**
@@ -426,6 +831,22 @@ export function checkAcceptanceEnvelope(
   envelope: AcceptanceEnvelope,
   proposal?: SubscriptionChangeProposal
 ): string | null {
+  // PR-15 (Finding 2): the envelope is caller input, validated
+  // BEFORE the determinacy assessment and any comparison — a
+  // malformed bound (NaN, negative, string-typed) or an unknown
+  // field refuses as INVALID_PROPOSAL here, at this pre-dispatch
+  // gate, rather than silently disabling the comparison it bounds
+  // (every comparison against NaN is false — repro44.5). A missing
+  // envelope at this entry point is likewise invalid input: an
+  // empty object is the way to state zero tolerance explicitly.
+  if (envelope === undefined || envelope === null) {
+    throw new SCQError(
+      "INVALID_PROPOSAL",
+      "checkAcceptanceEnvelope requires an acceptance envelope object (an empty object states zero tolerance on every dimension); a missing envelope at this pre-dispatch gate is invalid input, not tolerance by silence.",
+      { envelopeProblem: "envelope missing" }
+    );
+  }
+  assertEnvelopeShapeValid(envelope);
   assertEnvelopeEnforceable(quoted, revalidated, proposal);
   const assessments = assessEnvelopePair(quoted, revalidated, proposal, "quote");
   const comparable = new Set(assessments.filter((d) => d.comparable).map((d) => d.dimension));
@@ -480,6 +901,16 @@ export function checkAcceptanceEnvelope(
  *    (or legitimately skipped as justified NOT_APPLICABLE on both
  *    sides).
  *
+ * PR-15 (Finding 2) adds the malformed-envelope rule, in the same
+ * spirit: an envelope that cannot be interpreted as recorded (a
+ * NaN / negative / string-typed bound, an unknown field, a
+ * non-object shape) never throws here and never reads as
+ * compliance — a violation established through its interpretable
+ * bounds reports VIOLATED, and anything else reports UNVERIFIED.
+ * The pre-dispatch counterpart (checkAcceptanceEnvelope) refuses
+ * the same input as INVALID_PROPOSAL: invalid input refuses
+ * BEFORE dispatch and classifies AFTER it.
+ *
  * No-envelope case (CANCEL-only REVALIDATE proposals may omit one —
  * see enforceGuaranteeRequest): there is nothing to COMPARE, and OK
  * keeps its v0.6.1 meaning of "no comparison applies" — but only
@@ -502,7 +933,15 @@ export function reconcileCommittedEffect(
   const assessments = assessEnvelopePair(quoted, committed, proposal, "committed");
   const undetermined = assessments.filter((d) => !d.comparable && !d.skipped);
 
-  if (!envelope) {
+  // PR-15 correction (P15-1): ONLY `undefined` is an omitted
+  // envelope. The pre-correction `if (!envelope)` also routed
+  // SUPPLIED falsy values (null, false, 0, "") down this
+  // no-envelope path, where established committed figures returned
+  // OK for malformed input. A supplied-but-falsy envelope now
+  // falls through to the malformed-envelope classification below:
+  // it never throws (the receipt must be recorded) and never
+  // reads OK.
+  if (envelope === undefined) {
     // Judge the COMMITTED side alone: with nothing to compare
     // against, the quoted side's determinacy is not the question —
     // whether the reported actuals are established is.
@@ -521,6 +960,46 @@ export function reconcileCommittedEffect(
   }
 
   const comparable = new Set(assessments.filter((d) => d.comparable).map((d) => d.dimension));
+
+  // PR-15 (Finding 2): a MALFORMED envelope (a NaN / negative /
+  // string-typed bound, an unknown field, a non-object shape)
+  // encountered POST-commit classifies — it never throws (this
+  // function never throws: the mutation has already landed and its
+  // receipt must be recorded) and it never silently passes (a NaN
+  // bound makes every comparison against it false, which the
+  // pre-PR-15 code read as compliance). Comparisons run on the
+  // envelope's FIREABLE projection (see fireableEnvelopeProjection):
+  // a violation established through the interpretable bounds
+  // reports VIOLATED — a proven violation is never downgraded by
+  // an unrelated uninterpretable term — and otherwise compliance
+  // is UNVERIFIED, because the caller's tolerance as recorded
+  // cannot be fully interpreted.
+  const envelopeProblem = envelopeShapeProblem(envelope);
+  if (envelopeProblem) {
+    const fireableViolation = compareDeterminedDimensions(quoted, committed, fireableEnvelopeProjection(envelope), comparable);
+    if (fireableViolation) {
+      return {
+        status: "VIOLATED",
+        reason:
+          `Post-commit reconciliation failed: the ACTUALLY-committed effect falls outside the caller's ` +
+          `acceptance envelope (${fireableViolation}). This violation is established through the envelope's ` +
+          `interpretable bounds alone; the recorded envelope is additionally malformed (${envelopeProblem}), ` +
+          `which does not downgrade a proven violation. The mutation has already occurred and cannot be ` +
+          `rolled back by this reconciliation check; it exists solely so this is never reported silently.`,
+      };
+    }
+    return {
+      status: "UNVERIFIED",
+      reason:
+        `Post-commit reconciliation cannot be established: the recorded acceptance envelope is malformed ` +
+        `(${envelopeProblem}), so compliance with the caller's tolerance as recorded cannot be established — ` +
+        `a malformed bound is never compared as zero and never read as compliance (PR-15). The mutation has ` +
+        `already occurred; its receipt is recorded with this classification, and the malformed envelope ` +
+        `requires operator follow-up.`,
+      undeterminedDimensions: undetermined.map((d) => d.dimension),
+    };
+  }
+
   const violation = compareDeterminedDimensions(quoted, committed, envelope, comparable);
   if (violation) {
     return {
@@ -552,9 +1031,30 @@ export function reconcileCommittedEffect(
  * guaranteeMode for a proposal is — the caller's explicit choice, or
  * REVALIDATE if omitted — and is the single place that default lives, so
  * all adapters can't drift out of sync on it.
+ *
+ * PR-15 hardening (Finding 2): the pre-PR-15 implementation returned
+ * `proposal.guaranteeMode ?? "REVALIDATE"` VERBATIM, so a runtime
+ * value outside the type union ("REVALDIATE", an explicit null,
+ * a number) flowed into every consumer's mode branches and
+ * satisfied none of them — enforcement fell through both branches.
+ * An omitted (undefined) mode still defaults to REVALIDATE; the
+ * two literals resolve to themselves; ANY other runtime value —
+ * explicit null included — refuses as INVALID_PROPOSAL, so a
+ * direct caller of this shared entry point cannot bypass
+ * enforcement with an invalid mode.
  */
 export function resolveGuaranteeMode(proposal: SubscriptionChangeProposal): GuaranteeMode {
-  return proposal.guaranteeMode ?? "REVALIDATE";
+  if (!proposal || typeof proposal !== "object") {
+    throw new SCQError("INVALID_PROPOSAL", `resolveGuaranteeMode requires a proposal object; got ${runtimeValueForMessage(proposal)}.`);
+  }
+  const mode: unknown = (proposal as { guaranteeMode?: unknown }).guaranteeMode;
+  if (mode === undefined) return "REVALIDATE";
+  if (mode === "EXACT" || mode === "REVALIDATE") return mode;
+  throw new SCQError(
+    "INVALID_PROPOSAL",
+    `guaranteeMode ${runtimeValueForMessage(mode)} is not a recognized guarantee mode — the only values are "EXACT" and "REVALIDATE" (omit the field for the REVALIDATE default). A malformed mode is refused here, at the shared resolution point, rather than falling through both modes' enforcement.`,
+    { guaranteeMode: mode ?? null }
+  );
 }
 
 /**
@@ -616,6 +1116,26 @@ export function enforceGuaranteeRequest(
   coverage: GuaranteeCoverage,
   acceptanceEnvelope: AcceptanceEnvelope | undefined
 ): void {
+  // PR-15 hardening (Finding 2): this function's branches key on
+  // the literals "EXACT" and "REVALIDATE", so a direct caller
+  // passing an invalid runtime mode fell through BOTH branches —
+  // no coverage check, no envelope requirement. An unrecognized
+  // mode is invalid input and refuses here, at the enforcement
+  // entry point, not downstream by accident. The same applies to
+  // a malformed envelope and to an empty change set (whose
+  // vacuous `every` would otherwise read as all-CANCEL and skip
+  // the envelope requirement).
+  if (effectiveMode !== "EXACT" && effectiveMode !== "REVALIDATE") {
+    throw new SCQError(
+      "INVALID_PROPOSAL",
+      `guaranteeMode ${runtimeValueForMessage(effectiveMode)} is not a recognized guarantee mode — the only values are "EXACT" and "REVALIDATE". Refusing at the enforcement entry point: a malformed mode must never fall through both modes' branches.`,
+      { guaranteeMode: effectiveMode ?? null }
+    );
+  }
+  if (!Array.isArray(changes) || changes.length === 0) {
+    throw new SCQError("INVALID_PROPOSAL", "enforceGuaranteeRequest requires a non-empty changes array.", { changes: Array.isArray(changes) ? changes.length : null });
+  }
+  assertEnvelopeShapeValid(acceptanceEnvelope);
   const actionsLabel = changes.map((c) => c.action).join("+");
   if (effectiveMode === "EXACT") {
     const failingDimension = COVERAGE_DIMENSIONS.find((dim) => coverage[dim] !== "EXACT");
@@ -631,7 +1151,10 @@ export function enforceGuaranteeRequest(
     }
   }
   const allCancel = changes.every((c) => c.action === "CANCEL");
-  if (effectiveMode === "REVALIDATE" && !allCancel && !acceptanceEnvelope) {
+  // `=== undefined`, not falsiness (P15-1 consistency): the shape
+  // assertion above has already refused every supplied malformed
+  // value, so only a genuinely omitted envelope reaches this test.
+  if (effectiveMode === "REVALIDATE" && !allCancel && acceptanceEnvelope === undefined) {
     throw new SCQError(
       "INVALID_PROPOSAL",
       `guaranteeMode "REVALIDATE" (explicit or defaulted) requires an acceptanceEnvelope for changes ` +
