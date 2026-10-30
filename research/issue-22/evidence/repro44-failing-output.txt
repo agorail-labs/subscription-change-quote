@@ -1,0 +1,143 @@
+TAP version 13
+# === TEST44 EVIDENCE 44.1 typo mode, no envelope (observed on unmodified main) ===
+# {
+#   "quoteRefused": null,
+#   "quoteCreated": true,
+#   "effectiveGuaranteeModeOnQuote": "REVALDIATE",
+#   "commitRefused": null,
+#   "receiptOutcome": "COMMITTED_AND_VERIFIED",
+#   "receiptReconciliation": "OK"
+# }
+# === END TEST44 EVIDENCE ===
+# === TEST44 EVIDENCE 44.2 NaN bound (observed on unmodified main) ===
+# {
+#   "quoteRefused": null,
+#   "quoteCreated": true,
+#   "effectiveGuaranteeModeOnQuote": "REVALIDATE",
+#   "commitRefused": null,
+#   "receiptOutcome": "COMMITTED_AND_VERIFIED",
+#   "receiptReconciliation": "OK"
+# }
+# === END TEST44 EVIDENCE ===
+# === TEST44 EVIDENCE 44.3 negative bound (observed on unmodified main) ===
+# {
+#   "quoteRefused": null,
+#   "quoteCreated": true,
+#   "effectiveGuaranteeModeOnQuote": "REVALIDATE",
+#   "commitRefused": null,
+#   "receiptOutcome": "COMMITTED_AND_VERIFIED",
+#   "receiptReconciliation": "OK"
+# }
+# === END TEST44 EVIDENCE ===
+# === TEST44 EVIDENCE 44.4 string bound (observed on unmodified main) ===
+# {
+#   "quoteRefused": null,
+#   "quoteCreated": true,
+#   "effectiveGuaranteeModeOnQuote": "REVALIDATE",
+#   "commitRefused": null,
+#   "receiptOutcome": "COMMITTED_AND_VERIFIED",
+#   "receiptReconciliation": "OK"
+# }
+# === END TEST44 EVIDENCE ===
+# === TEST44 EVIDENCE 44.5 (observed on unmodified main) ===
+# {"drift":"+5000 immediate.net","bound":"NaN","violationReturned":null,"threw":false}
+# === END TEST44 EVIDENCE ===
+# Subtest: Test 44.1 (Issue \#22 F2): guaranteeMode "REVALDIATE" (typo) with NO acceptanceEnvelope must be refused at quote creation
+not ok 1 - Test 44.1 (Issue \#22 F2): guaranteeMode "REVALDIATE" (typo) with NO acceptanceEnvelope must be refused at quote creation
+  ---
+  duration_ms: 9.235463
+  location: '/home/hatch/workspace/subscription-change-quote/reference/dist/tests/repro44-runtime-validation.repro.js:84:1'
+  failureType: 'testCodeFailure'
+  error: 'a misspelled guaranteeMode must be refused at runtime (no refusal occurred; the flow produced outcome=COMMITTED_AND_VERIFIED, reconciliation=OK)'
+  code: 'ERR_ASSERTION'
+  name: 'AssertionError'
+  expected: true
+  operator: '=='
+  stack: |-
+    TestContext.<anonymous> (file:///home/hatch/workspace/subscription-change-quote/reference/dist/tests/repro44-runtime-validation.repro.js:87:12)
+    async Test.run (node:internal/test_runner/test:980:9)
+    async startSubtestAfterBootstrap (node:internal/test_runner/harness:296:3)
+  ...
+# Subtest: Test 44.2 (Issue \#22 F2): a NaN envelope bound must be refused at quote creation
+not ok 2 - Test 44.2 (Issue \#22 F2): a NaN envelope bound must be refused at quote creation
+  ---
+  duration_ms: 1.644036
+  location: '/home/hatch/workspace/subscription-change-quote/reference/dist/tests/repro44-runtime-validation.repro.js:93:1'
+  failureType: 'testCodeFailure'
+  error: 'a NaN acceptance-envelope bound is malformed input and must be refused, not silently compared as never-exceedable'
+  code: 'ERR_ASSERTION'
+  name: 'AssertionError'
+  expected: true
+  operator: '=='
+  stack: |-
+    TestContext.<anonymous> (file:///home/hatch/workspace/subscription-change-quote/reference/dist/tests/repro44-runtime-validation.repro.js:99:12)
+    async Test.run (node:internal/test_runner/test:980:9)
+    async Test.processPendingSubtests (node:internal/test_runner/test:677:7)
+  ...
+# Subtest: Test 44.3 (Issue \#22 F2): a negative envelope bound must be refused at quote creation
+not ok 3 - Test 44.3 (Issue \#22 F2): a negative envelope bound must be refused at quote creation
+  ---
+  duration_ms: 1.690366
+  location: '/home/hatch/workspace/subscription-change-quote/reference/dist/tests/repro44-runtime-validation.repro.js:104:1'
+  failureType: 'testCodeFailure'
+  error: 'a negative acceptance-envelope bound is malformed input and must be refused at quote creation with a validation error'
+  code: 'ERR_ASSERTION'
+  name: 'AssertionError'
+  expected: true
+  operator: '=='
+  stack: |-
+    TestContext.<anonymous> (file:///home/hatch/workspace/subscription-change-quote/reference/dist/tests/repro44-runtime-validation.repro.js:110:12)
+    async Test.run (node:internal/test_runner/test:980:9)
+    async Test.processPendingSubtests (node:internal/test_runner/test:677:7)
+  ...
+# Subtest: Test 44.4 (Issue \#22 F2): a string-typed envelope bound must be refused at quote creation
+not ok 4 - Test 44.4 (Issue \#22 F2): a string-typed envelope bound must be refused at quote creation
+  ---
+  duration_ms: 1.211578
+  location: '/home/hatch/workspace/subscription-change-quote/reference/dist/tests/repro44-runtime-validation.repro.js:115:1'
+  failureType: 'testCodeFailure'
+  error: 'a non-numeric acceptance-envelope bound (JSON can carry one) must be refused, not coerced/NaN-compared into a silent pass'
+  code: 'ERR_ASSERTION'
+  name: 'AssertionError'
+  expected: true
+  operator: '=='
+  stack: |-
+    TestContext.<anonymous> (file:///home/hatch/workspace/subscription-change-quote/reference/dist/tests/repro44-runtime-validation.repro.js:121:12)
+    async Test.run (node:internal/test_runner/test:980:9)
+    async Test.processPendingSubtests (node:internal/test_runner/test:677:7)
+  ...
+# Subtest: Test 44.5 (Issue \#22 F2): checkAcceptanceEnvelope with a NaN bound must not silently pass a drifted revalidation
+not ok 5 - Test 44.5 (Issue \#22 F2): checkAcceptanceEnvelope with a NaN bound must not silently pass a drifted revalidation
+  ---
+  duration_ms: 0.562224
+  location: '/home/hatch/workspace/subscription-change-quote/reference/dist/tests/repro44-runtime-validation.repro.js:128:1'
+  failureType: 'testCodeFailure'
+  error: 'a NaN bound must not make a +5000 drift read as within-envelope (NaN comparisons are always false)'
+  code: 'ERR_ASSERTION'
+  name: 'AssertionError'
+  expected: true
+  actual: false
+  operator: '=='
+  stack: |-
+    TestContext.<anonymous> (file:///home/hatch/workspace/subscription-change-quote/reference/dist/tests/repro44-runtime-validation.repro.js:153:12)
+    Test.runInAsyncScope (node:async_hooks:211:14)
+    Test.run (node:internal/test_runner/test:979:25)
+    Test.processPendingSubtests (node:internal/test_runner/test:677:18)
+    Test.postRun (node:internal/test_runner/test:1090:19)
+    Test.run (node:internal/test_runner/test:1018:12)
+    async Test.processPendingSubtests (node:internal/test_runner/test:677:7)
+  ...
+# Subtest: Test 44.6 (Issue \#22 F2 control): well-formed REVALIDATE proposal with finite nonnegative bounds works
+ok 6 - Test 44.6 (Issue \#22 F2 control): well-formed REVALIDATE proposal with finite nonnegative bounds works
+  ---
+  duration_ms: 1.22023
+  ...
+1..6
+# tests 6
+# suites 0
+# pass 1
+# fail 5
+# cancelled 0
+# skipped 0
+# todo 0
+# duration_ms 124.213219
