@@ -867,3 +867,98 @@ test("Test 48.18: idempotent replay of a recorded receipt is not refused by post
   assert.equal(replayed.receiptId, receipt.receiptId, "the repeated commit returns the ORIGINAL receipt (§6.10), unvalidated and unrecomputed");
   assert.equal(replayed.outcome, "COMMITTED_AND_VERIFIED");
 });
+
+// ---------------------------------------------------------------------------
+// 48.20 — PR-15 review correction P15-1: a SUPPLIED-but-falsy
+// envelope (null, false, 0, "") is MALFORMED input, not an omitted
+// envelope. reconcileCommittedEffect's `if (!envelope)` conflated
+// the two: with committed figures otherwise established, the
+// no-envelope path returned OK for a malformed supplied envelope.
+// Only `undefined` means omission; a supplied malformed envelope
+// must classify (never throw, never OK) — UNVERIFIED here, because
+// a non-object envelope carries no interpretable bound through
+// which a violation could be established.
+// ---------------------------------------------------------------------------
+
+test("Test 48.20 (P15-1): falsy supplied envelopes classify as malformed post-commit, never as omitted", () => {
+  const quoted = detEffect(20000, 80900, false);
+  const within = detEffect(20000, 80900, true);
+  const violated = detEffect(20000, 90000, true);
+  for (const bad of [null, false, 0, ""] as unknown[]) {
+    const label = `envelope=${JSON.stringify(bad) ?? String(bad)}`;
+    let r;
+    assert.doesNotThrow(() => { r = reconcileCommittedEffect(quoted, within, bad as any, QTY_PROPOSAL); }, `${label}: reconcile must never throw`);
+    assert.equal(r!.status, "UNVERIFIED", `${label}: a supplied malformed envelope must not read as the no-envelope OK, got ${r!.status}`);
+    assert.match(r!.reason ?? "", /malformed/i, `${label}: the classification must name the malformed envelope`);
+    // Even with drifted figures, a non-object envelope establishes
+    // no interpretable bound — still classified, still never OK.
+    const rv = reconcileCommittedEffect(quoted, violated, bad as any, QTY_PROPOSAL);
+    assert.notEqual(rv.status, "OK", `${label}: drifted figures + malformed envelope must not read OK, got ${rv.status}`);
+  }
+  // Control: a genuinely OMITTED envelope (undefined) keeps its
+  // established no-envelope semantics — established committed
+  // actuals with nothing to compare against reconcile OK.
+  assert.equal(reconcileCommittedEffect(quoted, within, undefined, QTY_PROPOSAL).status, "OK", "undefined remains omission: established actuals reconcile OK with no envelope");
+});
+
+// ---------------------------------------------------------------------------
+// 48.21 — PR-15 review correction P15-2: envelope bounds are read
+// through OWN properties only. The validator checked own field
+// NAMES (Object.keys) but read bound VALUES through ordinary
+// property access, so a bound inherited through the prototype
+// chain passed validation AND drove comparisons — an inherited
+// maxRecurringIncrease silently enlarged the permitted drift
+// without any explicitly supplied bound. Inherited properties are
+// not part of the envelope: they neither validate, nor tolerate,
+// nor fire — an envelope whose bounds are all inherited behaves
+// exactly like an envelope with those bounds omitted (zero
+// tolerance), at quote time and at reconcile time alike.
+// ---------------------------------------------------------------------------
+
+test("Test 48.21 (P15-2): inherited envelope bounds never influence validation or comparison", () => {
+  const quoted = detEffect(20000, 80900, false);
+  const drifted = detEffect(20000, 85900, false); // recurring +5000
+  const committedDrift = detEffect(20000, 85900, true);
+  const HUGE = 1_000_000;
+
+  // Envelope whose ONLY bound arrives via the prototype chain.
+  const inheritedOnly: Record<string, unknown> = Object.create({ maxRecurringIncrease: HUGE });
+  assert.deepEqual(Object.keys(inheritedOnly), [], "fixture check: the bound is inherited, not own");
+
+  // Validation: an inherited valid value states no bound at all —
+  // the envelope is shape-valid (equivalent to an empty envelope).
+  assert.doesNotThrow(
+    () => validateProposalRuntime({ changes: QTY_PROPOSAL.changes, effectiveIntent: QTY_PROPOSAL.effectiveIntent, guaranteeMode: "REVALIDATE", acceptanceEnvelope: inheritedOnly }),
+    "an inherited bound must not fail validation — it simply is not part of the envelope",
+  );
+  // An inherited MALFORMED value is likewise not part of the
+  // envelope: it must not make a shape-valid (empty) envelope
+  // refuse as malformed.
+  const inheritedNaN: Record<string, unknown> = Object.create({ maxRecurringIncrease: NaN });
+  assert.doesNotThrow(
+    () => validateProposalRuntime({ changes: QTY_PROPOSAL.changes, effectiveIntent: QTY_PROPOSAL.effectiveIntent, guaranteeMode: "REVALIDATE", acceptanceEnvelope: inheritedNaN }),
+    "an inherited NaN bound is not the caller's bound and must not refuse the proposal",
+  );
+
+  // Quote time: the +5000 recurring drift must violate ZERO
+  // tolerance (the inherited 1,000,000 must not enlarge it).
+  const violation = checkAcceptanceEnvelope(quoted, drifted, inheritedOnly as any, QTY_PROPOSAL);
+  assert.ok(violation !== null && /maxRecurringIncrease=0/.test(violation), `inherited tolerance must not pass a +5000 drift at quote time, got: ${violation}`);
+
+  // Mixed: an OWN zero bound alongside an inherited huge one —
+  // the own fields govern; the inherited field stays inert.
+  const mixed: Record<string, unknown> = Object.create({ maxRecurringIncrease: HUGE });
+  mixed.maxImmediateNetIncrease = 0;
+  const mixedViolation = checkAcceptanceEnvelope(quoted, drifted, mixed as any, QTY_PROPOSAL);
+  assert.ok(mixedViolation !== null && /maxRecurringIncrease=0/.test(mixedViolation), `own fields only: inherited maxRecurringIncrease must stay inert, got: ${mixedViolation}`);
+
+  // Commit time (reconcile): the same inherited envelope must not
+  // turn an established out-of-tolerance commit into OK.
+  const r = reconcileCommittedEffect(quoted, committedDrift, inheritedOnly as any, QTY_PROPOSAL);
+  assert.equal(r.status, "VIOLATED", `inherited tolerance must not reconcile a +5000 drift OK, got ${r.status}`);
+
+  // Control: an OWN stated bound behaves exactly as before — a
+  // +5000 drift inside an own 10000 bound passes both gates.
+  assert.equal(checkAcceptanceEnvelope(quoted, drifted, { maxRecurringIncrease: 10000 }, QTY_PROPOSAL), null, "an own bound of 10000 still tolerates a +5000 drift at quote time");
+  assert.equal(reconcileCommittedEffect(quoted, committedDrift, { maxRecurringIncrease: 10000 }, QTY_PROPOSAL).status, "OK", "an own bound of 10000 still reconciles a +5000 drift OK");
+});

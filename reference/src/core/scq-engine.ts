@@ -222,13 +222,52 @@ export function envelopeShapeProblem(envelope: unknown): string | null {
     }
   }
   for (const field of ENVELOPE_FIELD_NAMES) {
-    const value = record[field];
+    const value = ownEnvelopeBound(record, field);
     if (value === undefined) continue;
     if (typeof value !== "number" || !Number.isFinite(value) || value < 0) {
       return `acceptance envelope bound ${field} must be a finite, nonnegative number (minor units); got ${runtimeValueForMessage(value)} — a malformed bound is never coerced to zero`;
     }
   }
   return null;
+}
+
+/**
+ * PR-15 correction (P15-2): reads a bound through the envelope's
+ * OWN properties only. The unknown-field check above iterates
+ * Object.keys (own names), but a plain `record[field]` read walks
+ * the prototype chain — an INHERITED bound (e.g. an envelope built
+ * on a prototype carrying maxRecurringIncrease) would be validated
+ * and compared as if the caller had stated it, silently enlarging
+ * the permitted drift. An inherited property is not part of the
+ * envelope the caller supplied: it states no bound, validates
+ * nothing, and tolerates nothing. Every envelope read in this
+ * module goes through this helper or through the sanitized
+ * projection below.
+ */
+function ownEnvelopeBound(record: Record<string, unknown>, field: (typeof ENVELOPE_FIELD_NAMES)[number]): unknown {
+  return Object.prototype.hasOwnProperty.call(record, field) ? record[field] : undefined;
+}
+
+/**
+ * PR-15 correction (P15-2): the SANITIZED envelope — a fresh plain
+ * object carrying ONLY the envelope's own, supported bounds. For a
+ * shape-valid envelope every own bound is already known valid
+ * (assertEnvelopeShapeValid / envelopeShapeProblem ran first), so
+ * the copy preserves semantics exactly while severing the
+ * prototype chain: downstream comparisons consume this form and
+ * can never observe an inherited property. Applied at the single
+ * shared comparison entry (compareDeterminedDimensions), so the
+ * quote-time gate, post-commit reconciliation, and the fireable
+ * projection path all compare the same sanitized form.
+ */
+function sanitizedEnvelope(envelope: AcceptanceEnvelope): AcceptanceEnvelope {
+  const record = envelope as Record<string, unknown>;
+  const out: AcceptanceEnvelope = {};
+  for (const field of ENVELOPE_FIELD_NAMES) {
+    const value = ownEnvelopeBound(record, field);
+    if (value !== undefined) out[field] = value as number;
+  }
+  return out;
 }
 
 /** Throws INVALID_PROPOSAL naming the shape problem, if any. An absent envelope is not a shape problem. */
@@ -666,13 +705,18 @@ function compareDeterminedDimensions(
   envelope: AcceptanceEnvelope,
   comparable: ReadonlySet<FinancialDimension>
 ): string | null {
+  // PR-15 correction (P15-2): compare the SANITIZED envelope —
+  // own bounds only — so a bound inherited through the caller's
+  // prototype chain can never enlarge the permitted drift here,
+  // whatever object the caller passed in.
+  const bounds = sanitizedEnvelope(envelope);
   if (comparable.has("immediateFinancialEffect")) {
     const quotedNet = quoted.immediate!.net!;
     const revalidatedNet = compared.immediate!.net!;
     const netIncrease = revalidatedNet - quotedNet;
 
     if (netIncrease > 0) {
-      const allowed = envelope.maxImmediateNetIncrease ?? 0;
+      const allowed = bounds.maxImmediateNetIncrease ?? 0;
       if (netIncrease > allowed) {
         return `immediate.net increased by ${netIncrease} (quoted ${quotedNet} -> revalidated ${revalidatedNet}), exceeding maxImmediateNetIncrease=${allowed}`;
       }
@@ -682,7 +726,7 @@ function compareDeterminedDimensions(
       // reasonably want a tighter or looser tolerance on "I got charged less
       // than expected" than on being charged more.
       const creditDecrease = -netIncrease;
-      const allowed = envelope.maxImmediateCreditDecrease ?? 0;
+      const allowed = bounds.maxImmediateCreditDecrease ?? 0;
       if (creditDecrease > allowed) {
         return `immediate.net moved in the caller's favor by ${creditDecrease} (quoted ${quotedNet} -> revalidated ${revalidatedNet}), exceeding maxImmediateCreditDecrease=${allowed}`;
       }
@@ -694,7 +738,7 @@ function compareDeterminedDimensions(
     const revalidatedRecurring = compared.recurring!.resultingAmount!;
     const recurringIncrease = revalidatedRecurring - quotedRecurring;
     if (recurringIncrease > 0) {
-      const allowed = envelope.maxRecurringIncrease ?? 0;
+      const allowed = bounds.maxRecurringIncrease ?? 0;
       if (recurringIncrease > allowed) {
         return `recurring.resultingAmount increased by ${recurringIncrease} (quoted ${quotedRecurring} -> revalidated ${revalidatedRecurring}), exceeding maxRecurringIncrease=${allowed}`;
       }
@@ -725,7 +769,10 @@ function fireableEnvelopeProjection(envelope: unknown): AcceptanceEnvelope {
   const record = envelope as Record<string, unknown>;
   const out: AcceptanceEnvelope = {};
   for (const field of ENVELOPE_FIELD_NAMES) {
-    const value = record[field];
+    // Own properties only (P15-2): an inherited bound is not part
+    // of the recorded envelope, so it neither fires nor is
+    // projected — it is absent, exactly as in validation.
+    const value = ownEnvelopeBound(record, field);
     if (value === undefined) continue;
     out[field] = typeof value === "number" && Number.isFinite(value) && value >= 0 ? value : NEVER;
   }
@@ -859,7 +906,15 @@ export function reconcileCommittedEffect(
   const assessments = assessEnvelopePair(quoted, committed, proposal, "committed");
   const undetermined = assessments.filter((d) => !d.comparable && !d.skipped);
 
-  if (!envelope) {
+  // PR-15 correction (P15-1): ONLY `undefined` is an omitted
+  // envelope. The pre-correction `if (!envelope)` also routed
+  // SUPPLIED falsy values (null, false, 0, "") down this
+  // no-envelope path, where established committed figures returned
+  // OK for malformed input. A supplied-but-falsy envelope now
+  // falls through to the malformed-envelope classification below:
+  // it never throws (the receipt must be recorded) and never
+  // reads OK.
+  if (envelope === undefined) {
     // Judge the COMMITTED side alone: with nothing to compare
     // against, the quoted side's determinacy is not the question —
     // whether the reported actuals are established is.
@@ -1069,7 +1124,10 @@ export function enforceGuaranteeRequest(
     }
   }
   const allCancel = changes.every((c) => c.action === "CANCEL");
-  if (effectiveMode === "REVALIDATE" && !allCancel && !acceptanceEnvelope) {
+  // `=== undefined`, not falsiness (P15-1 consistency): the shape
+  // assertion above has already refused every supplied malformed
+  // value, so only a genuinely omitted envelope reaches this test.
+  if (effectiveMode === "REVALIDATE" && !allCancel && acceptanceEnvelope === undefined) {
     throw new SCQError(
       "INVALID_PROPOSAL",
       `guaranteeMode "REVALIDATE" (explicit or defaulted) requires an acceptanceEnvelope for changes ` +
