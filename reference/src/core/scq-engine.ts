@@ -141,9 +141,10 @@ export function validateCommit(
  * develop parallel interpretations of the three-state model. The
  * state machine mirrors `auditDeterminacy`'s exactly (same
  * `determinacyOf` reading, same value-validity rule, same
- * applicability-table license and citation validation — the audit
- * remains the report-only diagnostic over the same rules, and the
- * BC-1 suite pins gate/audit agreement on the refusal cases).
+ * NOT_APPLICABLE validation — BC1-R1 field-absence purity first,
+ * then the applicability-table license and citation validation —
+ * the audit remains the report-only diagnostic over the same rules,
+ * and the BC-1 suites pin gate/audit agreement on the refusal cases).
  *
  * Two ROLE differences from the audit are deliberate and documented
  * (research/bc1-fail-closed-enforcement.md):
@@ -197,6 +198,18 @@ function dimensionValue(effect: CommercialEffect, dimension: FinancialDimension)
 }
 
 /**
+ * The dimension's whole financial FIELD (not one figure within it).
+ * BC1-R1 judges NOT_APPLICABLE purity against this: the assertion
+ * claims the dimension does not arise, so the field itself must be
+ * absent — a present field in ANY shape (a nonzero amount, an
+ * explicit zero, a partial shape such as { charge } without net)
+ * contradicts the assertion.
+ */
+function dimensionField(effect: CommercialEffect, dimension: FinancialDimension): unknown {
+  return dimension === "immediateFinancialEffect" ? effect.immediate : effect.recurring;
+}
+
+/**
  * The authoritative action context for applicability licensing: the
  * proposal's single change action. A multi-change proposal has no
  * single action context — its combined effect's dimensions genuinely
@@ -217,6 +230,21 @@ function assessDimensionSide(
 ): SideAssessment {
   const state = determinacyOf(effect)[dimension];
   if (state === "NOT_APPLICABLE") {
+    // BC1-R1 — field-absence purity is judged FIRST, before the
+    // justification preconditions below. NOT_APPLICABLE claims the
+    // dimension does not arise (issue #7 Topic 1), which requires
+    // its financial field to be ABSENT: a present field in any
+    // shape — a nonzero amount, an explicit zero (a verified zero
+    // is DETERMINED, present as 0), a partial shape such as
+    // { charge } without net — is a value the assertion itself
+    // contradicts, and no action context, license, or citation can
+    // cure the payload's internal inconsistency. The order mirrors
+    // the DETERMINED branch, where value validity dominates
+    // provenance findings; the audit reports the same first finding
+    // for the same shape (gate/audit agreement, pinned in test36).
+    if (dimensionField(effect, dimension) !== undefined) {
+      return { state, findings: ["INCONSISTENT_NOT_APPLICABLE_VALUE"], kind: "unenforceable" };
+    }
     // Same justification preconditions, in the same order, as the
     // audit: context, then license, then citation.
     if (!action) return { state, findings: ["MISSING_ACTION_CONTEXT"], kind: "unenforceable" };
@@ -289,9 +317,10 @@ function describeAssessment(d: DimensionAssessment, comparedLabel: string): stri
  * role-appropriate provenance, or BOTH sides assert a justified
  * NOT_APPLICABLE under the proposal's authoritative action context.
  * Anything else — UNKNOWN on either side (legacy payloads included),
- * an invalid DETERMINED value, an unjustified or one-sided
- * NOT_APPLICABLE — refuses: UNKNOWN is never zero, and a skipped
- * dimension is never a zero comparison.
+ * an invalid DETERMINED value, an unjustified, one-sided, or
+ * internally inconsistent NOT_APPLICABLE (BC1-R1: asserted over a
+ * present financial field) — refuses: UNKNOWN is never zero, and a
+ * skipped dimension is never a zero comparison.
  */
 export function assertEnvelopeEnforceable(
   quoted: CommercialEffect,
@@ -442,8 +471,9 @@ export function checkAcceptanceEnvelope(
  *  - UNVERIFIED — no established violation, but at least one
  *    dimension cannot be established (UNKNOWN on either side, an
  *    invalid DETERMINED value, committed figures of estimate or
- *    unestablished provenance, an unjustified NOT_APPLICABLE):
- *    compliance was not proven, so OK is not available. An UNKNOWN
+ *    unestablished provenance, an unjustified NOT_APPLICABLE, or a
+ *    NOT_APPLICABLE asserted over a present financial field —
+ *    BC1-R1): compliance was not proven, so OK is not available. An UNKNOWN
  *    committed dimension cannot produce OK by absence, by numeric
  *    coincidence, or by sharing the quote's number.
  *  - OK — every dimension is established and within the envelope
@@ -753,7 +783,8 @@ export type DeterminacyAuditFinding =
   | "PROVENANCE_NOT_ESTABLISHING"
   | "UNJUSTIFIED_NOT_APPLICABLE"
   | "MISSING_ACTION_CONTEXT"
-  | "MISSING_APPLICABILITY_PROVENANCE";
+  | "MISSING_APPLICABILITY_PROVENANCE"
+  | "INCONSISTENT_NOT_APPLICABLE_VALUE";
 
 export type DeterminacyAuditEntry = {
   dimension: FinancialDimension;
@@ -781,6 +812,11 @@ function applicabilityLicensed(action: string, dimension: FinancialDimension): b
 
 function auditDimensionValue(effect: CommercialEffect, dimension: FinancialDimension): unknown {
   return dimension === "immediateFinancialEffect" ? effect.immediate?.net : effect.recurring?.resultingAmount;
+}
+
+/** The dimension's whole financial field — the BC1-R1 purity test (see dimensionField). */
+function auditDimensionField(effect: CommercialEffect, dimension: FinancialDimension): unknown {
+  return dimension === "immediateFinancialEffect" ? effect.immediate : effect.recurring;
 }
 
 function auditOneEffect(
@@ -845,6 +881,17 @@ function auditOneEffect(
     return;
   }
   if (state === "NOT_APPLICABLE") {
+    // BC1-R1 — field-absence purity first, exactly as in the gate's
+    // assessment (assessDimensionSide): a NOT_APPLICABLE assertion
+    // over a PRESENT financial field is internally inconsistent
+    // (the dimension is claimed not to arise while its field
+    // carries a value — an explicit zero included), and reports
+    // INCONSISTENT_NOT_APPLICABLE_VALUE regardless of how the
+    // justification preconditions below would have resolved.
+    if (auditDimensionField(effect, dimension) !== undefined) {
+      findings.add("INCONSISTENT_NOT_APPLICABLE_VALUE");
+      return;
+    }
     // Justification preconditions, in order (findings-closure F2):
     // context, then license, then citation — the first failing
     // precondition is the finding.

@@ -368,3 +368,88 @@ preflight for the exact commit, (4) a named reconciliation owner,
 Chargebee call was made for this PR; the mocked pilot harness
 remains SIMULATED_PASS with live commit BLOCKED and 0 mutating
 calls.
+
+## 11. Review correction BC1-R1 — NOT_APPLICABLE field-absence purity
+
+Owner review of head `1df747f` accepted the principal BC-1
+behavior and found one remaining three-state purity defect, fixed
+in this section's round (new suite: test36).
+
+**The defect.** The N/A branches of the shared assessment
+(`assessDimensionSide`) and of the audit (`auditOneEffect`)
+validated an assertion's action context, license, and citation —
+but never whether the dimension's financial field was actually
+absent. Issue #7 Topic 1 (and the `DimensionState` contract in
+types.ts) defines NOT_APPLICABLE as the dimension *not arising*,
+with its field absent; a verified zero is DETERMINED, present as
+0. Counterexample at `1df747f`: quoted = revalidated =
+CANCEL effect carrying `immediate: { net: 50000 }` AND
+`immediateFinancialEffect: "NOT_APPLICABLE"` with a valid CANCEL
+citation — `checkAcceptanceEnvelope` returned null (the dimension
+was skipped; the present 50000 was discarded by relabeling), and
+the matching committed shape could reconcile OK.
+
+**The rule.** For a NOT_APPLICABLE assertion, the dimension's
+whole field (`effect.immediate` / `effect.recurring`) must be
+genuinely absent (`undefined`). Present in ANY shape — a nonzero
+amount, an explicit zero, or a partial shape such as
+`{ charge: 50000 }` without `net` — the assertion is internally
+inconsistent: the dimension is unenforceable with the new finding
+**`INCONSISTENT_NOT_APPLICABLE_VALUE`** (added to the
+`DeterminacyAuditFinding` union in scq-engine.ts). Consequences
+flow through the existing machinery unchanged: pre-mutation, the
+dimension is not skipped, so the gate throws
+QUOTE_NOT_DETERMINISTIC (CONFIRMED_NON_EXECUTION) before any
+dispatch; post-commit, the dimension is unenforceable, so
+reconciliation reports UNVERIFIED — unless another dimension
+independently establishes a violation, which keeps precedence
+(VIOLATED, pinned in test36.7). A present amount is never
+discarded by treating it as N/A.
+
+**Order of findings (decided here, pinned in test36.10/36.11).**
+Within the N/A branch of both implementations the checks run:
+(0) **field-absence purity**, then (1) action context, (2)
+applicability license, (3) citation — the first failing check is
+the side's finding, identically in gate and audit. Rationale:
+purity is a property of the payload itself, independent of any
+context — the assertion contradicts the effect's own contents —
+so it is judged before any question of justification arises,
+mirroring the DETERMINED branch, where value validity dominates
+provenance findings. A side effect of the order: an impure
+*recurring* N/A reports INCONSISTENT_NOT_APPLICABLE_VALUE rather
+than the license failure (test36.11); recurring remains
+unlicensable either way, so no verdict changes — only the named
+reason is the more fundamental one.
+
+**Failing-first evidence.** test36 (11 tests) was written against
+unmodified `1df747f` and run before the fix: **9 fail / 2 pass**.
+The failures are the impure shapes (nonzero net, explicit zero,
+charge-without-net, one-sided, committed envelope and no-envelope
+reconciliation, audit agreement, order, recurring symmetry). The
+2 passes are disclosed controls: 36.7 (an independently
+established recurring violation reports VIOLATED beside an impure
+committed N/A — true before and after) and 36.8 (a pure N/A —
+field genuinely absent, valid citation — still skips pre-commit
+and reconciles OK post-commit). After the fix: test36 11/11, full
+suite **529/529** on a fresh clean build (518 baseline + 11).
+
+**Fixture audit (no flips).** Every NOT_APPLICABLE assertion in
+the repository was checked for a present field on the asserted
+dimension: test14's audit fixtures (14.9–14.13), test17.5, and
+test35's `cancelEffect` uses (all invoke it with the field
+absent); the adapter constructions — Stripe's CANCEL quote,
+Paddle's CANCEL quote, mismatch-observed committed effect, and
+verified-cancel committed effect (a spread of the pure quote),
+Zuora's `buildCommercialEffect` (the `immediate` field is set
+only in the DETERMINED branch) — are pure by construction; the
+Chargebee simulator and live adapters assert NOT_APPLICABLE for
+no dimension; store-suite fixtures assert none. Result: **no
+pre-existing test was modified in this round and no verdict
+flipped** — the 518 baseline passes unmodified alongside test36.
+No fixture in the tree was itself encoding the impurity.
+
+**Composition note.** The adapters' local determinacy gates (M2)
+were not changed: they remain the earlier, adapter-specific
+refusal, and their own produced effects are pure. The core gate —
+now purity-enforcing — remains the protocol-level backstop at
+every envelope/reconciliation call site behind them.
