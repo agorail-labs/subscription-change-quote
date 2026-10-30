@@ -610,3 +610,190 @@ test("Test 47.12 (PR-14): the live adapter's CANCEL posture is unchanged — ref
   );
   assert.equal(mock.calls.length, 0, "the refusal precedes every provider call — unchanged by PR-14");
 });
+
+// ---------------------------------------------------------------------------
+// PR-14 REVIEW CORRECTIONS (47.13–47.18) — two runtime-integrity
+// holes in the gate as first delivered, found in independent
+// review:
+//
+// Finding 1: the capability declaration was a `readonly` INSTANCE
+// field. `readonly` is compile-time only: at JavaScript runtime a
+// caller holding the adapter could assign
+// `(adapter as any).mutationCapability = "TARGETED_UPDATE"` BEFORE
+// quote creation, after which the quote recorded the false
+// capability, quote and commit agreed on the lie, and the gate was
+// bypassed while the adapter still dispatched full-list
+// replacement. Fix: the capability is a module-private constant —
+// a fact about this module's single dispatch mechanism, not about
+// any instance — and the gate, quote creation, and every other
+// consumer read ONLY that constant. The public property is a
+// getter over the constant (assignment throws in strict mode;
+// an Object.defineProperty shadow on one instance is inert
+// because nothing security-relevant reads the instance property).
+//
+// Finding 2: only TARGET_REPLACEMENT was refused at quote
+// creation; any other unknown runtime scope value (e.g.
+// "UNRESTRICTED") was accepted, recorded verbatim, and at commit
+// was never validated — the gate's protection for a bogus scope
+// was incidental (it fell out of the capability comparison), so a
+// non-OPERATION scope could slip past the scope logic entirely.
+// Fix: explicit runtime validation at quote creation AND at
+// commit (of the stored record), with INVALID_PROPOSAL as the
+// invalid-input refusal — the same code this adapter uses for
+// malformed proposals. Only absent-or-OPERATION creates a quote;
+// only a validated scope reaches the capability gate.
+// ---------------------------------------------------------------------------
+
+/** Attempts a runtime assignment to the adapter's capability view; returns what the property reads afterwards. */
+function tryAssignCapability(adapter: ChargebeeLiveAdapter, value: string): { threw: boolean; readBack: unknown } {
+  let threw = false;
+  try {
+    (adapter as any).mutationCapability = value;
+  } catch {
+    threw = true; // getter-only accessor: assignment is rejected in strict mode
+  }
+  return { threw, readBack: (adapter as any).mutationCapability };
+}
+
+test("Test 47.13 (PR-14 review, Finding 1a): assigning TARGETED_UPDATE to the instance BEFORE quote creation cannot falsify the recorded capability or bypass the gate", async () => {
+  const mock = new PreservationMockChargebee();
+  const { adapter, store } = makeAdapter(mock);
+  const { readBack } = tryAssignCapability(adapter, "TARGETED_UPDATE");
+  assert.equal(readBack, "FULL_REPLACEMENT_ONLY", "the capability view still reports the adapter's actual mechanism after the assignment attempt");
+  const quote = await adapter.createChangeQuote(SUB, PROPOSAL(21));
+  assert.equal((quote as any).mutationCapability, "FULL_REPLACEMENT_ONLY", "the quote records the mechanism's real capability, not the assigned lie");
+  assert.equal((store.get(quote.id) as any).authorization_capability, "FULL_REPLACEMENT_ONLY", "the stored record carries the real capability");
+  const err = await expectPreservationRefusal(() => adapter.commitChangeQuote(quote.id));
+  assert.equal(detailsOf(err)?.mutationCapability, "FULL_REPLACEMENT_ONLY");
+  assert.equal(mock.updateDispatches.length, 0, "zero mutating requests were dispatched");
+});
+
+test("Test 47.14 (PR-14 review, Finding 1b): assigning TARGETED_UPDATE to the instance AFTER quote creation cannot reframe the commit — the refusal names the real capability on both sides", async () => {
+  const mock = new PreservationMockChargebee();
+  const { adapter } = makeAdapter(mock);
+  const quote = await adapter.createChangeQuote(SUB, PROPOSAL(21));
+  tryAssignCapability(adapter, "TARGETED_UPDATE");
+  const err = await expectPreservationRefusal(() => adapter.commitChangeQuote(quote.id));
+  assert.equal(detailsOf(err)?.mutationCapability, "FULL_REPLACEMENT_ONLY", "the refusal names the adapter's REAL capability — not a mutated instance value");
+  assert.equal(detailsOf(err)?.recordedCapability, "FULL_REPLACEMENT_ONLY", "the refusal is the capability gate's own refusal, not a mismatch against a lie");
+  assert.equal(mock.updateDispatches.length, 0, "zero mutating requests were dispatched");
+});
+
+test("Test 47.15 (PR-14 review, Finding 1c): an Object.defineProperty override of the capability is inert — quote and gate read the private mechanism declaration, never the instance", async () => {
+  const mock = new PreservationMockChargebee();
+  const { adapter, store } = makeAdapter(mock);
+  Object.defineProperty(adapter, "mutationCapability", { value: "TARGETED_UPDATE", writable: true, configurable: true });
+  assert.equal((adapter as any).mutationCapability, "TARGETED_UPDATE", "fixture check: the own-property shadow is installed (the attack surface is real)");
+  const quote = await adapter.createChangeQuote(SUB, PROPOSAL(21));
+  assert.equal((quote as any).mutationCapability, "FULL_REPLACEMENT_ONLY", "quote creation does not consult the instance property");
+  assert.equal((store.get(quote.id) as any).authorization_capability, "FULL_REPLACEMENT_ONLY");
+  const err = await expectPreservationRefusal(() => adapter.commitChangeQuote(quote.id));
+  assert.equal(detailsOf(err)?.mutationCapability, "FULL_REPLACEMENT_ONLY", "the gate does not consult the instance property either");
+  assert.equal(mock.updateDispatches.length, 0, "zero mutating requests were dispatched");
+});
+
+test("Test 47.16 (PR-14 review, Finding 2): quote creation refuses invalid authorization scopes as INVALID_PROPOSAL — nothing stored, no provider call; absent/OPERATION controls unchanged", async () => {
+  const mock = new PreservationMockChargebee();
+  const { adapter, store } = makeAdapter(mock);
+  const invalidScopes: Array<{ label: string; value: unknown }> = [
+    { label: "unknown string", value: "UNRESTRICTED" },
+    { label: "wrong case", value: "target_replacement" },
+    { label: "empty string", value: "" },
+    { label: "numeric", value: 42 },
+    { label: "object", value: { scope: "OPERATION" } },
+  ];
+  for (const { label, value } of invalidScopes) {
+    const callsBefore = mock.calls.length;
+    await assert.rejects(
+      () => adapter.createChangeQuote(SUB, { ...(PROPOSAL(21) as any), authorizationScope: value } as any),
+      (e: unknown) => e instanceof SCQError && e.code === "INVALID_PROPOSAL",
+      `scope case "${label}" must refuse as INVALID_PROPOSAL`,
+    );
+    assert.equal(mock.calls.length, callsBefore, `scope case "${label}": the refusal precedes every provider call`);
+  }
+  assert.equal(store.all().length, 0, "no quote was stored for any invalid scope");
+
+  // Controls: absent scope and explicit OPERATION create quotes
+  // exactly as before, and their commits refuse at the capability
+  // gate (47.2 covers the absent case end-to-end; here the pair is
+  // pinned side by side).
+  const qAbsent = await adapter.createChangeQuote(SUB, PROPOSAL(21));
+  assert.equal((store.get(qAbsent.id) as any).authorization_scope, "OPERATION");
+  const qExplicit = await adapter.createChangeQuote(SUB, { ...(PROPOSAL(21) as any), authorizationScope: "OPERATION" } as any);
+  assert.equal((store.get(qExplicit.id) as any).authorization_scope, "OPERATION");
+  await expectPreservationRefusal(() => adapter.commitChangeQuote(qAbsent.id));
+  await expectPreservationRefusal(() => adapter.commitChangeQuote(qExplicit.id));
+  assert.equal(mock.updateDispatches.length, 0, "zero mutating requests were dispatched");
+
+  // Control: TARGET_REPLACEMENT keeps its pre-existing refusal.
+  await assert.rejects(
+    () => adapter.createChangeQuote(SUB, { ...(PROPOSAL(21) as any), authorizationScope: "TARGET_REPLACEMENT" } as any),
+    (e: unknown) => e instanceof SCQError && e.code === "UNSUPPORTED_CHANGE",
+    "TARGET_REPLACEMENT remains refused as unsupported, not as invalid input",
+  );
+});
+
+test("Test 47.17 (PR-14 review, Finding 2): a stored quote carrying an unknown scope refuses at commit as INVALID_PROPOSAL — never gated-as-OPERATION, never INDETERMINATE, zero dispatches", async () => {
+  const mock = new PreservationMockChargebee();
+  const { adapter, store } = makeAdapter(mock);
+
+  // Variant 1: the bogus value sits in the stored record's scope field.
+  const q1 = await adapter.createChangeQuote(SUB, PROPOSAL(21));
+  const t1 = store.get(q1.id) as any;
+  t1.authorization_scope = "UNRESTRICTED";
+  store.put(t1);
+  let err1: unknown;
+  try { await adapter.commitChangeQuote(q1.id); } catch (e) { err1 = e; }
+  assert.ok(err1 instanceof SCQError, `expected an SCQError refusal, got: ${String(err1)}`);
+  assert.equal(codeOf(err1), "INVALID_PROPOSAL", "an unknown stored scope refuses as invalid input — a distinct class from the preservation gate");
+  assert.notEqual(detailsOf(err1)?.outcome, "INDETERMINATE", "nothing was dispatched, so the refusal is never INDETERMINATE");
+  assert.equal(store.get(q1.id)?.commit_receipt, undefined, "no receipt was recorded");
+  assert.equal(store.get(q1.id)?.commit_outcome?.outcome, "CONFIRMED_NON_EXECUTION", "the refusal is recorded in the non-execution class");
+
+  // Variant 2: the bogus value sits only in the stored proposal;
+  // the record's own scope field is stripped (legacy-shaped).
+  const q2 = await adapter.createChangeQuote(SUB, PROPOSAL(22));
+  const t2 = store.get(q2.id) as any;
+  delete t2.authorization_scope;
+  t2.proposal = { ...t2.proposal, authorizationScope: "UNRESTRICTED" };
+  store.put(t2);
+  let err2: unknown;
+  try { await adapter.commitChangeQuote(q2.id); } catch (e) { err2 = e; }
+  assert.ok(err2 instanceof SCQError, `expected an SCQError refusal, got: ${String(err2)}`);
+  assert.equal(codeOf(err2), "INVALID_PROPOSAL", "a bogus scope in the stored proposal is validated too — no source is trusted by shape alone");
+  assert.equal(mock.updateDispatches.length, 0, "zero mutating requests were dispatched across both variants");
+});
+
+test("Test 47.18 (PR-14 review, Findings 1+2 composed): a bogus stored scope combined with a mutated instance capability still refuses before dispatch; a TARGET_REPLACEMENT hidden in the stored proposal is never downgraded by an OPERATION record field", async () => {
+  const mock = new PreservationMockChargebee();
+  const { adapter, store } = makeAdapter(mock);
+
+  // The composed bypass: on the pre-correction code the instance
+  // mutation makes quote and commit agree on TARGETED_UPDATE, and
+  // the bogus scope is not TARGET_REPLACEMENT — the commit
+  // DISPATCHES the full-list replacement. After the corrections,
+  // the stored scope is validated first and refuses as invalid.
+  const q1 = await adapter.createChangeQuote(SUB, PROPOSAL(21));
+  const t1 = store.get(q1.id) as any;
+  t1.authorization_scope = "UNRESTRICTED";
+  store.put(t1);
+  tryAssignCapability(adapter, "TARGETED_UPDATE");
+  let err1: unknown;
+  try { await adapter.commitChangeQuote(q1.id); } catch (e) { err1 = e; }
+  assert.ok(err1 instanceof SCQError, `expected an SCQError refusal, got: ${String(err1)}`);
+  assert.equal(codeOf(err1), "INVALID_PROPOSAL", "scope validation precedes the capability gate — the composed attack dies on the invalid scope");
+  assert.equal(mock.updateDispatches.length, 0, "zero mutating requests were dispatched");
+
+  // Downgrade forgery: the record's scope field claims OPERATION
+  // while the stored proposal declares TARGET_REPLACEMENT. The
+  // declaration is never silently downgraded — the commit refuses
+  // under the TARGET_REPLACEMENT branch.
+  const q2 = await adapter.createChangeQuote(SUB, PROPOSAL(22));
+  const t2 = store.get(q2.id) as any;
+  t2.authorization_scope = "OPERATION";
+  t2.proposal = { ...t2.proposal, authorizationScope: "TARGET_REPLACEMENT" };
+  store.put(t2);
+  const err2 = await expectPreservationRefusal(() => adapter.commitChangeQuote(q2.id));
+  assert.equal(detailsOf(err2)?.authorizationScope, "TARGET_REPLACEMENT", "the refusal reports the declared scope it refused — the record field cannot downgrade it");
+  assert.equal(mock.updateDispatches.length, 0, "zero mutating requests were dispatched");
+});

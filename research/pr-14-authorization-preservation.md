@@ -37,11 +37,13 @@ this PR (see §5).
 
 **Mutation capability (declared by the adapter, never by the caller).**
 `MutationCapability = "CONDITIONAL_WRITE" | "TARGETED_UPDATE" | "FULL_REPLACEMENT_ONLY"`.
-The Chargebee-live adapter declares a code-level property,
-`readonly mutationCapability = "FULL_REPLACEMENT_ONLY"`, grounded in its actual
+The Chargebee-live adapter's capability is declared in a module-private constant,
+`ADAPTER_MUTATION_CAPABILITY = "FULL_REPLACEMENT_ONLY"`, grounded in its actual
 mechanism (sole dispatch = `update_for_items`, always `replace_items_list=true`) and
 in the PR #23 capability assessment (no documented conditional write; no documented
-targeted update for this operation class). The declaration covers the adapter's two
+targeted update for this operation class). (As first delivered this was a
+`readonly` instance field; the review correction in §10 moved it to the
+module-private constant after demonstrating the field was runtime-mutable.) The declaration covers the adapter's two
 update operations, `CHANGE_QUANTITY` and `CHANGE_PLAN`. It does **not** cover a cancel
 path: this adapter has none — `CANCEL` (and `CHANGE_CADENCE`) quotes are refused at
 creation with `UNSUPPORTED_CHANGE` before any provider call, a pre-existing posture
@@ -67,10 +69,13 @@ determinacy and acceptance-envelope checks, and the live-commit-enabled check, a
 **immediately before** the durable write-ahead gate (`beginDurableAttempt`) and any
 mutating HTTP request:
 
-- scope = stored `authorization_scope` ?? proposal scope ?? OPERATION (legacy quotes
-  default to OPERATION);
-- a stored TARGET_REPLACEMENT scope refuses as unsupported (it could only have been
-  crafted outside `createChangeQuote`, which refuses the declaration at creation);
+- the stored scope is validated first (review correction, §10): both places a scope
+  can be declared on the record (stored `authorization_scope`, stored proposal) must
+  hold a recognized value — an unknown value in either refuses as INVALID_PROPOSAL
+  before any gate logic; absent in both defaults to OPERATION (legacy quotes);
+- a TARGET_REPLACEMENT scope declared in either place refuses as unsupported (it
+  could only have been crafted outside `createChangeQuote`, which refuses the
+  declaration at creation) — the record field cannot downgrade it;
 - a recorded capability that is a known value **different** from the adapter's
   declared capability refuses as a mismatch — the adapter's declaration is
   authoritative, so a forged record claiming `CONDITIONAL_WRITE` cannot bypass;
@@ -262,3 +267,124 @@ the P0 defect itself is prevented, and its production regression coverage is tes
 - **Zero live mutation**: no Chargebee live call of any kind was made, no credentials
   were used, `SCQ_LIVE_COMMIT_ENABLED` was never set; every mutation-path test uses
   injected mocked transports. Evidence class: SIMULATED.
+- Review corrections (§10): default suite **630/630** (624 + test47.13–47.18);
+  research suite unchanged (18; 3 pass / 15 fail); the correction commits touch no
+  gated file (types.ts needed no change — `INVALID_PROPOSAL` already existed).
+
+## 10. Review corrections — runtime integrity of the gate
+
+Independent review of the first delivered head found the gate's safety correction
+sound but identified two runtime-integrity holes in its implementation. Both are
+fixed on this branch; the regressions are test47.13–47.18, written failing-first
+against the pre-correction head.
+
+### Finding 1 — the capability declaration was runtime-mutable (blocking)
+
+As delivered, the capability was `readonly mutationCapability =
+"FULL_REPLACEMENT_ONLY"` on the adapter class. `readonly` is a compile-time
+annotation only: at JavaScript runtime the field is an ordinary writable property.
+A caller holding the adapter instance could assign
+`(adapter as any).mutationCapability = "TARGETED_UPDATE"` **before** quote creation;
+the quote then recorded the false capability, quote and commit agreed on the lie,
+and the commit dispatched the full-list replacement.
+
+**Failing-first record (pre-correction head).** test47.13 failed at the read-back
+assertion (the assignment silently took effect; the property read
+`"TARGETED_UPDATE"`). An end-to-end probe of the same scenario (mocked transport,
+not part of the suite) showed the complete bypass: the quote recorded
+`TARGETED_UPDATE`, the commit dispatched `update_for_items` once, and the receipt
+returned was `COMMITTED_AND_VERIFIED`. test47.14 (assign after creation) refused,
+but only via the capability-*mismatch* branch, and the refusal reported the mutated
+value as the adapter's capability (`details.mutationCapability =
+"TARGETED_UPDATE"`). test47.15 failed because the quote recorded the
+`Object.defineProperty`-installed value.
+
+**Fix — private, immutable mechanism declaration.** The capability now lives in a
+module-private constant, `ADAPTER_MUTATION_CAPABILITY`, in the adapter module. The
+module constant was chosen over an ECMAScript `#private` field deliberately: the
+capability is a fact about the adapter's single dispatch **mechanism** — code in
+this module — not per-instance state. A `#private` field would still model it as
+instance state (initialized per construction, in principle variable per instance),
+inviting exactly the configuration drift the finding warns about; the module
+constant is shared by all instances because the mechanism is, and it is unreachable
+from outside the module — not exported, not on the prototype, not on any instance —
+so there is no reference a caller can obtain and mutate. The gate, quote creation,
+preflight derivation, rehearsal, and pilot paths were audited: the only consumers
+of the capability were inside the adapter itself, and every one now reads the
+constant (a full-tree grep confirms no remaining `this.mutationCapability` read).
+The public property remains as a **getter over the constant** for disclosure:
+assignment to it throws a `TypeError` in strict mode (verified — the pre-correction
+attack probe now dies at the assignment line), and an `Object.defineProperty`
+shadow on a single instance is inert because nothing security-relevant reads the
+instance property (test47.15 installs the shadow, asserts it is really there, and
+shows quote and gate ignoring it).
+
+### Finding 2 — invalid authorization scopes were accepted (blocking)
+
+As delivered, quote creation refused only the exact string `"TARGET_REPLACEMENT"`.
+Any other unknown runtime value — `"UNRESTRICTED"`, a wrong-case string, an empty
+string, a number, an object — was accepted and recorded verbatim. At commit, the
+stored scope was never validated: the gate's derivation
+(`authorization_scope ?? proposal.authorizationScope ?? "OPERATION"`) passed the
+bogus value through, and it was refused only incidentally, because the capability
+branch fires for every scope — not because the scope was ever checked. Composed
+with Finding 1 (or with any future permitting capability), a non-OPERATION scope
+slips past the scope logic entirely: it is "not TARGET_REPLACEMENT", and nothing
+else examines it.
+
+**Failing-first record (pre-correction head).** test47.16 failed with "Missing
+expected rejection" on the first case: `"UNRESTRICTED"` created and stored a quote
+with no refusal (probe: the returned quote carried `authorizationScope:
+"UNRESTRICTED"` verbatim). test47.17 (stored record seeded with `"UNRESTRICTED"`)
+refused at commit under `AUTHORIZATION_PRESERVATION_UNENFORCEABLE` — the
+incidental capability-branch refusal — not as invalid input. test47.18's composed
+case likewise refused via the mismatch branch under the preservation code; the
+probe in the review's ordering (mutate the instance first, then create a quote
+declaring `"UNRESTRICTED"`) **dispatched and returned COMMITTED_AND_VERIFIED**.
+
+**Fix — explicit runtime validation, both ends.**
+
+- *Quote creation* (`validateScopeDeclarationAtCreation`, at the position the
+  TARGET_REPLACEMENT check occupied — after the proposal shape/action checks,
+  before any provider call): absent (undefined/null) ⇒ OPERATION; `"OPERATION"` ⇒
+  accepted; `"TARGET_REPLACEMENT"` ⇒ refused `UNSUPPORTED_CHANGE` (unchanged);
+  **any other value ⇒ refused `INVALID_PROPOSAL`**, no quote stored, no provider
+  call made. Only the validated result is recorded.
+- *Commit* (first step inside the gate block, before the TARGET_REPLACEMENT /
+  capability logic): the stored record's scope is validated from **both**
+  declaration sites — the `authorization_scope` field and the stored proposal. An
+  unknown value in either refuses as `INVALID_PROPOSAL` with
+  `CONFIRMED_NON_EXECUTION` recorded (never INDETERMINATE; zero dispatches; no
+  receipt; no durable attempt). Only a validated scope reaches the capability gate,
+  and a `TARGET_REPLACEMENT` in either site is effective — the record field cannot
+  silently downgrade a proposal that declared it. Placement preserves the existing
+  precedence exactly: replay, the INDETERMINATE guard, expiry/fingerprint
+  (QUOTE_STALE/QUOTE_EXPIRED), determinacy, envelope (QUOTE_DRIFTED), and
+  LIVE_COMMIT_DISABLED all still refuse first, and none of them consults the scope,
+  so validating here cannot weaken them — while no gate decision is ever made on an
+  unvalidated scope.
+
+**Error-code choice.** `INVALID_PROPOSAL` is the codebase's invalid-caller-input
+refusal at quote creation (every adapter throws it for malformed proposals; this
+adapter already threw it for an empty change list and an unknown item). A scope
+value outside the recognized set is malformed proposal input at creation, and the
+same defect on the stored record at commit. `UNSUPPORTED_CHANGE` was not used: it
+means "recognized but not implemented", which is exactly TARGET_REPLACEMENT's
+classification and is preserved for it. No new error-code variant was needed, so
+the corrections change no gated file (`INVALID_PROPOSAL` already exists in
+types.ts; `scq-engine.ts` untouched).
+
+**Simulator scope note (not hidden, not expanded).** The four simulator adapters
+and the core engine never read `authorizationScope` at all (verified by grep): the
+field is inert on those paths — a bogus scope there is neither honored nor refused,
+because no simulator has a scope gate. Runtime validation of proposal fields in
+general is Issue #22's Finding 2 (F2) territory, sequenced for the follow-up
+runtime-validation PR; this correction deliberately does not expand into it. If
+scope semantics are ever extended to the simulators, they need the same validation
+— today a caller can pass a bogus scope to a simulator adapter with no refusal.
+
+**After the corrections.** test47 is 18/18 (47.13–47.18 green; 47.1–47.12
+unchanged and green); default suite 630/630; research suite unchanged (18; 3
+pass / 15 fail — repro43 still fails with the gate refusal itself, as in §7); the
+composed attack refuses as INVALID_PROPOSAL with zero dispatches (test47.18), and
+the pre-correction end-to-end bypass no longer reproduces.

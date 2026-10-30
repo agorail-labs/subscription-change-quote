@@ -304,6 +304,86 @@ import { ChargebeeClient, ChargebeeHttpError } from "./chargebee-http.js";
 const QUOTE_TTL_MS = 5 * 60 * 1000;
 
 /**
+ * PR-14 (Issue #22, Finding 1): this adapter's mutation capability
+ * for its update operations, declared from its ACTUAL dispatch
+ * mechanism. The only mutating call this adapter makes is
+ * `update_for_items`, and `buildChargebeeUpdateParams` always
+ * sends `replace_items_list=true` with the quote-time item list:
+ * the dispatch REPLACES the subscription's item list wholesale.
+ * Chargebee's documented surface offers no conditional write (no
+ * compare-and-swap precondition — `resource_version` is an
+ * output-only timestamp) and no targeted item update for this
+ * operation class (PR #23 capability assessment,
+ * research/issue-22/CHARGEBEE-CAPABILITY-ASSESSMENT.md), so the
+ * capability is FULL_REPLACEMENT_ONLY. This declaration is
+ * authoritative at commit time: a quote record claiming a
+ * stronger capability is never consulted as authority.
+ *
+ * PR-14 REVIEW CORRECTION (Finding 1): the declaration lives in
+ * this MODULE-PRIVATE constant — not on the adapter instance.
+ * The adapter has exactly one dispatch mechanism (the code in
+ * this module), so the capability is a fact about the code, not
+ * per-instance state. As first delivered it was a `readonly`
+ * instance field, but `readonly` is compile-time only: a caller
+ * holding the instance could assign
+ * `(adapter as any).mutationCapability = "TARGETED_UPDATE"` at
+ * runtime BEFORE quote creation, after which the quote recorded
+ * the false capability, quote and commit agreed on the lie, and
+ * the gate was bypassed while the adapter still dispatched the
+ * full-list replacement (verified end-to-end on the pre-correction
+ * head: the commit dispatched and returned a
+ * COMMITTED_AND_VERIFIED receipt). The gate, quote creation, and
+ * every other consumer read ONLY this constant. The class's
+ * public `mutationCapability` is a getter over the constant —
+ * assignment to it throws in strict mode, and an own-property
+ * shadow installed via Object.defineProperty is inert because no
+ * security-relevant path reads the instance property
+ * (regressions: test47.13–47.15).
+ */
+const ADAPTER_MUTATION_CAPABILITY: MutationCapability = "FULL_REPLACEMENT_ONLY";
+
+/** Renders an arbitrary runtime scope value for an error message, safely. */
+function scopeValueForMessage(raw: unknown): string {
+  if (typeof raw === "string") return JSON.stringify(raw);
+  try {
+    return JSON.stringify(raw) ?? String(raw);
+  } catch {
+    return String(raw);
+  }
+}
+
+/**
+ * PR-14 REVIEW CORRECTION (Finding 2): runtime validation of a
+ * proposal's authorization-scope declaration at quote creation.
+ * TypeScript types do not exist at runtime: as first delivered,
+ * only the exact string "TARGET_REPLACEMENT" was refused, and any
+ * other unknown value ("UNRESTRICTED", a wrong-case string, a
+ * number, an object) was accepted and recorded verbatim. The
+ * rules now, exhaustively:
+ *   - absent (undefined/null)  => OPERATION (the default);
+ *   - "OPERATION"              => accepted;
+ *   - "TARGET_REPLACEMENT"     => refused as UNSUPPORTED_CHANGE
+ *     (pre-existing behavior: the declaration is unsupported in
+ *     this version — never honored, never silently downgraded);
+ *   - ANY other value          => refused as INVALID_PROPOSAL,
+ *     the codebase's invalid-caller-input refusal at quote
+ *     creation (the same code this adapter throws for a malformed
+ *     proposal). No quote is stored and no provider call is made.
+ * The commit path applies the same recognition rules to the
+ * STORED record before any gate logic (see the gate below).
+ */
+function validateScopeDeclarationAtCreation(raw: unknown): AuthorizationScope {
+  if (raw === undefined || raw === null) return "OPERATION";
+  if (raw === "TARGET_REPLACEMENT") {
+    throw new SCQError("UNSUPPORTED_CHANGE", "TARGET_REPLACEMENT authorization is not supported: no adapter in this build gives wholesale target-state replacement reviewed authorization semantics, and the declaration is never silently downgraded to OPERATION. Refused before any provider call.", { authorizationScope: raw });
+  }
+  if (raw !== "OPERATION") {
+    throw new SCQError("INVALID_PROPOSAL", `authorizationScope ${scopeValueForMessage(raw)} is not a recognized authorization scope. A proposal may declare OPERATION (or omit the field, which defaults to OPERATION); TARGET_REPLACEMENT is refused as unsupported, and any other value is invalid input. Refused before any provider call; no quote is stored.`, { authorizationScope: raw });
+  }
+  return "OPERATION";
+}
+
+/**
  * PR-7 review correction L3: the ONLY Chargebee api_error_codes for
  * which an HTTP 400 on the mutating call establishes
  * CONFIRMED_NON_EXECUTION. HTTP status 400 alone is NOT evidence of
@@ -898,22 +978,18 @@ export function buildChargebeeUpdateParams(items: Array<{ itemPriceId: string; q
 
 export class ChargebeeLiveAdapter implements SubscriptionProvider {
   /**
-   * PR-14 (Issue #22, Finding 1): this adapter's mutation capability
-   * for its update operations, declared from its ACTUAL dispatch
-   * mechanism. The only mutating call this adapter makes is
-   * `update_for_items`, and `buildChargebeeUpdateParams` always
-   * sends `replace_items_list=true` with the quote-time item list:
-   * the dispatch REPLACES the subscription's item list wholesale.
-   * Chargebee's documented surface offers no conditional write (no
-   * compare-and-swap precondition — `resource_version` is an
-   * output-only timestamp) and no targeted item update for this
-   * operation class (PR #23 capability assessment,
-   * research/issue-22/CHARGEBEE-CAPABILITY-ASSESSMENT.md), so the
-   * capability is FULL_REPLACEMENT_ONLY. This declaration is
-   * authoritative at commit time: a quote record claiming a
-   * stronger capability is never consulted as authority.
+   * Read-only disclosure view of this adapter's declared mutation
+   * capability — a getter over the module-private
+   * ADAPTER_MUTATION_CAPABILITY constant. Assignment throws in
+   * strict mode; more importantly, NO security-relevant path
+   * reads this property: the gate and quote creation read the
+   * constant directly, so neither an assignment nor an
+   * Object.defineProperty shadow on an instance can influence
+   * them (PR-14 review correction, Finding 1; test47.13–47.15).
    */
-  readonly mutationCapability: MutationCapability = "FULL_REPLACEMENT_ONLY";
+  get mutationCapability(): MutationCapability {
+    return ADAPTER_MUTATION_CAPABILITY;
+  }
 
   private now: () => Date;
   constructor(
@@ -993,9 +1069,12 @@ export class ChargebeeLiveAdapter implements SubscriptionProvider {
     // here, before any provider call: never honored, never silently
     // downgraded to OPERATION. OPERATION (declared or defaulted) is
     // the only scope a quote can be created under.
-    if (proposal.authorizationScope === "TARGET_REPLACEMENT") {
-      throw new SCQError("UNSUPPORTED_CHANGE", "TARGET_REPLACEMENT authorization is not supported: no adapter in this build gives wholesale target-state replacement reviewed authorization semantics, and the declaration is never silently downgraded to OPERATION. Refused before any provider call.", { authorizationScope: proposal.authorizationScope });
-    }
+    // PR-14 REVIEW CORRECTION (Finding 2): the declaration is
+    // validated at RUNTIME, exhaustively — an unknown value
+    // ("UNRESTRICTED", wrong case, non-string) is invalid input
+    // (INVALID_PROPOSAL), not a scope this adapter happens not to
+    // check for. Only the validated result is recorded below.
+    const authorizationScope = validateScopeDeclarationAtCreation(proposal.authorizationScope);
     // Refuse unsupported effective intents BEFORE any provider call at all
     // (stronger than the spec's "before preview/mutation" floor).
     enforceEffectiveIntent(proposal.effectiveIntent, ["IMMEDIATE"]);
@@ -1078,12 +1157,15 @@ export class ChargebeeLiveAdapter implements SubscriptionProvider {
       effective_guarantee_mode: effectiveMode,
       guarantee_coverage: { ...COVERAGE },
       multi_change_consistency: "ATOMIC",
-      // PR-14: record the effective authorization scope (OPERATION
-      // unless the proposal declared it — TARGET_REPLACEMENT was
-      // refused above) and THIS ADAPTER's declared mutation
-      // capability on every quote, at creation.
-      authorization_scope: proposal.authorizationScope ?? "OPERATION",
-      authorization_capability: this.mutationCapability,
+      // PR-14: record the effective authorization scope (the
+      // validated declaration — OPERATION is the only scope a
+      // quote can be created under in this version) and THIS
+      // ADAPTER's declared mutation capability on every quote, at
+      // creation. The capability is read from the module-private
+      // mechanism declaration, never from the instance (PR-14
+      // review correction, Finding 1).
+      authorization_scope: authorizationScope,
+      authorization_capability: ADAPTER_MUTATION_CAPABILITY,
       provider_preview_input: { items: targetItems, idempotencyKey: `scq-${quoteId}`.slice(0, 100) },
       quoted_effect: commercialEffect,
       created_at: this.now().toISOString(),
@@ -1103,8 +1185,8 @@ export class ChargebeeLiveAdapter implements SubscriptionProvider {
       validUntil: expiresAt,
       // PR-14: the recorded scope + capability ride on the quote
       // itself, so the commit consequence is disclosed at creation.
-      authorizationScope: proposal.authorizationScope ?? "OPERATION",
-      mutationCapability: this.mutationCapability,
+      authorizationScope,
+      mutationCapability: ADAPTER_MUTATION_CAPABILITY,
       providerMetadata: {
         source: "chargebee-live-experimental",
         // PR-14 disclosure: quotes remain useful read-only artifacts
@@ -1112,8 +1194,8 @@ export class ChargebeeLiveAdapter implements SubscriptionProvider {
         // commit on this FULL_REPLACEMENT_ONLY capability will be
         // REFUSED at commit — preservation of unrelated state cannot
         // be enforced by a non-atomic full-list replacement.
-        authorizationScope: proposal.authorizationScope ?? "OPERATION",
-        mutationCapability: this.mutationCapability,
+        authorizationScope,
+        mutationCapability: ADAPTER_MUTATION_CAPABILITY,
         authorizationPreservation: "This adapter's update dispatch replaces the subscription's item list wholesale (replace_items_list=true). OPERATION-authorized update commits are REFUSED at commit time (AUTHORIZATION_PRESERVATION_UNENFORCEABLE): the replacement cannot atomically preserve unrelated items or quantities that change after the quote, and no documented conditional write or targeted update exists for this operation class.",
         resourceVersion: sub.resource_version ?? null,
         hasScheduledChanges: sub.has_scheduled_changes ?? false,
@@ -1233,8 +1315,45 @@ export class ChargebeeLiveAdapter implements SubscriptionProvider {
     // cannot bypass the gate — a mismatch refuses. An absent scope
     // (legacy quote) reads OPERATION; an absent or unknown recorded
     // capability classifies as the weakest.
+    //
+    // PR-14 REVIEW CORRECTIONS: (Finding 1) the capability compared
+    // and enforced here is the module-private
+    // ADAPTER_MUTATION_CAPABILITY constant — never the instance
+    // property, which a caller could previously overwrite at
+    // runtime. (Finding 2) the STORED scope is validated FIRST,
+    // before any gate logic: scope can be declared in two places on
+    // the record (the creation-time `authorization_scope` field and
+    // the stored proposal), and BOTH are validated — an unknown
+    // value in either refuses as INVALID_PROPOSAL, so a bogus scope
+    // is never waved through as merely "not OPERATION, therefore
+    // ungated", and its refusal never depended on the capability
+    // comparison happening to fire. Validation sits at the head of
+    // this block: the earlier refusals (expiry, fingerprint,
+    // determinacy, envelope, live-commit-enabled) keep their
+    // precedence because none of them consults the scope, and no
+    // gate decision below is ever made on an unvalidated scope. A
+    // TARGET_REPLACEMENT declaration in EITHER place is effective:
+    // the record field cannot silently downgrade a proposal that
+    // declared it.
     {
-      const scope: AuthorizationScope = validated.authorization_scope ?? validated.proposal.authorizationScope ?? "OPERATION";
+      const declaredScopes: unknown[] = [validated.authorization_scope, validated.proposal.authorizationScope];
+      const refuseInvalidScope = (value: unknown): never => {
+        this.store.recordCommitOutcome(quoteId, {
+          outcome: "CONFIRMED_NON_EXECUTION",
+          at: this.now().toISOString(),
+          details: { blocked: "INVALID_AUTHORIZATION_SCOPE", authorizationScope: value ?? null, reason: "the stored quote carries an authorization scope value that is not recognized in this version; the record is invalid input, refused before dispatch" },
+        });
+        throw new SCQError(
+          "INVALID_PROPOSAL",
+          `Commit refused before dispatch: the stored quote carries authorization scope ${scopeValueForMessage(value)}, which is not a recognized authorization scope. Only OPERATION (the default when no scope is declared) can proceed to the authorization-preservation gate; TARGET_REPLACEMENT is refused as unsupported. An unknown scope value is invalid input — it is never treated as a broader authorization and never as an ungated commit. No mutating request was dispatched and no durable dispatch attempt was created.`,
+          { outcome: "CONFIRMED_NON_EXECUTION", blocked: "INVALID_AUTHORIZATION_SCOPE", authorizationScope: value ?? null },
+        );
+      };
+      for (const declared of declaredScopes) {
+        if (declared === undefined || declared === null) continue;
+        if (declared !== "OPERATION" && declared !== "TARGET_REPLACEMENT") refuseInvalidScope(declared);
+      }
+      const scope: AuthorizationScope = declaredScopes.includes("TARGET_REPLACEMENT") ? "TARGET_REPLACEMENT" : "OPERATION";
       const recordedCapability = validated.authorization_capability;
       const knownCapability = recordedCapability === "CONDITIONAL_WRITE" || recordedCapability === "TARGETED_UPDATE" || recordedCapability === "FULL_REPLACEMENT_ONLY"
         ? recordedCapability
@@ -1243,12 +1362,12 @@ export class ChargebeeLiveAdapter implements SubscriptionProvider {
         this.store.recordCommitOutcome(quoteId, {
           outcome: "CONFIRMED_NON_EXECUTION",
           at: this.now().toISOString(),
-          details: { blocked: "AUTHORIZATION_PRESERVATION_UNENFORCEABLE", authorizationScope: scope, mutationCapability: this.mutationCapability, recordedCapability: recordedCapability ?? null, reason },
+          details: { blocked: "AUTHORIZATION_PRESERVATION_UNENFORCEABLE", authorizationScope: scope, mutationCapability: ADAPTER_MUTATION_CAPABILITY, recordedCapability: recordedCapability ?? null, reason },
         });
         throw new SCQError(
           "AUTHORIZATION_PRESERVATION_UNENFORCEABLE",
-          `Commit refused before dispatch: this quote is ${scope}-authorized, but the adapter's update dispatch is a full-list replacement (replace_items_list=true) on a ${this.mutationCapability} capability, which cannot atomically preserve unrelated subscription state that changes after validation. ${reason} No mutating request was dispatched and no durable dispatch attempt was created. An OPERATION-authorized commit requires a documented conditional write or a documented targeted update for this operation class.`,
-          { outcome: "CONFIRMED_NON_EXECUTION", blocked: "AUTHORIZATION_PRESERVATION_UNENFORCEABLE", authorizationScope: scope, mutationCapability: this.mutationCapability, recordedCapability: recordedCapability ?? null },
+          `Commit refused before dispatch: this quote is ${scope}-authorized, but the adapter's update dispatch is a full-list replacement (replace_items_list=true) on a ${ADAPTER_MUTATION_CAPABILITY} capability, which cannot atomically preserve unrelated subscription state that changes after validation. ${reason} No mutating request was dispatched and no durable dispatch attempt was created. An OPERATION-authorized commit requires a documented conditional write or a documented targeted update for this operation class.`,
+          { outcome: "CONFIRMED_NON_EXECUTION", blocked: "AUTHORIZATION_PRESERVATION_UNENFORCEABLE", authorizationScope: scope, mutationCapability: ADAPTER_MUTATION_CAPABILITY, recordedCapability: recordedCapability ?? null },
         );
       };
       if (scope === "TARGET_REPLACEMENT") {
@@ -1258,14 +1377,14 @@ export class ChargebeeLiveAdapter implements SubscriptionProvider {
         // never honored, never downgraded.
         refusePreservation("The stored quote declares TARGET_REPLACEMENT authorization, which is unsupported in this build.");
       }
-      if (knownCapability !== undefined && knownCapability !== this.mutationCapability) {
+      if (knownCapability !== undefined && knownCapability !== ADAPTER_MUTATION_CAPABILITY) {
         // The record disagrees with the adapter's authoritative
         // declaration. The adapter's capability governs: refuse
         // rather than honor a capability the dispatch does not have
         // (a forged CONDITIONAL_WRITE claim lands here).
-        refusePreservation(`The quote record claims mutation capability ${knownCapability}, which does not match the adapter's declared capability ${this.mutationCapability}; the adapter's declaration is authoritative and the recorded claim is not honored.`);
+        refusePreservation(`The quote record claims mutation capability ${knownCapability}, which does not match the adapter's declared capability ${ADAPTER_MUTATION_CAPABILITY}; the adapter's declaration is authoritative and the recorded claim is not honored.`);
       }
-      if (this.mutationCapability === "FULL_REPLACEMENT_ONLY") {
+      if (ADAPTER_MUTATION_CAPABILITY === "FULL_REPLACEMENT_ONLY") {
         refusePreservation("Dispatching would replace the subscription's item list with the quote-time list, deleting any unrelated item or quantity change that landed after the quote.");
       }
     }
