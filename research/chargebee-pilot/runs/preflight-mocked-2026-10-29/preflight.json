@@ -1,6 +1,6 @@
 {
   "kind": "scq-chargebee-exact-commit-preflight",
-  "generatedAt": "2026-10-30T06:40:51.127Z",
+  "generatedAt": "2026-10-30T14:58:51.019Z",
   "refused": false,
   "refusalReasons": [],
   "identity": {
@@ -11,10 +11,10 @@
     "tenantModeEstablished": "UNVERIFIED",
     "subscriptionId": "pilot-sub-001",
     "syntheticFixtureDesignation": true,
-    "quoteId": "scq_cblive_0a1897ea749a9b68",
+    "quoteId": "scq_cblive_4cb2bdb77b26ab23",
     "quoteStatus": "ACTIVE",
-    "quoteCreatedAt": "2026-10-30T06:40:51.125Z",
-    "quoteExpiresAt": "2026-10-30T06:45:51.125Z",
+    "quoteCreatedAt": "2026-10-30T14:58:51.016Z",
+    "quoteExpiresAt": "2026-10-30T15:03:51.016Z",
     "storedFingerprint": "rv:1700000000000",
     "currentResourceVersion": 1700000000000,
     "currentFingerprint": "rv:1700000000000",
@@ -59,7 +59,7 @@
     "prorate": true,
     "invoiceImmediately": false,
     "changeOption": "immediately",
-    "idempotencyKey": "scq-scq_cblive_0a1897ea749a9b68",
+    "idempotencyKey": "scq-scq_cblive_4cb2bdb77b26ab23",
     "requestHash": "ae8a7bec519c1f95f61b443e290d02957d9c16a20b126eeada4adfa1821bef81",
     "storedPreviewInput": {
       "items": [
@@ -72,12 +72,13 @@
           "quantity": 21
         }
       ],
-      "idempotencyKey": "scq-scq_cblive_0a1897ea749a9b68"
+      "idempotencyKey": "scq-scq_cblive_4cb2bdb77b26ab23"
     },
     "matchesStoredPreviewInput": true,
     "matchesStoredAttempts": null
   },
   "providerState": {
+    "subscriptionId": "pilot-sub-001",
     "subscriptionStatus": "active",
     "items": [
       {
@@ -158,8 +159,11 @@
   "durableReadiness": {
     "quoteExistsDurably": true,
     "providerMatch": true,
-    "subscriptionMatch": null,
-    "siteBindingOk": null,
+    "subscriptionMatch": true,
+    "siteBindingOk": true,
+    "originBinding": "ESTABLISHED",
+    "originSite": "pilot-test",
+    "originSubscriptionId": "pilot-sub-001",
     "requestCoherence": true,
     "unresolvedAttempts": [],
     "recordedReceiptPresent": false,
@@ -196,9 +200,14 @@
       "detail": "stored provider binding is chargebee"
     },
     {
+      "id": "quote_origin_binding",
+      "status": "pass",
+      "detail": "quote origin is established by its issuance record: issued against site \"pilot-test\" for subscription \"pilot-sub-001\", digest-bound to the stored quote — the same site identity binds this run's request, re-read, and ledger"
+    },
+    {
       "id": "quote_not_expired",
       "status": "pass",
-      "detail": "quote expires at 2026-10-30T06:45:51.125Z"
+      "detail": "quote expires at 2026-10-30T15:03:51.016Z"
     },
     {
       "id": "synthetic_designation",
@@ -216,9 +225,9 @@
       "detail": "the stored idempotency key is the original adapter-derived key for this quote; it is reported, never regenerated"
     },
     {
-      "id": "request_matches_proposal",
+      "id": "provider_subscription_identity",
       "status": "pass",
-      "detail": "the stored target item set is exactly what the recorded proposal authorizes"
+      "detail": "the provider re-read returned the bound subscription \"pilot-sub-001\""
     },
     {
       "id": "fingerprint_stable",
@@ -229,6 +238,11 @@
       "id": "item_set_complete",
       "status": "pass",
       "detail": "the full current item collection was read with id, quantity, and amount for every entry"
+    },
+    {
+      "id": "request_matches_proposal",
+      "status": "pass",
+      "detail": "the stored dispatch target is exactly the full resulting item multiset the recorded proposal authorizes over the independently re-read current item set (every item's id and quantity compared, not just the changed item)"
     },
     {
       "id": "target_covers_current_items",
@@ -275,12 +289,12 @@
     "updateForItemsDispatched": 0
   },
   "evidence": {
-    "transportOrigin": "mocked",
+    "transportOrigin": "injected",
     "capabilities": [
       {
         "capability": "exact-commit preflight evidence (this run)",
         "result": "SIMULATED_PASS",
-        "detail": "mocked transport: this evidence validates procedure and code paths, never live provider behavior"
+        "detail": "caller-supplied (injected) transport: this evidence validates procedure and code paths, never live provider behavior — provenance is structural and cannot be upgraded by a caller-supplied label"
       },
       {
         "capability": "zero observed mutations",
@@ -308,8 +322,8 @@
       "condition": 3,
       "name": "Executed preflight for the exact commit (this report)",
       "status": "UNVERIFIED",
-      "evidence": "this report was produced over a mocked transport",
-      "reason": "no real-tenant preflight evidence exists: mocked/injected runs validate the procedure, not the actual commit against the actual tenant"
+      "evidence": "this report was produced over a caller-supplied (injected) transport",
+      "reason": "Condition 3 is not met — the transport was caller-supplied (injected/simulated evidence): only the preflight's own internally constructed guarded real-network transport produces real-tenant evidence, and no caller-supplied label changes that; operator attestation of actual test-tenant ownership/mode was not supplied (tenant mode UNVERIFIED)"
     },
     {
       "condition": 4,

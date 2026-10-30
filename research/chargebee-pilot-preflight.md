@@ -289,3 +289,141 @@ expectation was changed; rh-07/test38.8 now pin the doctrine).
 Until all four exist, the controlled test-site commit remains
 NO-GO, and nothing in this PR performs, schedules, or simulates
 authorization for one.
+
+## 10. PR #20 review corrections — PF1–PF3 (2026-10-30)
+
+The independent review of the delivered PR (`d13767c`) found three
+material gaps in the preflight's evidence and authorization
+checks. All three are corrected on this branch; the readiness
+conclusion is unchanged (NO-GO), and Condition 3 is now HARDER to
+pass, not easier. Where this section contradicts §2 or §6, this
+section governs.
+
+**PF1 (critical) — simulated evidence could be mislabeled as
+live.** `PreflightInput` took a caller-supplied transport AND a
+caller-asserted `transportOrigin: "real"`; `runPreflight` passed
+the string through and set Condition 3 = PASS whenever it read
+`"real"` with no blockers. A mocked transport labeled `"real"`
+produced LIVE_PASS and a real-tenant preflight PASS, and Condition
+3 never required operator attestation. **Correction — provenance
+is structural now.** The origin input is REMOVED. A caller-supplied
+transport is always classified `injected` (simulated evidence,
+capped at SIMULATED_PASS); the only LIVE-eligible source is the
+preflight module's own internally constructed guarded real-network
+transport, obtained from `createRealPreflightTransport()` and
+carrying a module-private brand symbol a caller cannot forge (a
+caller-assembled handle is refused outright). This mirrors the
+pilot harness's internally constructed network path (run-pilot).
+Condition 3 PASS additionally requires: `operatorAttestation.
+testTenantAttested`, an ESTABLISHED quote-origin binding (PF3), a
+completed re-read whose provider subscription identity was
+verified, no refusal, and zero blockers — with every unmet
+requirement named in the condition's reason.
+
+**PF2 (critical) — "exact request" validation checked only the
+changed item.** `request_matches_proposal` asserted the one changed
+item's quantity against the proposal; other items' quantities,
+extras, duplicates, and omissions went unchecked (counterexample:
+stored target keeps addon 21 but moves the flat-fee plan quantity
+1→2 — every pre-correction check, including the fresh estimate,
+passed while the exact request would change a second, unauthorized
+item). **Correction — full resulting-multiset validation.** The
+check now runs AFTER the independent re-read: the authorized
+resulting set is reconstructed by applying the recorded proposal
+to the re-read's CURRENT item set (mirroring the adapter's target
+construction; the baseline is the independent read, NEVER the
+possibly tainted preview input) and compared as a multiset of
+(itemPriceId, quantity) tuples against the stored dispatch target.
+Any divergence — non-target quantity change, extra entry,
+duplicate, omission — blocks, with per-item divergences named.
+Multi-change proposals and actions outside CHANGE_QUANTITY /
+CHANGE_PLAN block as unsupported. Until the validation runs
+(refused runs, failed re-reads, incomplete baselines), coherence is
+reported NOT established — it cannot default to PASS. The shared
+builder / form / `requestHashOf` semantics are unchanged.
+
+**PF3 (high) — original site binding was unproven.**
+`siteBindingOk` / `subscriptionMatch` stayed null unless optional
+`expectedSite` / `expectedSubscriptionId` were supplied (the normal
+CLI supplied neither): zero blockers beside two nulls, and in any
+case agreement between two caller inputs is not evidence the quote
+ORIGINATED on that site. **Correction — issuance-captured origin
+manifest.** New pilot-layer module `quote-origin.ts`: an
+append-only JSONL manifest whose records are written at quote
+issuance (by the issuance path, with the site from that run's
+configuration), keyed by quote id and carrying the ledger-canonical
+digest (`requestHashOf`) of the stored quote's issuance-stable
+fields. The preflight derives `siteBindingOk` /
+`subscriptionMatch` from the record — ESTABLISHED only when record
+site = run site, record subscription = stored subscription, and
+the digest still matches the stored quote. No record (MISSING),
+conflicting records, a corrupt manifest, a digest mismatch, or a
+cross-site replay (MISMATCH) all BLOCK. The re-read's returned
+subscription id is also checked against the bound id
+(`provider_subscription_identity`). `expectedSite` /
+`expectedSubscriptionId` remain as consistency inputs only, with
+their evidentiary weight explicitly removed. The normal CLI
+participates: the mocked fixture path records origin at issuance,
+and `--db/--quote` reads `--origin-manifest` (default
+`<db>.origins.jsonl`) — no more null-by-default. The gated core and
+store surfaces are untouched (the manifest is pilot-layer; the
+store is only read). **Subsequent binding work:** a production
+issuance harness must call the manifest's `record` at its own
+quote-creation step with its configured site; until a real
+issuance path does so, real quotes have no origin record and
+Condition 3 stays BLOCKED/UNVERIFIED for them — which is the
+honest state, and this PR does not claim otherwise.
+
+**Failing-first evidence (this round).** test39 + test40 were
+written against the delivered head `d13767c` before any fix.
+test39 (which uses only pre-correction exports, the PF1 attack
+smuggled through a cast in the reviewer's exact shape) ran
+BEHAVIORALLY: **8 fail / 2 pass** — PF1 forgery (39.1), PF1
+attestation-free "real" (39.2), PF2 plan-quantity counterexample
+(39.4), extra item (39.5), duplicate (39.6), omitted item (39.7 —
+the run was already blocked pre-correction by the ID-coverage
+check; the regression is that the coherence check itself must
+judge the full multiset), PF3 null binding (39.9), PF3 provider-id
+mismatch (39.10). The 2 passes are disclosed controls: 39.3 (a
+plainly mocked run already classified SIMULATED_PASS) and 39.8
+(the canonical target already passed the coherence check).
+test40 — the origin-manifest and structural-provenance mechanics —
+failed to compile pre-correction with **12 TypeScript errors, all
+inside test40** (TS2307: `quote-origin.js` did not exist; TS2305:
+`createRealPreflightTransport` was not exported). After the
+corrections: **fresh clean build 591/591** (572 + test39 ×10 +
+test40 ×9); test27–36 and the pilot/rehearsal suites green
+unmodified; smoke/demo/pilot green (pilot: 0 observed mutating
+calls).
+
+**Disclosed test modifications (this round).** test37's fixture
+builder now records the fixture quote's origin at issuance and its
+`preflightInput` passes the manifest (mirroring the corrected CLI),
+and the three inline `runPreflight` inputs that named the removed
+`transportOrigin` property no longer do; **no test37 assertion was
+changed**. test39's fixture received the same issuance-origin
+wiring after its failing-first run was recorded (the
+pre-correction code has no origin concept, so the recorded
+failures are unaffected); its PF3 test withholds the manifest
+explicitly.
+
+**Final Condition 3 semantics.** PASS iff ALL of: structural
+real-network provenance; operator test-tenant attestation
+supplied; quote-origin binding ESTABLISHED; independent re-read
+completed with provider subscription identity verified; not
+refused; zero blockers. Anything less is UNVERIFIED (no blockers)
+or BLOCKED (blockers stand), with the unmet requirements named.
+On all evidence that exists today Condition 3 remains UNVERIFIED
+and the overall assessment remains **NO-GO**.
+
+**Changed in this round:** `src/live/pilot/quote-origin.ts` (new),
+`src/live/pilot/preflight.ts`, `src/live/pilot/run-preflight.ts`,
+`tests/test37-chargebee-preflight.test.ts` (fixture wiring only),
+`tests/test39-chargebee-preflight-pf-regressions.test.ts` (new),
+`tests/test40-chargebee-preflight-origin.test.ts` (new), the
+regenerated sample run under
+`research/chargebee-pilot/runs/preflight-mocked-2026-10-29/`
+(binding now ESTABLISHED from the issuance record; provenance
+reported `injected`), and this note. Frozen-surface diff remains
+empty: no spec, `types.ts`, `scq-engine.ts`, or store-layer file
+changed in this round or this PR.

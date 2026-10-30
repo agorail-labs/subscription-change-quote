@@ -12,10 +12,21 @@
  *   is NO-GO by construction (conditions 1/3/4/5 unresolved).
  * - `--db <path> --quote <id>`: preflights an EXISTING durable quote
  *   record. With `--live`, reads go to the real Chargebee test tenant
- *   through the guarded read-only transport; this requires
- *   CHARGEBEE_SITE + CHARGEBEE_API_KEY in the environment and the
- *   site listed in SCQ_PILOT_APPROVED_TEST_SITES. Without that
- *   configuration the run is BLOCKED (reported, never fabricated).
+ *   through the preflight's own internally constructed guarded
+ *   real-network transport (structural provenance, PF1 — there is no
+ *   caller-asserted origin); this requires CHARGEBEE_SITE +
+ *   CHARGEBEE_API_KEY in the environment and the site listed in
+ *   SCQ_PILOT_APPROVED_TEST_SITES. Without that configuration the
+ *   run is BLOCKED (reported, never fabricated).
+ *
+ * Quote origin (PF3): site/subscription binding is established from
+ * the quote-origin manifest — issuance records written when a quote
+ * was created (see quote-origin.ts). The mocked fixture path below
+ * records the fixture quote's origin at issuance; for an existing
+ * database the manifest is read from `--origin-manifest <path>`
+ * (default `<db>.origins.jsonl`). A quote with no origin record
+ * BLOCKS: the CLI never falls back to asserting the configured site
+ * as the quote's origin.
  *
  * Operator-supplied records are inputs, recorded as supplied:
  * - `--attest-test-tenant`: the operator running this command attests
@@ -36,13 +47,14 @@ import { mkdtempSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
-import { ChargebeeClient, fetchTransport, type HttpTransport } from "../chargebee-http.js";
+import { ChargebeeClient, type HttpTransport } from "../chargebee-http.js";
 import { ChargebeeLiveAdapter } from "../chargebee-scq-adapter.js";
 import { PilotMockChargebee } from "./mock-transport.js";
 import { approvedTestSitesFromEnv } from "./live-guard.js";
+import { QuoteOriginManifest } from "./quote-origin.js";
 import { DurableQuoteStore } from "../../store/durable-store.js";
 import { DurableMutationCoordinator } from "../../store/mutation-coordinator.js";
-import { runPreflight, renderPreflightMarkdown, type PreflightInput } from "./preflight.js";
+import { createRealPreflightTransport, runPreflight, renderPreflightMarkdown, type RealPreflightTransport } from "./preflight.js";
 import { runRehearsal } from "./rehearsal.js";
 
 const SUB = "pilot-sub-001";
@@ -68,11 +80,15 @@ export async function main(argv: string[] = process.argv.slice(2)): Promise<numb
   }
 
   let store: DurableQuoteStore;
-  let transport: HttpTransport;
-  let origin: PreflightInput["transportOrigin"];
+  let transport: HttpTransport | undefined;
+  let realTransport: RealPreflightTransport | undefined;
+  let originManifest: QuoteOriginManifest;
   let site: string;
   let quoteId: string;
   let apiKey: string | undefined;
+
+  const manifestFor = (db: string): QuoteOriginManifest =>
+    QuoteOriginManifest.load(argValue(argv, "--origin-manifest") ?? `${db}.origins.jsonl`);
 
   if (live) {
     site = process.env.CHARGEBEE_SITE ?? "";
@@ -82,20 +98,24 @@ export async function main(argv: string[] = process.argv.slice(2)): Promise<numb
       return 2;
     }
     store = new DurableQuoteStore(dbPath, { recoveryGraceMs: 0 });
-    transport = fetchTransport as HttpTransport;
-    origin = "real";
+    // PF1: the LIVE path uses the preflight module's own internally
+    // constructed guarded network transport — the only construction
+    // whose evidence can be classified as real.
+    realTransport = createRealPreflightTransport();
+    originManifest = manifestFor(dbPath);
     quoteId = quoteIdArg;
   } else {
     site = SITE;
     apiKey = "pilot-mock-key";
     const mock = new PilotMockChargebee();
     transport = mock.transport as HttpTransport;
-    origin = "mocked";
     if (dbPath && quoteIdArg) {
       store = new DurableQuoteStore(dbPath, { recoveryGraceMs: 0 });
+      originManifest = manifestFor(dbPath);
       quoteId = quoteIdArg;
     } else {
-      const path = join(mkdtempSync(join(tmpdir(), "scq-pr11-cli-")), "scq.db");
+      const dir = mkdtempSync(join(tmpdir(), "scq-pr11-cli-"));
+      const path = join(dir, "scq.db");
       store = new DurableQuoteStore(path, { recoveryGraceMs: 0 });
       const client = new ChargebeeClient({ site, apiKey }, transport);
       const adapter = new ChargebeeLiveAdapter(client, store, {
@@ -109,7 +129,14 @@ export async function main(argv: string[] = process.argv.slice(2)): Promise<numb
         acceptanceEnvelope: {},
       });
       quoteId = quote.id;
-      console.log(`mocked fixture quote: ${quoteId} (durable db ${path})`);
+      // PF3: origin is recorded AT ISSUANCE, with the site taken
+      // from this run's configuration — the record the preflight
+      // below binds to. (A real issuance harness does the same at
+      // its own quote-creation step; without a record, preflight
+      // blocks.)
+      originManifest = new QuoteOriginManifest(join(dir, "scq.db.origins.jsonl"));
+      originManifest.record({ stored: store.get(quoteId)!, site, recordedBy: "run-preflight mocked issuance (fixture)" });
+      console.log(`mocked fixture quote: ${quoteId} (durable db ${path}; origin recorded in ${originManifest.filePath})`);
     }
   }
 
@@ -119,8 +146,8 @@ export async function main(argv: string[] = process.argv.slice(2)): Promise<numb
   const report = await runPreflight({
     quoteId,
     store,
-    transport,
-    transportOrigin: origin,
+    ...(realTransport ? { realTransport } : { transport }),
+    originManifest,
     site,
     approvedTestSites: live ? approvedTestSitesFromEnv() : [SITE],
     apiKey,

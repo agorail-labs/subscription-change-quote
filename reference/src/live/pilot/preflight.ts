@@ -33,9 +33,31 @@
  *   only record operator-supplied inputs as such. Condition 1
  *   (v0.6.2 release approval) is likewise never inferred from merged
  *   pull requests.
+ *
+ * PR #20 review corrections (PF1–PF3):
+ * - PF1: transport provenance is STRUCTURAL, never caller-asserted.
+ *   There is no origin input. A caller-supplied transport is always
+ *   "injected" (simulated evidence); the only LIVE-eligible
+ *   transport is the one this module constructs itself around the
+ *   real network transport (`createRealPreflightTransport`), whose
+ *   handle carries a module-private brand a caller cannot forge.
+ *   Condition 3 additionally requires actual operator attestation of
+ *   test-tenant ownership/mode and verified provider identity.
+ * - PF2: the exact-request check validates the FULL resulting
+ *   (itemPriceId, quantity) multiset: the authorized proposal
+ *   applied to the INDEPENDENTLY re-read current item set, compared
+ *   tuple-for-tuple against the stored dispatch target. Checking
+ *   only the changed item let an unauthorized change to any other
+ *   item pass undetected.
+ * - PF3: site/subscription binding rests on the quote-origin
+ *   manifest (see quote-origin.ts) — a record captured at issuance,
+ *   keyed by quote id + the ledger-canonical digest of the stored
+ *   quote. Caller-supplied site/subscription expectations survive
+ *   only as consistency inputs; they are not origin evidence, and
+ *   absence of origin evidence BLOCKS.
  */
 
-import { ChargebeeClient, formEncode, type HttpTransport } from "../chargebee-http.js";
+import { ChargebeeClient, fetchTransport, formEncode, type HttpTransport } from "../chargebee-http.js";
 import {
   buildChargebeeUpdateParams,
   chargebeeEffectWithDeterminacy,
@@ -43,7 +65,8 @@ import {
   interpretChargebeeEstimate,
   type CbSubscription,
 } from "../chargebee-scq-adapter.js";
-import { ChargebeeOperationNotAllowedError, createGuardedLiveTransport, isApprovedTestSite, isSyntheticSubscriptionId, summarizeTransportLog, type TransportLogEntry, type TransportSummary } from "./live-guard.js";
+import { ChargebeeOperationNotAllowedError, createGuardedLiveTransport, isApprovedTestSite, isSyntheticSubscriptionId, observedSuccessfulOps, summarizeTransportLog, type TransportLogEntry, type TransportSummary } from "./live-guard.js";
+import { QuoteOriginManifest, quoteOriginDigest } from "./quote-origin.js";
 import { classifyRunCapability } from "./run-pilot.js";
 import { checkAcceptanceEnvelope } from "../../core/scq-engine.js";
 import { DurableQuoteStore, requestHashOf, type StoredAttempt } from "../../store/durable-store.js";
@@ -67,10 +90,53 @@ export function createPreflightTransport(inner: HttpTransport): { transport: Htt
 }
 
 // ---------------------------------------------------------------------------
+// Structural transport provenance (PF1)
+// ---------------------------------------------------------------------------
+
+/**
+ * The brand marking a transport handle as constructed by THIS
+ * module around the real network transport. The symbol is
+ * module-private and never exported: a caller cannot assemble a
+ * handle carrying it — the only way to obtain one is
+ * `createRealPreflightTransport()` below, which takes NO caller
+ * transport. Provenance therefore derives from how the transport
+ * was obtained, never from a caller-supplied label (the pre-PF1
+ * `transportOrigin: "real"` input let a mocked transport forge
+ * LIVE_PASS and a Condition 3 PASS).
+ */
+const REAL_PREFLIGHT_TRANSPORT_BRAND: unique symbol = Symbol("scq-real-preflight-transport");
+
+export type RealPreflightTransport = {
+  readonly [REAL_PREFLIGHT_TRANSPORT_BRAND]: true;
+  transport: HttpTransport;
+  log: TransportLogEntry[];
+};
+
+/**
+ * Constructs the preflight's own guarded REAL-network transport
+ * (the pilot allowlist wrapped around the real fetch transport).
+ * This is the only LIVE-eligible transport source: runs over it are
+ * classified by what the observed log shows, exactly as runs over
+ * caller-supplied transports are classified SIMULATED — the
+ * difference is construction, not assertion.
+ */
+export function createRealPreflightTransport(): RealPreflightTransport {
+  const { transport, log } = createGuardedLiveTransport(fetchTransport);
+  return { [REAL_PREFLIGHT_TRANSPORT_BRAND]: true, transport, log };
+}
+
+// ---------------------------------------------------------------------------
 // Report types
 // ---------------------------------------------------------------------------
 
-export type PreflightTransportOrigin = "mocked" | "injected" | "real";
+/**
+ * Where the run's evidence came from, established STRUCTURALLY by
+ * runPreflight (PF1): "real" only when the transport was this
+ * module's internally constructed guarded network transport;
+ * "injected" for every caller-supplied transport (mocked fixtures
+ * included), whatever label a caller attaches to it.
+ */
+export type PreflightTransportOrigin = "real" | "injected";
 
 export type PreflightCheck = {
   id: string;
@@ -153,6 +219,8 @@ export type PreflightReport = {
     matchesStoredAttempts: boolean | null;
   } | null;
   providerState: {
+    /** The subscription id the provider's re-read actually returned — checked against the bound id (PF3). */
+    subscriptionId: string | null;
     subscriptionStatus: string | null;
     items: Array<{ itemPriceId: string; quantity: number | null; unitPrice: number | null; amount: number | null; complete: boolean }>;
     itemSetComplete: boolean;
@@ -170,8 +238,20 @@ export type PreflightReport = {
   durableReadiness: {
     quoteExistsDurably: boolean;
     providerMatch: boolean | null;
+    /** Derived from the quote-origin record vs the stored quote (PF3) — never from a caller-supplied expectation. Null only when no stored quote exists. */
     subscriptionMatch: boolean | null;
+    /** Derived from the quote-origin record vs the run's site (PF3). Null only when no stored quote exists. */
     siteBindingOk: boolean | null;
+    /**
+     * PF3 quote-origin binding: ESTABLISHED only when an issuance
+     * record in the origin manifest matches this quote's site,
+     * subscription, and canonical digest. MISSING (no record) and
+     * MISMATCH (conflicting/corrupt/divergent record) both block.
+     * Null only when no stored quote exists.
+     */
+    originBinding: "ESTABLISHED" | "MISSING" | "MISMATCH" | null;
+    originSite: string | null;
+    originSubscriptionId: string | null;
     requestCoherence: boolean | null;
     unresolvedAttempts: Array<{ attemptId: string; state: string; quoteId: string }>;
     recordedReceiptPresent: boolean;
@@ -199,8 +279,30 @@ export type PreflightInput = {
   quoteId: string;
   /** The authoritative durable record. A quote that exists only in an in-memory store is not a preflight candidate. */
   store: DurableQuoteStore;
-  transport: HttpTransport;
-  transportOrigin: PreflightTransportOrigin;
+  /**
+   * A caller-supplied transport. ALWAYS classified as injected /
+   * simulated evidence (PF1), whatever it actually is: provenance
+   * is structural, and no caller-supplied label can upgrade it.
+   * Mutually exclusive in effect with `realTransport` — when both
+   * are supplied, the internally constructed transport is the one
+   * used and classified, because it is the one that produced the
+   * evidence.
+   */
+  transport?: HttpTransport;
+  /**
+   * The preflight's own internally constructed guarded real-network
+   * transport, obtained ONLY from `createRealPreflightTransport()`.
+   * This is the sole LIVE-eligible source. A handle not constructed
+   * by that factory is refused (brand check) rather than classified.
+   */
+  realTransport?: RealPreflightTransport;
+  /**
+   * The quote-origin manifest (PF3): issuance records captured when
+   * quotes were issued. Origin evidence comes from here — never
+   * from caller-supplied site/subscription expectations. Omitting
+   * it leaves every quote's origin MISSING, which blocks.
+   */
+  originManifest?: QuoteOriginManifest;
   site: string;
   /** Per-run explicitly approved site entry (F1 model): must exactly match `site`. */
   approvedSite?: string;
@@ -213,6 +315,13 @@ export type PreflightInput = {
   now?: () => Date;
   /** Additional secret strings to scrub from every output string. */
   redactionSecrets?: string[];
+  /**
+   * Consistency inputs ONLY (PF3): when supplied, the stored
+   * subscription / run site are compared against them and a mismatch
+   * blocks — but agreement between two caller inputs is NOT origin
+   * evidence and never establishes binding. Origin comes from
+   * `originManifest` alone.
+   */
   expectedSubscriptionId?: string;
   expectedSite?: string;
   /** Summary of a completed mocked rehearsal run (condition 2 evidence). */
@@ -287,6 +396,86 @@ function emptyTransportSummary(): TransportSummary & { updateForItemsDispatched:
   return { totalCalls: 0, mutatingCalls: 0, estimateCalls: 0, byOperation: {}, rejectedAttempts: 0, updateForItemsDispatched: 0 };
 }
 
+// ---------------------------------------------------------------------------
+// Full resulting-multiset validation (PF2)
+// ---------------------------------------------------------------------------
+
+type ItemTuple = { itemPriceId: string; quantity: number };
+
+/**
+ * The item multiset the recorded proposal AUTHORIZES as the
+ * resulting state: the proposal's single change applied to the
+ * AUTHORITATIVE current item set (the independent provider
+ * re-read) — mirroring the adapter's own target construction
+ * (CHANGE_QUANTITY replaces the target item's quantity in place;
+ * CHANGE_PLAN swaps the target item's id for the offering,
+ * quantity preserved). The baseline is NEVER the stored preview
+ * input: that is the artifact under examination, and a tainted
+ * preview input must not be allowed to define its own expectation.
+ * Anything outside the adapter's single-change scope (multi-change
+ * proposals, other actions, a target item absent from the current
+ * set) cannot be reconstructed and blocks.
+ */
+function expectedTargetItems(
+  proposal: SubscriptionChangeProposal,
+  baseline: readonly ItemTuple[],
+): { ok: true; items: ItemTuple[] } | { ok: false; reason: string } {
+  const changes = proposal.changes;
+  if (changes.length !== 1) {
+    return { ok: false, reason: `the recorded proposal carries ${changes.length} changes; exact-request validation covers the adapter's single-change scope only, so the authorized resulting set cannot be reconstructed and the request is not validated` };
+  }
+  const change = changes[0];
+  if (change.action === "CHANGE_QUANTITY") {
+    if (change.itemId === undefined || typeof change.quantity !== "number") {
+      return { ok: false, reason: "the recorded CHANGE_QUANTITY change lacks its item id or quantity — the authorized resulting set cannot be reconstructed" };
+    }
+    if (!baseline.some((i) => i.itemPriceId === change.itemId)) {
+      return { ok: false, reason: `the proposal's target item "${change.itemId}" is absent from the independently re-read current item set — the authorized resulting set cannot be reconstructed` };
+    }
+    return { ok: true, items: baseline.map((i) => (i.itemPriceId === change.itemId ? { itemPriceId: i.itemPriceId, quantity: change.quantity as number } : { ...i })) };
+  }
+  if (change.action === "CHANGE_PLAN") {
+    if (change.itemId === undefined || change.offeringRef === undefined) {
+      return { ok: false, reason: "the recorded CHANGE_PLAN change lacks its item id or offering reference — the authorized resulting set cannot be reconstructed" };
+    }
+    if (!baseline.some((i) => i.itemPriceId === change.itemId)) {
+      return { ok: false, reason: `the proposal's target item "${change.itemId}" is absent from the independently re-read current item set — the authorized resulting set cannot be reconstructed` };
+    }
+    return { ok: true, items: baseline.map((i) => (i.itemPriceId === change.itemId ? { itemPriceId: change.offeringRef as string, quantity: i.quantity } : { ...i })) };
+  }
+  return { ok: false, reason: `proposal action "${change.action}" is outside the exact-request validation scope (CHANGE_QUANTITY / CHANGE_PLAN) — unsupported proposal actions block` };
+}
+
+/**
+ * Tuple-multiset divergences between the authorized resulting set
+ * and the stored dispatch target, described per item id: quantity
+ * changes on ANY item (not just the changed one), extra entries,
+ * duplicates, and omissions all surface here.
+ */
+function multisetDivergences(expected: readonly ItemTuple[], target: readonly ItemTuple[]): string[] {
+  const byId = (list: readonly ItemTuple[]): Map<string, number[]> => {
+    const m = new Map<string, number[]>();
+    for (const i of list) {
+      const arr = m.get(i.itemPriceId) ?? [];
+      arr.push(i.quantity);
+      m.set(i.itemPriceId, arr);
+    }
+    for (const arr of m.values()) arr.sort((a, b) => a - b);
+    return m;
+  };
+  const e = byId(expected);
+  const t = byId(target);
+  const out: string[] = [];
+  for (const id of new Set([...e.keys(), ...t.keys()])) {
+    const ev = e.get(id);
+    const tv = t.get(id);
+    if (JSON.stringify(ev ?? null) !== JSON.stringify(tv ?? null)) {
+      out.push(`${id}: authorized resulting quantities [${ev ? ev.join(", ") : "absent"}] vs stored target [${tv ? tv.join(", ") : "absent"}]`);
+    }
+  }
+  return out;
+}
+
 export async function runPreflight(input: PreflightInput): Promise<PreflightReport> {
   const now = input.now ?? (() => new Date());
   const env = input.env ?? {};
@@ -296,6 +485,25 @@ export async function runPreflight(input: PreflightInput): Promise<PreflightRepo
     checks.push({ id, status, detail });
     if (status === "blocker") blockers.push(`${id}: ${detail}`);
   };
+
+  // --- Structural transport provenance (PF1) -------------------------
+  // Provenance is decided HERE, from how the transport was obtained:
+  // the module-branded internally constructed handle is "real";
+  // every caller-supplied transport is "injected". There is no
+  // origin input, and a forged handle is refused outright — a
+  // caller must not be able to assemble the appearance of the real
+  // network path around a mocked transport.
+  let provenance: PreflightTransportOrigin;
+  if (input.realTransport !== undefined) {
+    if ((input.realTransport as unknown as Record<symbol, unknown>)[REAL_PREFLIGHT_TRANSPORT_BRAND] !== true) {
+      throw new Error("runPreflight: realTransport was not constructed by createRealPreflightTransport() — refusing to classify a caller-assembled handle as the internally constructed real-network transport");
+    }
+    provenance = "real";
+  } else if (input.transport !== undefined) {
+    provenance = "injected";
+  } else {
+    throw new Error("runPreflight: no transport supplied — pass a caller-supplied transport (injected/simulated evidence) or realTransport from createRealPreflightTransport()");
+  }
 
   const approvedSites = [...(input.approvedTestSites ?? []), ...(input.approvedSite ? [input.approvedSite] : [])];
   const siteApproved = isApprovedTestSite(input.site, approvedSites);
@@ -334,6 +542,9 @@ export async function runPreflight(input: PreflightInput): Promise<PreflightRepo
       providerMatch: null,
       subscriptionMatch: null,
       siteBindingOk: null,
+      originBinding: null,
+      originSite: null,
+      originSubscriptionId: null,
       requestCoherence: null,
       unresolvedAttempts: [],
       recordedReceiptPresent: false,
@@ -343,7 +554,7 @@ export async function runPreflight(input: PreflightInput): Promise<PreflightRepo
     checks,
     blockers,
     transport: emptyTransportSummary(),
-    evidence: { transportOrigin: input.transportOrigin, capabilities: [] },
+    evidence: { transportOrigin: provenance, capabilities: [] },
     conditions: [],
     overall: "NO-GO",
   };
@@ -402,15 +613,73 @@ export async function runPreflight(input: PreflightInput): Promise<PreflightRepo
     report.durableReadiness.providerMatch = stored.provider === "chargebee";
     check("provider_binding", stored.provider === "chargebee" ? "pass" : "blocker",
       stored.provider === "chargebee" ? "stored provider binding is chargebee" : `stored provider binding is "${stored.provider}" — this preflight covers chargebee quotes only`);
+
+    // PF3: quote-origin binding. A StoredQuote carries no site, so
+    // the ONLY origin evidence is the issuance record in the origin
+    // manifest — captured when the quote was issued, keyed by quote
+    // id, and digest-bound to the stored quote. Absence BLOCKS (it
+    // no longer sits null beside zero blockers): without it, a quote
+    // issued on one site could be replayed against another approved
+    // site with a coincidentally matching subscription id and
+    // fingerprint, and nothing here could tell.
+    const manifest = input.originManifest;
+    if (manifest?.corrupt) {
+      report.durableReadiness.originBinding = "MISMATCH";
+      report.durableReadiness.siteBindingOk = false;
+      report.durableReadiness.subscriptionMatch = false;
+      check("quote_origin_binding", "blocker", "the quote-origin manifest is corrupt or partially unreadable — origin evidence is untrustworthy, so site/subscription binding cannot be established");
+    } else {
+      const origins = manifest?.recordsFor(stored.quote_id) ?? [];
+      if (origins.length === 0) {
+        report.durableReadiness.originBinding = "MISSING";
+        report.durableReadiness.siteBindingOk = false;
+        report.durableReadiness.subscriptionMatch = false;
+        check("quote_origin_binding", "blocker", "no quote-origin record exists for this quote: the site and subscription it was ISSUED against are not independently established. Caller-supplied site expectations are consistency inputs, not origin evidence — origin binding is a hard precondition and its absence blocks");
+      } else {
+        const first = origins[0];
+        report.durableReadiness.originSite = first.site;
+        report.durableReadiness.originSubscriptionId = first.subscriptionId;
+        const conflicting = origins.some((r) => r.site !== first.site || r.subscriptionId !== first.subscriptionId || r.quoteDigest !== first.quoteDigest || r.provider !== first.provider);
+        if (conflicting) {
+          report.durableReadiness.originBinding = "MISMATCH";
+          report.durableReadiness.siteBindingOk = false;
+          report.durableReadiness.subscriptionMatch = false;
+          check("quote_origin_binding", "blocker", `${origins.length} origin records exist for this quote and they conflict (site, subscription, provider, or digest) — the quote's origin is ambiguous and cannot be established`);
+        } else if (first.provider !== "chargebee" || first.subscriptionId !== stored.subscription_id) {
+          report.durableReadiness.originBinding = "MISMATCH";
+          report.durableReadiness.siteBindingOk = false;
+          report.durableReadiness.subscriptionMatch = false;
+          check("quote_origin_binding", "blocker", `the origin record binds this quote to provider "${first.provider}" / subscription "${first.subscriptionId}", but the stored quote names provider "${stored.provider}" / subscription "${stored.subscription_id}" — the record does not belong to this quote`);
+        } else if (first.quoteDigest !== quoteOriginDigest(stored)) {
+          report.durableReadiness.originBinding = "MISMATCH";
+          report.durableReadiness.siteBindingOk = false;
+          report.durableReadiness.subscriptionMatch = false;
+          check("quote_origin_binding", "blocker", "the stored quote no longer matches the canonical digest captured in its origin record at issuance — the quote was altered after issuance (or the record was transplanted), so its origin cannot be trusted for this record");
+        } else if (first.site !== input.site) {
+          report.durableReadiness.originBinding = "MISMATCH";
+          report.durableReadiness.siteBindingOk = false;
+          report.durableReadiness.subscriptionMatch = false;
+          check("quote_origin_binding", "blocker", `cross-site replay refused: this quote was issued against site "${first.site}" (origin record) but this preflight runs against site "${input.site}" — the same site identity must bind the issuance, the request, the read, the ledger, and any future authorization`);
+        } else {
+          report.durableReadiness.originBinding = "ESTABLISHED";
+          report.durableReadiness.siteBindingOk = true;
+          report.durableReadiness.subscriptionMatch = true;
+          check("quote_origin_binding", "pass", `quote origin is established by its issuance record: issued against site "${first.site}" for subscription "${first.subscriptionId}", digest-bound to the stored quote — the same site identity binds this run's request, re-read, and ledger`);
+        }
+      }
+    }
+    // Consistency inputs (PF3): agreement or disagreement between
+    // caller inputs — recorded, and a mismatch blocks — but never
+    // treated as origin evidence.
     if (input.expectedSubscriptionId !== undefined) {
-      report.durableReadiness.subscriptionMatch = stored.subscription_id === input.expectedSubscriptionId;
-      check("subscription_binding", report.durableReadiness.subscriptionMatch ? "pass" : "blocker",
-        report.durableReadiness.subscriptionMatch ? "stored subscription matches the expected subscription" : `stored subscription "${stored.subscription_id}" does not match the expected "${input.expectedSubscriptionId}"`);
+      const consistent = stored.subscription_id === input.expectedSubscriptionId;
+      check("subscription_consistency", consistent ? "pass" : "blocker",
+        consistent ? "stored subscription matches the caller-supplied expected subscription (consistency input only — not origin evidence)" : `stored subscription "${stored.subscription_id}" does not match the caller-supplied expected subscription "${input.expectedSubscriptionId}"`);
     }
     if (input.expectedSite !== undefined) {
-      report.durableReadiness.siteBindingOk = input.expectedSite === input.site;
-      check("site_binding", report.durableReadiness.siteBindingOk ? "pass" : "blocker",
-        report.durableReadiness.siteBindingOk ? "the run's site matches the expected site binding" : `the run's site "${input.site}" does not match the expected site binding "${input.expectedSite}"`);
+      const consistent = input.expectedSite === input.site;
+      check("site_consistency", consistent ? "pass" : "blocker",
+        consistent ? "the run's site matches the caller-supplied expected site (consistency input only — not origin evidence)" : `the run's site "${input.site}" does not match the caller-supplied expected site "${input.expectedSite}"`);
     }
     if (new Date(stored.expires_at).getTime() <= now().getTime()) {
       check("quote_not_expired", "blocker", `quote expired at ${stored.expires_at}`);
@@ -465,7 +734,10 @@ export async function runPreflight(input: PreflightInput): Promise<PreflightRepo
       idempotencyKey: pii.idempotencyKey,
       requestHash: derivedHash,
       storedPreviewInput: { items: storedItems, idempotencyKey: pii.idempotencyKey },
-      matchesStoredPreviewInput: true, // refined by the proposal coherence check below
+      // PF2: settled ONLY by the post-read full-multiset validation
+      // below — until the independent baseline exists, the request
+      // is NOT reported as matching the authorized change.
+      matchesStoredPreviewInput: false,
       matchesStoredAttempts: null,
     };
     if (pii.idempotencyKey !== expectedKey) {
@@ -473,23 +745,13 @@ export async function runPreflight(input: PreflightInput): Promise<PreflightRepo
     } else {
       check("idempotency_key_coherence", "pass", "the stored idempotency key is the original adapter-derived key for this quote; it is reported, never regenerated");
     }
-    // Proposal coherence: the stored target set must be exactly what the
-    // recorded proposal authorizes.
-    const changes = stored.proposal.changes;
-    let coherent = changes.length === 1;
-    if (coherent) {
-      const change = changes[0];
-      if (change.action === "CHANGE_QUANTITY") {
-        const target = pii.items.find((i) => i.itemPriceId === change.itemId);
-        coherent = target !== undefined && target.quantity === change.quantity;
-      } else if (change.action === "CHANGE_PLAN") {
-        coherent = change.offeringRef !== undefined && pii.items.some((i) => i.itemPriceId === change.offeringRef);
-      }
-    }
-    report.exactRequest.matchesStoredPreviewInput = coherent;
-    report.durableReadiness.requestCoherence = coherent;
-    check("request_matches_proposal", coherent ? "pass" : "blocker",
-      coherent ? "the stored target item set is exactly what the recorded proposal authorizes" : "the stored target item set diverges from the recorded proposal (item ids/quantities) — the request a commit would send is not the authorized change");
+    // Proposal coherence is deliberately NOT settled here (PF2):
+    // whether the stored target is exactly the authorized change
+    // can only be judged against the independent provider re-read
+    // (see the full-multiset validation in the re-read below). The
+    // pre-correction check compared only the changed item against
+    // the stored target — the artifact under examination grading
+    // itself.
     // Recorded-attempt hash coherence.
     const quoteAttempts = attempts.filter((a) => a.quoteId === input.quoteId);
     if (quoteAttempts.length > 0) {
@@ -501,12 +763,34 @@ export async function runPreflight(input: PreflightInput): Promise<PreflightRepo
   }
 
   // --- Independent provider re-read (guarded, read-only) ------------------
+  let runLog: TransportLogEntry[] = [];
+  let proposalCoherenceSettled = false;
+  let identityVerified = false;
   if (!report.refused && stored && derivedParams) {
-    const { transport: guarded, log } = createPreflightTransport(input.transport);
+    // The internally constructed real transport is already guarded
+    // by its factory (its log is the run's log); a caller-supplied
+    // transport is wrapped in the same guard here.
+    const { transport: guarded, log } = provenance === "real"
+      ? { transport: input.realTransport!.transport, log: input.realTransport!.log }
+      : createPreflightTransport(input.transport!);
+    runLog = log;
     const client = new ChargebeeClient({ site: input.site, apiKey: input.apiKey ?? "" }, guarded);
     try {
       const subRes = await client.getSubscription(stored.subscription_id);
       const sub = ((subRes.json as any)?.subscription ?? {}) as CbSubscription;
+      // PF3: the re-read must actually BE the bound subscription.
+      // The id the provider returns is compared against the stored
+      // (origin-bound) subscription id — a response about any other
+      // subscription is not evidence about this quote.
+      const responseSubscriptionId = typeof sub.id === "string" && sub.id.length > 0 ? sub.id : null;
+      if (responseSubscriptionId === null) {
+        check("provider_subscription_identity", "unknown", "the provider re-read carries no subscription id — the identity of the re-read subscription cannot be verified against the bound subscription id, so the read is not verified identity evidence");
+      } else if (responseSubscriptionId !== stored.subscription_id) {
+        check("provider_subscription_identity", "blocker", `the provider re-read returned subscription "${responseSubscriptionId}", which is not the bound subscription "${stored.subscription_id}" — state read from a different subscription is not evidence for this quote`);
+      } else {
+        identityVerified = true;
+        check("provider_subscription_identity", "pass", `the provider re-read returned the bound subscription "${stored.subscription_id}"`);
+      }
       report.identity.currentResourceVersion = typeof sub.resource_version === "number" ? sub.resource_version : null;
       report.identity.currentFingerprint = chargebeeSubscriptionFingerprint(sub);
       if (report.identity.currentFingerprint === stored.subscription_version_at_quote) {
@@ -523,6 +807,7 @@ export async function runPreflight(input: PreflightInput): Promise<PreflightRepo
       const scheduledChanges = typeof sub.has_scheduled_changes === "boolean" ? (sub.has_scheduled_changes ? "true" : "false") : "UNKNOWN";
       const scheduledAdvance = typeof sub.has_scheduled_advance_invoices === "boolean" ? (sub.has_scheduled_advance_invoices ? "true" : "false") : "UNKNOWN";
       report.providerState = {
+        subscriptionId: responseSubscriptionId,
         subscriptionStatus: typeof sub.status === "string" ? sub.status : null,
         items,
         itemSetComplete,
@@ -535,6 +820,38 @@ export async function runPreflight(input: PreflightInput): Promise<PreflightRepo
       };
       check("item_set_complete", itemSetComplete ? "pass" : "blocker",
         itemSetComplete ? "the full current item collection was read with id, quantity, and amount for every entry" : "the current item collection is incomplete (an entry lacks id, quantity, or stated amount) — the resulting state cannot be fully compared");
+      // PF2: full resulting-multiset validation. The authorized
+      // resulting set is reconstructed from THIS independent read
+      // plus the recorded proposal, then compared tuple-for-tuple
+      // (as a multiset) against the stored dispatch target. Every
+      // item is judged — a quantity change smuggled onto a
+      // non-target item, an extra or duplicated entry, or an
+      // omission diverges and blocks. Until this runs, request
+      // coherence cannot be PASS.
+      {
+        const baselineUsable = items.length > 0 && items.every((i) => i.itemPriceId.length > 0 && i.quantity !== null);
+        if (!baselineUsable) {
+          check("request_matches_proposal", "unknown", "the independent re-read did not yield a complete current item set (id + quantity for every entry), so the full resulting item set cannot be validated — request coherence is NOT established");
+        } else {
+          const baseline: ItemTuple[] = items.map((i) => ({ itemPriceId: i.itemPriceId, quantity: i.quantity as number }));
+          const expected = expectedTargetItems(stored.proposal, baseline);
+          if (!expected.ok) {
+            report.durableReadiness.requestCoherence = false;
+            check("request_matches_proposal", "blocker", expected.reason);
+          } else {
+            const target: ItemTuple[] = (previewInput?.items ?? []).map((i) => ({ itemPriceId: i.itemPriceId, quantity: i.quantity }));
+            const divergences = multisetDivergences(expected.items, target);
+            const coherent = divergences.length === 0;
+            report.exactRequest!.matchesStoredPreviewInput = coherent;
+            report.durableReadiness.requestCoherence = coherent;
+            check("request_matches_proposal", coherent ? "pass" : "blocker",
+              coherent
+                ? "the stored dispatch target is exactly the full resulting item multiset the recorded proposal authorizes over the independently re-read current item set (every item's id and quantity compared, not just the changed item)"
+                : `the stored dispatch target diverges from the authorized resulting item set: ${divergences.join("; ")} — the request a commit would send is not the authorized change`);
+          }
+        }
+        proposalCoherenceSettled = true;
+      }
       // Target-set coverage: replace_items_list=true drops anything the
       // target set omits (mandatory addons excepted — and those are
       // precisely the interference this check names).
@@ -637,18 +954,27 @@ export async function runPreflight(input: PreflightInput): Promise<PreflightRepo
     report.transport = { ...summary, updateForItemsDispatched: log.filter((e) => e.dispatched && e.operation === "update_for_items").length };
   }
 
+  // PF2: if the run never reached the multiset validation (refused
+  // before reads, or the re-read failed), coherence is reported as
+  // NOT established — it can never default to a pass.
+  if (stored && previewInput && !proposalCoherenceSettled) {
+    check("request_matches_proposal", "unknown", "request coherence was not validated against an independent provider baseline (the run was refused before reads, or the re-read did not complete) — it cannot be reported as matching the authorized change");
+  }
+
   // --- Capabilities, classified honestly ----------------------------------
   const okReads = !report.refused && report.providerState !== null && report.transport.mutatingCalls === 0;
+  const successfulReads = observedSuccessfulOps(runLog, "retrieve_subscription");
   report.evidence.capabilities = [
     {
       capability: "exact-commit preflight evidence (this run)",
-      // The pilot's classifier takes origin "real" | "injected"; a
-      // mocked origin is fully decided by the mode argument, which
-      // short-circuits before the origin is consulted.
-      result: classifyRunCapability(input.transportOrigin === "real" ? "live" : "mocked", okReads, report.transport.totalCalls, input.transportOrigin === "injected" ? "injected" : "real"),
-      detail: input.transportOrigin === "real"
-        ? "real read-only transport: observed operations were allowlisted reads/estimates only"
-        : `${input.transportOrigin} transport: this evidence validates procedure and code paths, never live provider behavior`,
+      // PF1: classification rests on STRUCTURAL provenance + the
+      // observed log. "real" is reachable only via the internally
+      // constructed transport; a caller-supplied transport is
+      // "injected" and caps at SIMULATED_PASS, however it is labeled.
+      result: classifyRunCapability("live", okReads, successfulReads, provenance),
+      detail: provenance === "real"
+        ? "internally constructed guarded real-network transport: observed operations were allowlisted reads/estimates only"
+        : "caller-supplied (injected) transport: this evidence validates procedure and code paths, never live provider behavior — provenance is structural and cannot be upgraded by a caller-supplied label",
     },
     {
       capability: "zero observed mutations",
@@ -662,6 +988,17 @@ export async function runPreflight(input: PreflightInput): Promise<PreflightRepo
   const owner = input.humanInputs?.reconciliationOwner;
   const release = input.humanInputs?.releaseApproval;
   const authz = input.humanInputs?.commitAuthorization;
+  // Condition 3 requirements (PF1 + PF3), enumerated so the report
+  // names exactly what is missing rather than failing opaquely.
+  const cond3Unmet: string[] = [];
+  if (provenance !== "real") cond3Unmet.push("the transport was caller-supplied (injected/simulated evidence): only the preflight's own internally constructed guarded real-network transport produces real-tenant evidence, and no caller-supplied label changes that");
+  if (!attestation?.testTenantAttested) cond3Unmet.push("operator attestation of actual test-tenant ownership/mode was not supplied (tenant mode UNVERIFIED)");
+  if (report.durableReadiness.originBinding !== "ESTABLISHED") cond3Unmet.push("quote-origin site/subscription binding is not established by an issuance record");
+  if (report.providerState === null) cond3Unmet.push("the independent provider re-read did not complete");
+  else if (!identityVerified) cond3Unmet.push("the re-read subscription identity was not verified against the bound subscription id");
+  if (report.refused) cond3Unmet.push("the run was refused before provider reads");
+  if (blockers.length > 0) cond3Unmet.push(`${blockers.length} blocker(s) stand (see checks)`);
+  const cond3Status: ReadinessCondition["status"] = cond3Unmet.length === 0 ? "PASS" : blockers.length > 0 ? "BLOCKED" : "UNVERIFIED";
   report.conditions = [
     {
       condition: 1, name: CONDITION_NAMES[1],
@@ -681,11 +1018,11 @@ export async function runPreflight(input: PreflightInput): Promise<PreflightRepo
     },
     {
       condition: 3, name: CONDITION_NAMES[3],
-      status: input.transportOrigin === "real" && !report.refused && blockers.length === 0 ? "PASS" : "UNVERIFIED",
-      evidence: input.transportOrigin === "real" ? "this report, produced against the real test tenant's read-only endpoints" : `this report was produced over a ${input.transportOrigin} transport`,
-      reason: input.transportOrigin === "real"
-        ? (blockers.length === 0 ? "the exact commit was preflighted against the real tenant with no blockers" : "the real-tenant preflight found blockers (see checks)")
-        : "no real-tenant preflight evidence exists: mocked/injected runs validate the procedure, not the actual commit against the actual tenant",
+      status: cond3Status,
+      evidence: provenance === "real" ? "this report, produced over the internally constructed guarded real-network transport" : "this report was produced over a caller-supplied (injected) transport",
+      reason: cond3Unmet.length === 0
+        ? "the exact commit was preflighted against the real tenant: structural real-network provenance, test-tenant attestation supplied, quote-origin binding established, provider identity verified, no blockers"
+        : `Condition 3 is not met — ${cond3Unmet.join("; ")}`,
     },
     {
       condition: 4, name: CONDITION_NAMES[4],
@@ -735,6 +1072,7 @@ export function renderPreflightMarkdown(report: PreflightReport): string {
   lines.push(`- Tenant mode: ${report.identity.tenantModeEstablished}${report.identity.operatorAttestation?.attestedBy ? ` (attested by ${report.identity.operatorAttestation.attestedBy})` : ""}`);
   lines.push(`- Subscription: ${report.identity.subscriptionId ?? "unknown"} (synthetic-fixture designation: ${report.identity.syntheticFixtureDesignation ? "yes" : "no"})`);
   lines.push(`- Quote: ${report.identity.quoteId}, created ${report.identity.quoteCreatedAt ?? "?"}, expires ${report.identity.quoteExpiresAt ?? "?"}, status ${report.identity.quoteStatus ?? "?"}`);
+  lines.push(`- Quote-origin binding (issuance record): ${report.durableReadiness.originBinding ?? "not applicable"}${report.durableReadiness.originSite ? ` (issued against site ${report.durableReadiness.originSite}, subscription ${report.durableReadiness.originSubscriptionId})` : ""}`);
   lines.push(`- Fingerprint: stored ${report.identity.storedFingerprint ?? "?"} · current ${report.identity.currentFingerprint ?? "?"} (resource_version ${report.identity.currentResourceVersion ?? "?"})`);
   lines.push(`- Action: ${report.identity.action ?? "?"} → target items ${report.identity.targetItems.map((i) => `${i.itemPriceId}×${i.quantity}`).join(", ") || "none recorded"}`);
   if (report.exactRequest) {
@@ -743,7 +1081,7 @@ export function renderPreflightMarkdown(report: PreflightReport): string {
     lines.push(`- Parameters (derived by the adapter's own request builder): replace_items_list=${report.exactRequest.replaceItemsList}, prorate=${report.exactRequest.prorate}, invoice_immediately=${report.exactRequest.invoiceImmediately}, change_option=${report.exactRequest.changeOption}`);
     lines.push(`- Idempotency key (original, stored): ${report.exactRequest.idempotencyKey}`);
     lines.push(`- Canonical request hash: ${report.exactRequest.requestHash}`);
-    lines.push(`- Matches stored preview input / proposal: ${report.exactRequest.matchesStoredPreviewInput ? "yes" : "NO — blocker"}`);
+    lines.push(`- Matches the authorized resulting item set (full multiset vs the independent re-read): ${report.durableReadiness.requestCoherence === true ? "yes" : report.durableReadiness.requestCoherence === false ? "NO — blocker" : "not established (no independent baseline)"}`);
     lines.push("");
     lines.push("```");
     lines.push(report.exactRequest.formEncodedBody);

@@ -6,6 +6,7 @@ import { join } from "node:path";
 import { ChargebeeClient, type HttpTransport } from "../src/live/chargebee-http.js";
 import { ChargebeeLiveAdapter } from "../src/live/chargebee-scq-adapter.js";
 import { PilotMockChargebee, type PilotMockFaults } from "../src/live/pilot/mock-transport.js";
+import { QuoteOriginManifest } from "../src/live/pilot/quote-origin.js";
 import { QuoteStore } from "../src/store/quote-store.js";
 import { DurableQuoteStore, requestHashOf } from "../src/store/durable-store.js";
 import { DurableMutationCoordinator } from "../src/store/mutation-coordinator.js";
@@ -44,6 +45,7 @@ type Fixture = {
   path: string;
   quoteId: string;
   mock: PilotMockChargebee;
+  manifest: QuoteOriginManifest;
 };
 
 /** Builds the canonical durable quote (addon 1 -> 21) over a mocked transport, exactly as a future commit would consume it. */
@@ -57,8 +59,13 @@ async function buildFixture(mock: PilotMockChargebee = new PilotMockChargebee())
     providerSite: SITE,
   });
   const quote = await adapter.createChangeQuote(SUB, PROPOSAL(21));
+  // PR #20 correction PF3: the fixture's quote origin is recorded at
+  // issuance (site from configuration), exactly as the corrected CLI
+  // does — the preflight binds to this record, not to an expectation.
+  const manifest = new QuoteOriginManifest(path + ".origins.jsonl");
+  manifest.record({ stored: store.get(quote.id)!, site: SITE, recordedBy: "test37 fixture issuance" });
   store.close();
-  return { path, quoteId: quote.id, mock };
+  return { path, quoteId: quote.id, mock, manifest };
 }
 
 function preflightInput(fx: Fixture, store: DurableQuoteStore, over: Partial<PreflightInput> = {}): PreflightInput {
@@ -66,7 +73,7 @@ function preflightInput(fx: Fixture, store: DurableQuoteStore, over: Partial<Pre
     quoteId: fx.quoteId,
     store,
     transport: fx.mock.transport as HttpTransport,
-    transportOrigin: "mocked",
+    originManifest: fx.manifest,
     site: SITE,
     approvedSite: SITE,
     apiKey: "pilot-mock-key",
@@ -247,7 +254,7 @@ test("Test 37.7: a subscription id without synthetic designation is rejected bef
   store0.close();
   const store = openStore(path);
   const report = await runPreflight({
-    quoteId: quote.id, store, transport: mock.transport as HttpTransport, transportOrigin: "mocked",
+    quoteId: quote.id, store, transport: mock.transport as HttpTransport,
     site: SITE, approvedSite: SITE, apiKey: "pilot-mock-key",
     operatorAttestation: { testTenantAttested: true }, env: {},
   });
@@ -281,7 +288,7 @@ test("Test 37.9: a quote that exists only in memory is not a preflight candidate
   const quote = await adapter.createChangeQuote(SUB, PROPOSAL(21));
   const store = openStore(tmpDb());
   const report = await runPreflight({
-    quoteId: quote.id, store, transport: mock.transport as HttpTransport, transportOrigin: "mocked",
+    quoteId: quote.id, store, transport: mock.transport as HttpTransport,
     site: SITE, approvedSite: SITE, apiKey: "pilot-mock-key", operatorAttestation: { testTenantAttested: true }, env: {},
   });
   store.close();
@@ -423,7 +430,7 @@ test("Test 37.18: a recorded receipt means replay posture — a new commit is no
   store0.close();
   const store = openStore(path);
   const report = await runPreflight({
-    quoteId: quote.id, store, transport: mock.transport as HttpTransport, transportOrigin: "mocked",
+    quoteId: quote.id, store, transport: mock.transport as HttpTransport,
     site: SITE, approvedSite: SITE, apiKey: "pilot-mock-key", operatorAttestation: { testTenantAttested: true }, env: {},
   });
   store.close();
