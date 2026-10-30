@@ -491,6 +491,197 @@ export type ProviderObservation = {
 };
 
 /**
+ * v0.6.2 (PR-9, additive — protocol change): the provider-neutral
+ * post-commit STATE verification contract, implemented by
+ * `verifyPostCommitState` (core/state-verification.ts) and consumed
+ * by the store's establishment procedure and by adapters that
+ * perform their own post-commit establishment. This is issue #7
+ * Topic 5's shared hook: the §6.12 state verification, generalized
+ * from the store's formerly private per-action check into one
+ * provider-neutral computation.
+ *
+ * The verdict is about OBSERVED STATE ONLY. Four questions are kept
+ * distinct throughout: (1) is the intended state observed? — this
+ * contract's verdict; (2) is the operation's execution established?
+ * (3) is the observed state ATTRIBUTABLE to this operation?
+ * (4) are the financial figures established? A state verdict
+ * answers question (1) and is structurally incapable of asserting
+ * the others: the result type carries them as constant-false
+ * fields. In particular a VERIFIED state NEVER upgrades a
+ * lost-response INDETERMINATE outcome (PR #16 L1: a matching state
+ * is observationally identical to another actor making the same
+ * change), and a state MISMATCH is never, by itself, a financial
+ * VIOLATED — that translation requires independently attributable
+ * financial evidence, which is the establishing adapter's burden.
+ */
+export type StateVerificationVerdict = "VERIFIED" | "MISMATCH" | "UNVERIFIABLE";
+
+/**
+ * What the verification actually covered. FULL_ITEM_SET: the
+ * expected RESULTING item set was compared against the observed
+ * collection as a multiset (identifiers + quantities [+ stated
+ * offerings]) — additions, removals, extras, and duplicates are
+ * all detectable. ACTION_LEVEL: only the per-change checks the
+ * proposal targets were performed (the historical §6.12
+ * semantics); state outside the targeted items/dimensions is NOT
+ * examined, and the result says so in its limitations.
+ */
+export type StateVerificationCoverage = "FULL_ITEM_SET" | "ACTION_LEVEL";
+
+/** One performed check, reported whether it passed, contradicted, or could not be performed. */
+export type StateVerificationCheck = {
+  /** Check identifier, e.g. "item-set", "change[0]:CHANGE_QUANTITY". */
+  check: string;
+  /** The state dimension examined, e.g. "state:itemSet", "state:cadence". */
+  dimension: string;
+  outcome: "VERIFIED" | "CONTRADICTED" | "UNVERIFIABLE";
+  /** Human-readable statement of what was compared and what was found. */
+  detail: string;
+};
+
+/**
+ * One entry of the expected resulting item set (FULL_ITEM_SET
+ * coverage). Derived by the CALLER from the authorized quote /
+ * dispatched request — never from the post-mutation state.
+ * `offeringRef` is compared only where the expectation states it.
+ */
+export type ExpectedItemState = {
+  id: string;
+  quantity?: number;
+  offeringRef?: string;
+};
+
+/**
+ * The trusted expectation side of state verification: the stored
+ * quote's authorized proposal, plus — where full item-set
+ * verification is claimed — the expected resulting item set
+ * derived from that authorized request.
+ */
+export type PostCommitStateExpectation = {
+  /** The authorized proposal (the stored quote's proposal). The hook checks its intent; it never accepts a caller-supplied verdict. */
+  proposal: SubscriptionChangeProposal;
+  /**
+   * The expected RESULTING item set (complete collection, multiset
+   * semantics). Supplied => FULL_ITEM_SET coverage; omitted =>
+   * ACTION_LEVEL coverage, reported as such.
+   */
+  expectedItems?: ReadonlyArray<ExpectedItemState>;
+  /**
+   * The authorized current-term boundary instant, where the caller
+   * can derive it from the authorized quote / request context (for
+   * example the quoted period boundary recorded at quote time).
+   * Used ONLY to align a TERM_END cancellation: a schedule or
+   * effected cancellation is verified for TERM_END when its
+   * independently established instant equals this boundary, or
+   * when provider schedule-kind evidence establishes the TERM_END
+   * kind directly. This value must come from the expectation
+   * (authorized) side — never from the post-commit snapshot being
+   * checked: a boundary read out of the observed state would be
+   * the state proving itself. Absent => TERM_END alignment rests
+   * on schedule-kind evidence alone, and a schedule carrying
+   * neither kind nor an alignable instant is UNVERIFIABLE.
+   */
+  termBoundaryAt?: string;
+};
+
+/**
+ * The observed subscription state, normalized for state
+ * verification. Unlike `SubscriptionSnapshot`, the item collection
+ * is OPTIONAL here: a read that omits the collection must be
+ * representable, because an omitted collection is UNVERIFIABLE —
+ * it is never an empty set.
+ */
+export type PostCommitObservedSnapshot = Omit<SubscriptionSnapshot, "items"> & {
+  items?: SubscriptionSnapshot["items"];
+};
+
+/**
+ * The observation side of state verification: a normalized
+ * post-commit read, adapted by the caller from whatever provider
+ * read it performed. Binding this value to a REAL provider read
+ * (bound to the operation where attribution matters) is the
+ * caller's duty — exactly as with `ProviderObservation`, the hook
+ * computes over what it is given and cannot prove provenance;
+ * `establishVerification`'s evidence branding remains the boundary
+ * that keeps a computed verdict from becoming evidence by itself.
+ */
+export type PostCommitStateObservation = {
+  /** The post-commit subscription state as read; absent => nothing about the state is established. */
+  snapshot?: PostCommitObservedSnapshot;
+  /**
+   * Whether `snapshot.items` is the COMPLETE collection.
+   * `false` => a partial return: contradictions established by
+   * PRESENT entries stand, but absence-based contradictions
+   * (missing items) are NOT established and the item-set dimension
+   * is at best UNVERIFIABLE. Absent => the collection is taken as
+   * complete (the shape of every read this repo's adapters make).
+   */
+  itemsComplete?: boolean;
+  /**
+   * Independently established cancellation schedule / cancellation
+   * evidence, for scheduled (TERM_END / DATE) CANCEL intents: the
+   * subscription snapshot carries no schedule, so a scheduled
+   * cancellation can only be verified from evidence established by
+   * a provider read (e.g. a scheduled-change record bound to the
+   * operation). `kind` is the provider-established schedule kind
+   * (TERM_END evidence can verify a TERM_END intent without a
+   * numeric boundary); `effectiveAt` is the established scheduled
+   * instant — or, for an already-terminal subscription, the
+   * established instant the cancellation took effect. Absent => a
+   * non-terminal scheduled cancel is UNVERIFIABLE; a schedule is
+   * never invented, and a terminal state carrying no cancellation
+   * instant cannot be distinguished from a premature termination
+   * for a DATE / TERM_END intent.
+   */
+  cancellationSchedule?: { kind?: EffectiveIntent["type"]; effectiveAt?: string };
+  /** Descriptor of the read that produced this observation (provenance, for the audit trail). */
+  source: string;
+  /** When the observation was made (ISO timestamp). */
+  observedAt?: string;
+};
+
+/** The computed result of `verifyPostCommitState`. A value, not evidence: it carries no brand and mints nothing. */
+export type PostCommitStateVerification = {
+  verdict: StateVerificationVerdict;
+  coverage: StateVerificationCoverage;
+  /** Every check performed, with its outcome — the verdict is derived from these, never asserted beside them. */
+  checks: StateVerificationCheck[];
+  /** Dimensions at least one check VERIFIED. */
+  verifiedDimensions: string[];
+  /** Established contradictions (present iff verdict is MISMATCH). */
+  contradictions: string[];
+  /** Dimensions no check could verify from the observation. */
+  unverifiableDimensions: string[];
+  /** Whether any post-commit snapshot was observed at all. */
+  stateObserved: boolean;
+  /**
+   * Constant false, by construction: this result does NOT
+   * establish that the operation executed. Execution establishment
+   * lives in operation-bound evidence (a mutation response, an
+   * operation-keyed read), never in a state comparison.
+   */
+  executionEstablished: false;
+  /**
+   * Constant false, by construction: this result does NOT
+   * establish that the observed state was caused by the operation
+   * under verification. Attribution requires an operation-bound
+   * bracket or equivalent; a matching state is observationally
+   * identical to another actor's identical change.
+   */
+  stateAttributableToThisOperation: false;
+  /**
+   * Constant false, by construction: this result examines state
+   * only and establishes NO financial outcome. A state VERIFIED
+   * does not make figures established; a state MISMATCH does not
+   * make a reconciliation VIOLATED.
+   */
+  financialOutcomeEstablished: false;
+  provenance: { source: string; observedAt?: string };
+  /** What this verification did NOT cover or cannot support — stated in the result, not just in prose. */
+  limitations: string[];
+};
+
+/**
  * v0.4/v0.5, unchanged: per-dimension guarantee coverage. See file header
  * (v0.4 rationale) for what each dimension means.
  */

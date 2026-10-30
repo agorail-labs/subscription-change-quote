@@ -271,6 +271,7 @@ import {
   type DimensionState,
   type GuaranteeCoverage,
   type MutationOutcome,
+  type PostCommitStateVerification,
   type ProviderCapabilities,
   type ReconciliationResult,
   type SubscriptionChangeProposal,
@@ -289,6 +290,7 @@ import {
   validateCommit,
   checkAcceptanceEnvelope,
 } from "../core/scq-engine.js";
+import { verifyPostCommitState } from "../core/state-verification.js";
 import { QuoteStore, type StoredQuote } from "../store/quote-store.js";
 import { DurableQuoteStore } from "../store/durable-store.js";
 import { DispatchBlockedError, type DurableMutationCoordinator } from "../store/mutation-coordinator.js";
@@ -555,49 +557,50 @@ function statedItemsAreComplete(stated: StatedItem[], targetItems: Array<{ itemP
 }
 
 /**
- * Compares an ACTUAL provider item list (a re-read subscription's
- * items) against the intended target item set and returns
- * human-readable mismatch descriptions — item ids and quantities
- * only, never payloads. An empty result means the actual set
- * establishes the intended set EXACTLY: the same item_price_id
- * multiset (no missing item, no extra item, no duplicate entry)
- * with equal quantities per item. Used post-commit (PR #4 final
- * review, Fix B) to verify that a successful update_for_items
- * response actually landed the intended mutation before any
- * COMMITTED receipt is issued, and in the lost-response path to
- * decide whether the intended set landed. Incomplete actual entries
- * (missing id or quantity) are mismatches, never silently skipped.
+ * v0.6.2 (PR-9): the post-commit item-set verification is the
+ * shared core hook `verifyPostCommitState` at FULL_ITEM_SET
+ * coverage — this adapter no longer carries its own multiset
+ * implementation (the retired PR #4-era `itemSetMismatches`).
+ * Callers branch on the hook's VERDICT: VERIFIED means the re-read
+ * set establishes the intended set EXACTLY (the same item_price_id
+ * multiset — no missing item, no extra item, no duplicate entry —
+ * with equal quantities per item); incomplete actual entries
+ * (missing id or quantity) compute UNVERIFIABLE, never VERIFIED
+ * and never silently skipped, and callers distinguish that case
+ * through their data-completeness checks exactly as before. The
+ * hook's contradiction strings keep this adapter's established
+ * phrasings (missing / extra / duplicate / quantity mismatch),
+ * which the core comparison emits identically.
+ *
+ * This adapter's part is only normalization and expectation
+ * derivation: the re-read subscription becomes the hook's
+ * observation snapshot (an ABSENT subscription_items member stays
+ * absent in the observation — UNVERIFIABLE, never an empty set),
+ * and the expected set is the AUTHORIZED dispatched target
+ * (`input.items`), never the post-mutation state. The hook's
+ * verdict is consumed as STATE evidence only: execution,
+ * attribution, and financial establishment remain decided by this
+ * adapter's operation-bound bracket evidence, per the PR #16 L1 /
+ * PR #14 Z1–Z3 doctrine — the verdict never upgrades, downgrades,
+ * or classifies an outcome by itself.
  */
-function itemSetMismatches(
-  actual: Array<{ item_price_id?: unknown; quantity?: unknown }>,
+function verifyLandedItemSet(
+  after: CbSubscription,
+  proposal: SubscriptionChangeProposal,
   targetItems: Array<{ itemPriceId: string; quantity: number }>,
-): string[] {
-  const mismatches: string[] = [];
-  const targetQty = new Map<string, number>();
-  for (const t of targetItems) targetQty.set(t.itemPriceId, t.quantity);
-  const actualCount = new Map<string, number>();
-  const actualQty = new Map<string, number>();
-  for (const a of actual) {
-    if (typeof a.item_price_id !== "string" || typeof a.quantity !== "number") {
-      mismatches.push("an actual item entry is incomplete (missing item_price_id or quantity)");
-      continue;
-    }
-    actualCount.set(a.item_price_id, (actualCount.get(a.item_price_id) ?? 0) + 1);
-    actualQty.set(a.item_price_id, a.quantity);
-  }
-  for (const [id, count] of actualCount) {
-    if (count > 1) mismatches.push(`duplicate entries for item ${id} (×${count})`);
-  }
-  for (const [id, qty] of targetQty) {
-    if (!actualCount.has(id)) { mismatches.push(`missing item ${id} (intended quantity ${qty})`); continue; }
-    if (actualCount.get(id) === 1 && actualQty.get(id) !== qty) {
-      mismatches.push(`quantity mismatch for item ${id}: intended ${qty}, actual ${actualQty.get(id)}`);
-    }
-  }
-  for (const [id, qty] of actualQty) {
-    if (!targetQty.has(id)) mismatches.push(`extra item ${id} (actual quantity ${qty})`);
-  }
-  return mismatches;
+  source: string,
+): PostCommitStateVerification {
+  const snapshot = snapshotFrom(after);
+  return verifyPostCommitState(
+    { proposal, expectedItems: targetItems.map((t) => ({ id: t.itemPriceId, quantity: t.quantity })) },
+    {
+      snapshot: {
+        ...snapshot,
+        items: Array.isArray(after.subscription_items) ? snapshot.items : undefined,
+      },
+      source,
+    },
+  );
 }
 
 /**
@@ -1336,8 +1339,18 @@ export class ChargebeeLiveAdapter implements SubscriptionProvider {
     const quoteId = validated.quote_id;
     let after: CbSubscription | undefined;
     try { after = await this.readSubscription(validated.subscription_id); } catch { after = undefined; }
+    // PR-9: the intended-set probe is the shared core hook at
+    // FULL_ITEM_SET coverage. Its VERIFIED verdict feeds ONLY the
+    // diagnostic record below — per L1 it cannot and does not
+    // change this path's INDETERMINATE outcome.
     const intendedSetObserved =
-      after !== undefined && itemSetMismatches(after.subscription_items ?? [], input.items).length === 0;
+      after !== undefined &&
+      verifyLandedItemSet(
+        after,
+        validated.proposal,
+        input.items,
+        "chargebee-live adapter: post-dispatch state re-read after an unestablishable dispatch (GET /subscriptions/{id})",
+      ).verdict === "VERIFIED";
     const fingerprintMoved = after !== undefined && fingerprintOf(after) !== preDispatchFingerprint;
     this.store.recordCommitOutcome(quoteId, {
       outcome: "INDETERMINATE",
@@ -1498,7 +1511,22 @@ export class ChargebeeLiveAdapter implements SubscriptionProvider {
     }
 
     const snap = snapshotFrom(after);
-    const mismatches = itemSetMismatches(after.subscription_items ?? [], input.items);
+    // PR-9: the landed-set verification is the shared core hook at
+    // FULL_ITEM_SET coverage. VERIFIED enters the established-set
+    // branch below; the contradiction strings feed the reasons and
+    // records of the not-established branches (where the
+    // data-completeness check below has already separated
+    // UNVERIFIABLE-data cases, whose branch texts do not quote
+    // them). Attribution (the fingerprint bracket) and financial
+    // establishment remain this adapter's own evidence, exactly as
+    // before — the hook's verdict classifies nothing by itself.
+    const stateVerification = verifyLandedItemSet(
+      after,
+      validated.proposal,
+      input.items,
+      "chargebee-live adapter: independent post-commit subscription re-read (GET /subscriptions/{id})",
+    );
+    const mismatches = stateVerification.contradictions;
     const afterFingerprint = fingerprintOf(after);
     const respFingerprint = respSub ? fingerprintOf(respSub) : undefined;
     const bracketClosed = respFingerprint !== undefined && respFingerprint === afterFingerprint;
@@ -1522,7 +1550,7 @@ export class ChargebeeLiveAdapter implements SubscriptionProvider {
     const provRecurringDetermined =
       "post-commit subscription re-read: strict sum of provider-stated subscription_items[].amount over the re-read item set";
 
-    if (mismatches.length === 0) {
+    if (stateVerification.verdict === "VERIFIED") {
       // The independent re-read establishes the complete intended
       // item set. Attribution and financial establishment decide.
       if (!bracketClosed) {

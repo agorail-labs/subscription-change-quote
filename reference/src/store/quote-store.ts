@@ -19,6 +19,7 @@
 
 import { SCQError, type CommercialEffect, type GuaranteeCoverage, type GuaranteeMode, type MultiChangeConsistency, type MutationOutcome, type ProviderObservation, type ReconciliationResult, type SubscriptionChangeProposal, type SubscriptionChangeReceipt, type VerificationEvidence } from "../core/types.js";
 import { reconcileCommittedEffect } from "../core/scq-engine.js";
+import { verifyPostCommitState } from "../core/state-verification.js";
 
 /**
  * v0.6.2 (CORE-8 / findings-closure F4): a receipt's IDENTITY — the
@@ -868,91 +869,19 @@ export class QuoteStore {
  */
 const establishedEvidenceTokens = new WeakSet<object>();
 
-const TERMINAL_SUBSCRIPTION_STATES: ReadonlySet<string> = new Set(["cancelled", "canceled", "terminated"]);
-
 /**
- * Computes the §6.12 post-commit state verification FROM an
- * observation's resulting snapshot against the proposal's intent —
- * per change, action-specific (the D3 contract), provider-neutral:
- *   CHANGE_QUANTITY — the targeted item is present with exactly
- *     the intended quantity;
- *   CHANGE_PLAN — the targeted item carries the intended offering;
- *   CHANGE_CADENCE — the billing cadence matches the intent;
- *   CANCEL — the subscription reads in a terminal state. For a
- *     TERM_END / AT_DATE intent the snapshot alone cannot
- *     establish the scheduled-vs-terminal kind (it carries no
- *     cancellation schedule — the F3 read-time distinction), so a
- *     non-terminal read is UNVERIFIABLE there rather than a
- *     mismatch; for an IMMEDIATE cancel it is a MISMATCH.
- * A read that does not contain what a check needs (no snapshot,
- * no items list, an absent quantity/cadence/status member)
- * computes UNVERIFIABLE for that check — never VERIFIED. Any
- * established contradiction is a MISMATCH, and a mismatch is a
- * DETERMINED negative verification: it never collapses into
- * UNVERIFIABLE (D3).
+ * v0.6.2 (PR-9): the §6.12 state verification this module used to
+ * compute with a private `observedStateVerification` now lives in
+ * ONE shared provider-neutral core implementation —
+ * `verifyPostCommitState` (core/state-verification.ts) — consumed
+ * here by `establishVerification` (at ACTION_LEVEL coverage, the
+ * historical semantics exactly) and directly by adapters that
+ * perform their own post-commit establishment (at FULL_ITEM_SET
+ * coverage where they derive the expected resulting set). There
+ * is deliberately no second implementation left in this module:
+ * one computation, one set of semantics, pinned by test15
+ * (establishment, unchanged) and test31 (the shared hook).
  */
-function observedStateVerification(
-  quote: StoredQuote,
-  observation: ProviderObservation
-): "VERIFIED" | "MISMATCH" | "UNVERIFIABLE" {
-  const snapshot = observation.resultingSnapshot;
-  if (!snapshot) return "UNVERIFIABLE";
-  const changes = quote.proposal.changes;
-  if (!Array.isArray(changes) || changes.length === 0) return "UNVERIFIABLE";
-  let sawUnverifiable = false;
-  for (const change of changes) {
-    switch (change.action) {
-      case "CHANGE_QUANTITY": {
-        if (!Array.isArray(snapshot.items)) {
-          sawUnverifiable = true;
-          break;
-        }
-        const item = snapshot.items.find((candidate) => candidate.id === change.itemId);
-        if (!item) return "MISMATCH";
-        if (typeof item.quantity !== "number") {
-          sawUnverifiable = true;
-          break;
-        }
-        if (item.quantity !== change.quantity) return "MISMATCH";
-        break;
-      }
-      case "CHANGE_PLAN": {
-        if (!Array.isArray(snapshot.items)) {
-          sawUnverifiable = true;
-          break;
-        }
-        const item = snapshot.items.find((candidate) => candidate.id === change.itemId);
-        if (!item) return "MISMATCH";
-        if (item.offeringRef !== change.offeringRef) return "MISMATCH";
-        break;
-      }
-      case "CHANGE_CADENCE": {
-        const cadence = snapshot.billing?.cadence;
-        if (typeof cadence !== "string" || cadence.length === 0) {
-          sawUnverifiable = true;
-          break;
-        }
-        if (cadence.toUpperCase() !== change.cadence) return "MISMATCH";
-        break;
-      }
-      case "CANCEL": {
-        const status = snapshot.status;
-        if (typeof status !== "string" || status.length === 0) {
-          sawUnverifiable = true;
-          break;
-        }
-        if (!TERMINAL_SUBSCRIPTION_STATES.has(status.toLowerCase())) {
-          if (quote.proposal.effectiveIntent?.type === "IMMEDIATE") return "MISMATCH";
-          sawUnverifiable = true;
-        }
-        break;
-      }
-      default:
-        sawUnverifiable = true;
-    }
-  }
-  return sawUnverifiable ? "UNVERIFIABLE" : "VERIFIED";
-}
 
 /**
  * v0.6.2 (PR #8 review correction, round 2 — R3): THE trusted
@@ -969,9 +898,11 @@ function observedStateVerification(
  *     a revalidated preview, a pre-mutation estimate, or
  *     unestablished is refused, as is an observation that IS the
  *     quote's own quoted effect (the estimate itself, relabeled);
- *   - state verification: computed by `observedStateVerification`
- *     from the observation's resulting snapshot against the
- *     proposal's intent — the caller never asserts it;
+ *   - state verification: computed by the shared core hook
+ *     `verifyPostCommitState` from the observation's resulting
+ *     snapshot against the proposal's intent (ACTION_LEVEL
+ *     coverage — the establishment contract's historical
+ *     semantics) — the caller never asserts it;
  *   - reconciliation: computed by `reconcileCommittedEffect` from
  *     the quote, the observation's figures, and the envelope —
  *     never asserted either.
@@ -1025,7 +956,14 @@ export function establishVerification(quote: StoredQuote, observation: ProviderO
   const token: VerificationEvidence = {
     committedEffect: deepCopy(observation.committedEffect),
     committedSource: source,
-    stateVerification: observedStateVerification(quote, observation),
+    stateVerification: verifyPostCommitState(
+      { proposal: quote.proposal },
+      {
+        snapshot: observation.resultingSnapshot,
+        source: observation.source,
+        ...(observation.observedAt ? { observedAt: observation.observedAt } : {}),
+      }
+    ).verdict,
     reconciliation: reconcileCommittedEffect(quote.quoted_effect, observation.committedEffect, quote.proposal.acceptanceEnvelope),
     ...(observation.observedAt ? { at: observation.observedAt } : {}),
   };
