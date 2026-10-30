@@ -240,6 +240,7 @@ whose store refused to open, without adopting anything.
 | Retry of a CONFIRMED_NON_EXECUTION attempt while another attempt on the subscription is unresolved | Blocked under the same transaction before re-arming; zero additional dispatches (D2) | 29.8; legitimate retry after resolution: 29.9 |
 | Idempotency key presented under a different quote/subscription/site | Refused as a collision in any attempt state; the bound attempt is never re-associated (D2) | 29.10 |
 | Adapter configured with a durable store but no coordinator | Commit refused before any mutating call; zero mutations (D4) | 29.13 |
+| Coordinator bound to a different store than the adapter's (or to an in-memory store); attempt for a quote the database does not hold, or with a mismatched subscription/provider binding | Refused before any mutating call (adapter binding check) / inside the beginDispatch transaction (store-side association); zero orphan attempt rows in the wrong database (D5) | 30.1, 30.2 (adapter), 30.3, 30.4, 30.5 (store); correctly bound control: 30.6 |
 
 ## 4. Concurrency evidence
 
@@ -275,9 +276,10 @@ the first commit's, with the mock's mutation count still 1).
 ## 6. Verification (this branch)
 
 - Clean build via a fresh `npm ci` (lockfile-complete, native prebuild
-  installed from the lockfile) then `npm test`: **394/394** (baseline 351 +
-  43 new: test27 ×26, test28 ×4, test29 ×13 — the PR-17 review-correction
-  regressions, §9). New suites re-run for stability.
+  installed from the lockfile) then `npm test`: **400/400** (baseline 351 +
+  49 new: test27 ×26, test28 ×4, test29 ×13 — the PR-17 D1–D4
+  review-correction regressions, §9 — and test30 ×6, the D5 regressions,
+  §10). New suites re-run for stability.
 - `npm run smoke:pack`: OK. `npm run demo`: OK. `npm run demo:commit`: OK
   (COMMITTED / BEST_EFFORT / reconciliation OK).
 - Provider-neutrality: OK (core untouched). Freeze guard: `git diff` vs
@@ -288,9 +290,9 @@ the first commit's, with the mock's mutation count still 1).
   commit BLOCKED, **0 mutating calls** (also asserted as test 28.4).
 - Zero-real-mutation audit: every dispatch in the new suites is accounted
   for by injected mocked transports or the coordinator's dispatch counters;
-  no network transport is constructed anywhere in test27/test28.
-- Disclosed pre-existing test changes: **none** (including the §9
-  corrections round). 351/351 pre-existing tests pass unmodified.
+  no network transport is constructed anywhere in test27–test30.
+- Disclosed pre-existing test changes: **none** (including the §9 and §10
+  corrections rounds). 351/351 pre-existing tests pass unmodified.
 
 ## 7. Known limitations
 
@@ -460,3 +462,73 @@ existing live-commit gate are unchanged.
 **Regression.** 29.13 (mocked transport: the misconfigured commit is
 refused with the coordinator named in the error; the mock's mutation
 count stays 0).
+
+## 10. PR-17 re-review correction (D5)
+
+The owner's re-review at `454de24` accepted D1–D4 and found one
+remaining configuration-level gap. It was reproduced first by the
+new regressions in `test30-durable-binding-corrections.test.ts`
+(30.1–30.5 failed against `454de24`; 30.6 is the positive control),
+then fixed on this branch. No pre-existing test was modified.
+
+### D5 — A coordinator bound to the wrong database still authorized dispatch
+
+**Defect.** D4 made `beginDurableAttempt` refuse a MISSING
+coordinator, but it never checked that the coordinator present was
+bound to the adapter's own store: `durableCoordinator.store ===
+this.store` was verified nowhere, and the constructor performed no
+binding check either. Meanwhile `DurableQuoteStore.beginDispatch`
+inserted a write-ahead attempt without checking that
+`intent.quoteId` named a quote durably stored in that same
+database, or that the stored quote's subscription/provider matched
+the intent. Split-ledger scenario: quote Q lives in Store A; the
+adapter is configured with Store A + Coordinator B (bound to Store
+B, which has no Q). B's `beginDispatch` accepted an attempt for the
+non-existent Q and authorized the mutation; the receipt landed in
+A (which had no intent) while B's settle found no quote evidence
+and settled INDETERMINATE. Each database stayed individually
+coherent; the atomic intent↔receipt association was void.
+
+**Fix (two composing layers).** (1) Adapter binding:
+`beginDurableAttempt` now refuses — after the unchanged live-commit
+gate and the D4 missing-coordinator check, before any mutating
+call — unless the configured coordinator's store IS this adapter's
+store object and is a `DurableQuoteStore`. A coordinator over a
+different durable store, or over a plain in-memory `QuoteStore`
+(a cast away in TypeScript, a plain mistake in JavaScript),
+is refused with `blocked: "DURABLE_COORDINATOR_STORE_MISMATCH"`,
+distinctly from D4's `DURABLE_COORDINATOR_REQUIRED`. (2)
+Store-side association: `beginDispatch` validates, inside the same
+`BEGIN IMMEDIATE` transaction as its existing request-hash,
+key-binding, and D2 exclusion checks, that `intent.quoteId` names
+a quote durably stored in this database (a row in the `quotes`
+table) and that the stored row's `subscription_id` / `provider`
+match the intent. A refusal throws `DispatchBlockedError` inside
+the transaction, so it rolls back and leaves zero new attempt
+rows — no orphan attempts, whatever entry point (adapter or direct
+coordinator) presented the intent. The two layers compose: the
+adapter check catches the misconfiguration at the integration
+boundary with a configuration error, and the store check makes
+the invariant hold for every caller of the ledger, not only the
+Chargebee adapter.
+
+**Regressions.** 30.1 (the review's scenario end-to-end on two
+separate temporary SQLite databases: quote created via Store A;
+adapter = Store A + `liveCommitEnabled: true` + coordinator bound
+to Store B ⇒ the commit is refused as a binding mismatch before
+any mutation — mock mutation count 0 — Store B contains zero
+attempts for the quote and its recovery report shows no unresolved
+attempt, and Store A contains no attempt either), 30.2 (a
+coordinator bound to a plain in-memory `QuoteStore` supplied to an
+adapter with a `DurableQuoteStore` ⇒ the same named refusal, zero
+mutations), 30.3 (direct `beginDispatch` for a quote the database
+does not hold ⇒ `DispatchBlockedError`, zero attempt rows; the
+same refusal through `coordinator.execute`, whose dispatch
+function is never invoked), 30.4 (`beginDispatch` whose
+subscription differs from the stored quote's ⇒ refused, zero
+attempts), 30.5 (`beginDispatch` whose provider differs ⇒
+refused, zero attempts), 30.6 (positive control: coordinator
+bound to the SAME store object as the adapter commits end-to-end —
+COMMITTED_AND_VERIFIED, one mutation, the settled attempt in the
+same database; the restarted cross-instance flow remains pinned
+by 28.1).
