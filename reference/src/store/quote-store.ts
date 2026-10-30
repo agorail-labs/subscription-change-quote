@@ -17,7 +17,7 @@
 // relying on replay semantics; see
 // research/chargebee-live-v1/LIMITATIONS-AND-GAPS.md D-3.
 
-import { SCQError, type CommercialEffect, type GuaranteeCoverage, type GuaranteeMode, type MultiChangeConsistency, type MutationOutcome, type ProviderObservation, type ReconciliationResult, type SubscriptionChangeProposal, type SubscriptionChangeReceipt, type VerificationEvidence } from "../core/types.js";
+import { SCQError, type AuthorizationScope, type CommercialEffect, type GuaranteeCoverage, type GuaranteeMode, type MultiChangeConsistency, type MutationCapability, type MutationOutcome, type ProviderObservation, type ReconciliationResult, type SubscriptionChangeProposal, type SubscriptionChangeReceipt, type VerificationEvidence } from "../core/types.js";
 import { reconcileCommittedEffect } from "../core/scq-engine.js";
 import { verifyPostCommitState } from "../core/state-verification.js";
 
@@ -129,6 +129,22 @@ export type StoredQuote<TPreviewInput = unknown> = {
   guarantee_coverage: GuaranteeCoverage;
   /** v0.5: whether committing changes.length > 1 changes together is ATOMIC / BEST_EFFORT / UNSUPPORTED for this proposal. */
   multi_change_consistency: MultiChangeConsistency;
+  /**
+   * PR-14 (additive, optional): the effective authorization scope
+   * recorded at quote creation (the proposal's declaration, or
+   * OPERATION when undeclared). Absent on quotes persisted before
+   * PR-14 — readers MUST treat absence as OPERATION, never as
+   * broader consent.
+   */
+  authorization_scope?: AuthorizationScope;
+  /**
+   * PR-14 (additive, optional): the mutation capability the creating
+   * adapter declared for this quote at creation. A record of what
+   * was disclosed, NOT an authority: at commit the adapter's current
+   * declaration governs, and an absent or unknown value classifies
+   * as the weakest (FULL_REPLACEMENT_ONLY).
+   */
+  authorization_capability?: MutationCapability;
   // Provider-specific inputs captured at quote time, replayed verbatim on commit.
   provider_preview_input: TPreviewInput;
   /** What was computed and shown to the caller at quote time — becomes the receipt's quotedEffect, unmodified. */

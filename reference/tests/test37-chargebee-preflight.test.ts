@@ -3,6 +3,7 @@ import assert from "node:assert/strict";
 import { mkdtempSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { SCQError } from "../src/core/types.js";
 import { ChargebeeClient, type HttpTransport } from "../src/live/chargebee-http.js";
 import { ChargebeeLiveAdapter } from "../src/live/chargebee-scq-adapter.js";
 import { PilotMockChargebee, type PilotMockFaults } from "../src/live/pilot/mock-transport.js";
@@ -426,7 +427,39 @@ test("Test 37.18: a recorded receipt means replay posture — a new commit is no
     providerSite: SITE,
   });
   const quote = await adapter.createChangeQuote(SUB, PROPOSAL(21));
-  await adapter.commitChangeQuote(quote.id);
+  // PR-14 MIGRATION: the fixture formerly produced the recorded
+  // receipt by committing through the adapter; the commit now
+  // refuses at the preservation gate (asserted here so the
+  // fixture's premise is explicit), so the receipt is seeded
+  // through the durable store's own recording API. The preflight
+  // behavior under test — a recorded receipt means replay posture —
+  // is unchanged.
+  await assert.rejects(
+    () => adapter.commitChangeQuote(quote.id),
+    (e: unknown) => e instanceof SCQError && e.code === "AUTHORIZATION_PRESERVATION_UNENFORCEABLE",
+  );
+  const storedQuote = store0.get(quote.id)!;
+  const snapshot = await adapter.getSubscription(SUB);
+  store0.recordCommitReceipt(quote.id, {
+    receiptId: "rcpt_test37_18_fixture",
+    quoteId: quote.id,
+    subscriptionRef: SUB,
+    status: "COMMITTED",
+    outcome: "COMMITTED_AND_VERIFIED",
+    resultingSnapshot: snapshot,
+    quotedEffect: storedQuote.quoted_effect,
+    committedEffect: {
+      immediate: { net: 20000 },
+      recurring: { resultingAmount: 80900, currency: "USD" },
+      determinacy: { immediateFinancialEffect: "DETERMINED", recurringFinancialEffect: "DETERMINED" },
+      provenance: { committedSource: "provider_actual" },
+    },
+    guaranteeMode: storedQuote.effective_guarantee_mode,
+    consistencyGuarantee: "BEST_EFFORT",
+    multiChangeConsistency: storedQuote.multi_change_consistency,
+    reconciliation: { status: "OK" },
+    committedAt: new Date().toISOString(),
+  } as any);
   store0.close();
   const store = openStore(path);
   const report = await runPreflight({

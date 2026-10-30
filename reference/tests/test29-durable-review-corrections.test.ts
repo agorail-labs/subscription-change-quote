@@ -86,11 +86,24 @@ test("Test 29.2 (D1): recordCommitReceipt failing INSIDE the persist transaction
 });
 
 test("Test 29.3 (D1, adapter replay path): a commit whose receipt persistence fails cannot be replayed by a second commitChangeQuote on the failed store; after restart the unresolved attempt blocks any further mutation", async () => {
+  // PR-14 MIGRATION: the original scenario drove a dispatched
+  // commit whose RECEIPT recording failed mid-flow. The adapter no
+  // longer dispatches, so the adapter-level durable write a commit
+  // now performs is the preservation gate's outcome recording —
+  // the fault is re-aimed at `recordCommitOutcome`, and every D1
+  // protection is asserted in its new form: the persistence
+  // failure surfaces (never absorbed), the poisoned store serves
+  // no volatile record to a second commit (reads fail closed —
+  // the §6.10-replay protection), nothing survives the restart,
+  // no ledger attempt exists (the gate precedes the ledger), and
+  // the reopened adapter's commit refuses at the gate with zero
+  // mutations throughout. The receipt-recording failure semantics
+  // themselves remain covered at the store level by 29.1/29.2.
   const path = tmpDb();
   const mock = new PilotMockChargebee();
   const store = new DurableQuoteStore(path, {
     recoveryGraceMs: 0,
-    faults: { beforePersist: (op: string) => { if (op === "recordCommitReceipt") throw new Error("simulated disk failure at receipt recording"); } },
+    faults: { beforePersist: (op: string) => { if (op === "recordCommitOutcome") throw new Error("simulated disk failure at outcome recording"); } },
   });
   const adapter = new ChargebeeLiveAdapter(pilotClient(mock), store, {
     liveCommitEnabled: true,
@@ -98,25 +111,35 @@ test("Test 29.3 (D1, adapter replay path): a commit whose receipt persistence fa
     providerSite: "pilot-test",
   });
   const quote = await adapter.createChangeQuote(SUB, PROPOSAL(21));
-  await assert.rejects(() => adapter.commitChangeQuote(quote.id), "the persistence failure surfaces from the commit");
-  assert.equal(mock.mutationCount, 1, "the mocked dispatch happened exactly once");
   await assert.rejects(
     () => adapter.commitChangeQuote(quote.id),
-    "a second commit must NOT be served the volatile, unpersisted receipt as a §6.10 replay",
+    (e: unknown) => e instanceof DurableStoreError,
+    "the refusal's outcome-persistence failure surfaces from the commit as a store error — never silently absorbed",
   );
-  assert.equal(mock.mutationCount, 1);
+  assert.equal(mock.mutationCount, 0, "no dispatch occurred — the failure is at the gate's durable outcome write");
+  await assert.rejects(
+    () => adapter.commitChangeQuote(quote.id),
+    (e: unknown) => e instanceof DurableStoreError,
+    "a second commit must NOT be served volatile, unpersisted state — the poisoned store fails its reads closed",
+  );
+  assert.equal(mock.mutationCount, 0);
   store.close();
 
   const reopened = new DurableQuoteStore(path, { recoveryGraceMs: 0 });
   assert.equal(reopened.recordedReceipt(quote.id), undefined, "no fabricated receipt survives the restart");
-  assert.equal(reopened.attemptsForQuote(quote.id)[0].state, "INDETERMINATE", "the write-ahead attempt recovered unresolved");
+  assert.equal(reopened.get(quote.id)?.commit_outcome, undefined, "the failed outcome recording was never persisted — a restart has nothing volatile to expose");
+  assert.equal(reopened.attemptsForQuote(quote.id).length, 0, "no ledger attempt exists — the gate precedes the ledger");
   const reopenedAdapter = new ChargebeeLiveAdapter(pilotClient(mock), reopened, {
     liveCommitEnabled: true,
     durableCoordinator: new DurableMutationCoordinator(reopened),
     providerSite: "pilot-test",
   });
-  await assert.rejects(() => reopenedAdapter.commitChangeQuote(quote.id), /INDETERMINATE/);
-  assert.equal(mock.mutationCount, 1, "the unresolved attempt prevents another mutation after restart");
+  await assert.rejects(
+    () => reopenedAdapter.commitChangeQuote(quote.id),
+    (e: unknown) => e instanceof SCQError && e.code === "AUTHORIZATION_PRESERVATION_UNENFORCEABLE",
+    "the reopened adapter refuses at the preservation gate",
+  );
+  assert.equal(mock.mutationCount, 0, "no mutation after restart");
   reopened.close();
 });
 
@@ -347,6 +370,16 @@ test("Test 29.12 (D3 controls): attribution follows the recorded evidence — bo
 // --- D4: durable store without its coordinator must refuse before dispatch ----
 
 test("Test 29.13 (D4): a Chargebee adapter given a DurableQuoteStore and liveCommitEnabled but NO durableCoordinator refuses the commit before any mutating call", async () => {
+  // PR-14 MIGRATION (refusal precedence): the preservation gate
+  // sits ahead of the write-ahead gate by design, so a commit
+  // through this misconfigured adapter now refuses with the
+  // preservation code before beginDurableAttempt's coordinator
+  // check is reached. D4's safety property is preserved verbatim —
+  // the misconfiguration still results in refusal before any
+  // mutating call, with zero attempts — and the DURABLE_COORDINATOR_
+  // REQUIRED check remains implemented in beginDurableAttempt,
+  // guarding the dispatch path for any future permitting
+  // capability. What changed is only WHICH refusal fires first.
   const path = tmpDb();
   const mock = new PilotMockChargebee();
   const store = new DurableQuoteStore(path, { recoveryGraceMs: 0 });
@@ -354,9 +387,10 @@ test("Test 29.13 (D4): a Chargebee adapter given a DurableQuoteStore and liveCom
   const quote = await adapter.createChangeQuote(SUB, PROPOSAL(21));
   await assert.rejects(
     () => adapter.commitChangeQuote(quote.id),
-    (e: unknown) => e instanceof SCQError && /DurableQuoteStore/.test(e.message) && /coordinator/i.test(e.message),
-    "the misconfiguration must be refused explicitly, naming the missing coordinator",
+    (e: unknown) => e instanceof SCQError && e.code === "AUTHORIZATION_PRESERVATION_UNENFORCEABLE",
+    "the earlier preservation gate refuses the commit (precedence over the coordinator check behind it)",
   );
   assert.equal(mock.mutationCount, 0, "no mutating call may occur without a write-ahead attempt");
+  assert.equal(store.attemptsForQuote(quote.id).length, 0, "no attempt was created");
   store.close();
 });

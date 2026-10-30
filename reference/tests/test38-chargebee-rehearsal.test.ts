@@ -30,25 +30,36 @@ test("Test 38.1: rehearsal completes with honestly classified evidence", async (
   assert.equal(r.allPassed, true, JSON.stringify(r.scenarios.filter((s) => !s.pass), null, 2));
 });
 
-test("Test 38.2: successful dispatch is durably recorded as COMMITTED_AND_VERIFIED", async () => {
+// PR-14 migration (Tests 38.2–38.4, 38.7–38.10): the adapter-level
+// scenarios rh-01/02/03/06/07/08/09 previously rehearsed dispatch
+// outcomes of the live adapter. PR-14's preservation gate refuses
+// those commits pre-dispatch, so the scenarios now rehearse the
+// refusal; scenario ids are retained for evidence continuity and
+// these assertions state the CURRENT expected behavior. The
+// INDETERMINATE ledger scenarios (38.5, 38.6, 38.14) are unchanged.
+
+test("Test 38.2 (PR-14): the update commit refuses pre-dispatch — no dispatch, no attempt, no receipt; outcome CONFIRMED_NON_EXECUTION", async () => {
   const s = scenario(await rehearsal(), "rh-01-successful-dispatch");
-  assert.equal(s.expectedOutcome, "COMMITTED_AND_VERIFIED");
-  assert.equal(s.observedOutcome, "COMMITTED_AND_VERIFIED");
+  assert.equal(s.expectedOutcome, "CONFIRMED_NON_EXECUTION");
+  assert.equal(s.observedOutcome, "CONFIRMED_NON_EXECUTION");
   assert.equal(s.pass, true);
+  assert.match(s.evidence, /AUTHORIZATION_PRESERVATION_UNENFORCEABLE/);
+  assert.match(s.evidence, /no dispatch was made/i);
 });
 
-test("Test 38.3: the exact original receipt replays after restart — no second dispatch", async () => {
+test("Test 38.3 (PR-14): the preservation refusal is deterministic after restart — no receipt exists to replay, no second dispatch", async () => {
   const s = scenario(await rehearsal(), "rh-02-exact-receipt-replay");
   assert.equal(s.pass, true);
-  assert.match(s.evidence, /mutation/i);
+  assert.match(s.evidence, /mutation count 0/i);
 });
 
-test("Test 38.4: lost response after a provider-side effect is INDETERMINATE — execution is never inferred from state", async () => {
+test("Test 38.4 (PR-14): the armed lost-response fault is never exercised — a pre-dispatch refusal is CONFIRMED_NON_EXECUTION, never INDETERMINATE", async () => {
   const s = scenario(await rehearsal(), "rh-03-lost-response");
-  assert.equal(s.expectedOutcome, "INDETERMINATE");
-  assert.equal(s.observedOutcome, "INDETERMINATE");
+  assert.equal(s.expectedOutcome, "CONFIRMED_NON_EXECUTION");
+  assert.equal(s.observedOutcome, "CONFIRMED_NON_EXECUTION");
   assert.equal(s.pass, true);
   assert.match(s.evidence, /no receipt/i);
+  assert.match(s.evidence, /never exercised/i);
 });
 
 test("Test 38.5: crash after write-ahead intent recovers the attempt as INDETERMINATE and dispatch never ran", async () => {
@@ -63,31 +74,31 @@ test("Test 38.6: crash after dispatch, before receipt persistence, is INDETERMIN
   assert.equal(s.pass, true);
 });
 
-test("Test 38.7: success-shaped response with the wrong resulting item set is INDETERMINATE, never committed", async () => {
+test("Test 38.7 (PR-14): the armed silent-ignore fault is never exercised — the refusal precedes any success-shaped response", async () => {
   const s = scenario(await rehearsal(), "rh-06-wrong-item-set");
-  assert.equal(s.expectedOutcome, "INDETERMINATE");
-  assert.equal(s.observedOutcome, "INDETERMINATE");
+  assert.equal(s.expectedOutcome, "CONFIRMED_NON_EXECUTION");
+  assert.equal(s.observedOutcome, "CONFIRMED_NON_EXECUTION");
   assert.equal(s.pass, true);
 });
 
-test("Test 38.8: an unexpected mandatory addon is recorded as a reconciliation VIOLATION on the attributable committed receipt", async () => {
+test("Test 38.8 (PR-14): the provider-attached-item hazard class is removed by refusal — no landed set exists to violate reconciliation", async () => {
   const s = scenario(await rehearsal(), "rh-07-mandatory-addon");
   assert.equal(s.pass, true);
-  assert.equal(s.observedOutcome, "COMMITTED_AND_VERIFIED");
-  assert.match(s.evidence, /VIOLATED/);
+  assert.equal(s.observedOutcome, "CONFIRMED_NON_EXECUTION");
+  assert.match(s.evidence, /AUTHORIZATION_PRESERVATION_UNENFORCEABLE/);
 });
 
-test("Test 38.9: unknown financial actuals yield COMMITTED_UNVERIFIED, not a verified receipt", async () => {
+test("Test 38.9 (PR-14): the unknown-financials response class is unreachable — the refusal precedes dispatch", async () => {
   const s = scenario(await rehearsal(), "rh-08-unknown-financials");
-  assert.equal(s.expectedOutcome, "COMMITTED_UNVERIFIED");
-  assert.equal(s.observedOutcome, "COMMITTED_UNVERIFIED");
+  assert.equal(s.expectedOutcome, "CONFIRMED_NON_EXECUTION");
+  assert.equal(s.observedOutcome, "CONFIRMED_NON_EXECUTION");
   assert.equal(s.pass, true);
 });
 
-test("Test 38.10: an established envelope violation is recorded as reconciliation VIOLATED on the committed receipt", async () => {
+test("Test 38.10 (PR-14): the post-commit envelope-violation class is unreachable — no committed receipt exists to violate", async () => {
   const s = scenario(await rehearsal(), "rh-09-envelope-violation");
   assert.equal(s.pass, true);
-  assert.match(s.evidence, /VIOLATED/);
+  assert.match(s.evidence, /AUTHORIZATION_PRESERVATION_UNENFORCEABLE/);
 });
 
 test("Test 38.11: concurrent attempts on the same subscription — the second is refused, exactly one attempt proceeds", async () => {

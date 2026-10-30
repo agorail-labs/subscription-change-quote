@@ -21,6 +21,23 @@
  *   (condition 4 remains a human act);
  * - never a conversion of INDETERMINATE into a safe retry: matching
  *   state alone does not establish execution (PR-7 review L1).
+ *
+ * PR-14 (Issue #22, Finding 1) reclassification: the live adapter's
+ * update commits are now refused pre-dispatch by the authorization
+ * preservation gate (its only dispatch is a full-list replacement
+ * on a FULL_REPLACEMENT_ONLY capability, which cannot preserve
+ * unrelated state under OPERATION authorization). The adapter-level
+ * scenarios that previously rehearsed dispatch outcomes
+ * (rh-01/02/03/06/07/08/09/14) now rehearse the refusal and the
+ * unreachability of their former fault classes through this
+ * adapter; rh-13's unresolved attempt is constructed at the
+ * coordinator/ledger level (the construction rh-04/rh-05 always
+ * used), because the adapter no longer creates one. Scenario ids
+ * are retained from PR-11/PR-12 for evidence continuity; titles and
+ * expected outcomes state the current behavior. The INDETERMINATE /
+ * COMMITTED_UNVERIFIED / VIOLATED classification machinery is
+ * unchanged and remains rehearsed at the ledger level (rh-04/05/13)
+ * and in the simulator and store suites.
  */
 
 import { mkdtempSync } from "node:fs";
@@ -141,38 +158,53 @@ function result(id: string, title: string, expectedOutcome: string, observedOutc
   return { id, title, expectedOutcome, observedOutcome, pass, evidence };
 }
 
+const GATE_CODE = "AUTHORIZATION_PRESERVATION_UNENFORCEABLE";
+
+/** PR-14: runs a commit and reports the refusal's code + recorded outcome class. */
+async function commitRefusal(adapter: ChargebeeLiveAdapter, quoteId: string): Promise<{ code: string; outcome: string }> {
+  try {
+    const receipt = await adapter.commitChangeQuote(quoteId);
+    return { code: "NO_REFUSAL", outcome: String(receipt.outcome ?? receipt.status) };
+  } catch (e) {
+    return {
+      code: e instanceof SCQError ? String(e.code) : "error",
+      outcome: e instanceof SCQError ? String((e.details as any)?.outcome ?? e.code) : "error",
+    };
+  }
+}
+
 async function rh01(): Promise<RehearsalScenarioResult> {
   const { store, adapter, quoteId, counted: c } = await quoteAndCommit();
-  const receipt = await adapter.commitChangeQuote(quoteId);
+  const refusal = await commitRefusal(adapter, quoteId);
   const stored = store.get(quoteId);
-  const pass = receipt.outcome === "COMMITTED_AND_VERIFIED" && receipt.reconciliation?.status === "OK" && stored?.commit_receipt?.receiptId === receipt.receiptId && c.dispatches() === 1;
+  const attempts = store.allAttempts().filter((a) => a.quoteId === quoteId);
+  const pass = refusal.code === GATE_CODE && refusal.outcome === "CONFIRMED_NON_EXECUTION" && c.dispatches() === 0 && attempts.length === 0 && stored?.commit_receipt === undefined && stored?.commit_outcome?.outcome === "CONFIRMED_NON_EXECUTION";
   store.close();
-  return result("rh-01-successful-dispatch", "Successful dispatch + durable recording", "COMMITTED_AND_VERIFIED", String(receipt.outcome ?? receipt.status),
-    pass, `receipt ${receipt.receiptId} persisted on the durable quote record; reconciliation ${receipt.reconciliation?.status}; exactly ${c.dispatches()} update dispatch`);
+  return result("rh-01-successful-dispatch", "Update commit refuses pre-dispatch — authorization preservation gate (PR-14)", "CONFIRMED_NON_EXECUTION", refusal.outcome,
+    pass, `refusal ${refusal.code}: no dispatch was made (update dispatches: ${c.dispatches()}), no durable attempt was created, no receipt was recorded, and the quote's recorded outcome is CONFIRMED_NON_EXECUTION. PR-14 migration: this scenario previously rehearsed a successful COMMITTED_AND_VERIFIED dispatch; the adapter's full-list replacement dispatch is now refused for OPERATION-authorized quotes because preservation of unrelated state cannot be enforced (Issue #22 Finding 1). The scenario id is retained from PR-11 for evidence continuity.`);
 }
 
 async function rh02(): Promise<RehearsalScenarioResult> {
   const { path, store, adapter, quoteId, mock } = await quoteAndCommit();
-  const first = await adapter.commitChangeQuote(quoteId);
+  const first = await commitRefusal(adapter, quoteId);
   store.close();
   const reopened = openStore(path);
   const adapter2 = adapterFor(reopened, mock.transport as HttpTransport);
-  const replayed = await adapter2.commitChangeQuote(quoteId);
-  const pass = JSON.stringify(replayed) === JSON.stringify(first) && mock.mutationCount === 1;
-  const evidence = `replayed receipt deep-equals the original after restart; provider mutation count ${mock.mutationCount} (no second mutation)`;
+  const second = await commitRefusal(adapter2, quoteId);
+  const pass = first.code === GATE_CODE && second.code === GATE_CODE && first.outcome === second.outcome && mock.mutationCount === 0 && reopened.allAttempts().length === 0 && reopened.get(quoteId)?.commit_receipt === undefined;
+  const evidence = `both commits — before and after the restart — refused with the identical ${GATE_CODE} / ${first.outcome}; provider mutation count ${mock.mutationCount}; no receipt was ever recorded, so §6.10 replay has nothing to replay for a refused commit and the refusal itself is the deterministic replay. PR-14 migration of the former exact-receipt-replay scenario (id retained for evidence continuity).`;
   reopened.close();
-  return result("rh-02-exact-receipt-replay", "Exact original-receipt replay after restart", "COMMITTED_AND_VERIFIED", String(replayed.outcome ?? replayed.status), pass, evidence);
+  return result("rh-02-exact-receipt-replay", "Preservation refusal is deterministic across restart — no receipt exists to replay (PR-14)", "CONFIRMED_NON_EXECUTION", second.outcome, pass, evidence);
 }
 
 async function rh03(): Promise<RehearsalScenarioResult> {
   const { store, adapter, quoteId, mock } = await quoteAndCommit({ loseUpdateResponse: true });
-  let outcome = "";
-  try { await adapter.commitChangeQuote(quoteId); } catch (e) { outcome = e instanceof SCQError ? String((e.details as any)?.outcome ?? e.code) : "error"; }
+  const refusal = await commitRefusal(adapter, quoteId);
   const stored = store.get(quoteId);
-  const pass = outcome === "INDETERMINATE" && stored?.commit_receipt === undefined && stored?.commit_outcome?.outcome === "INDETERMINATE";
-  const evidence = `provider-side mutation count ${mock.mutationCount} (the effect may have landed), yet SCQ records no receipt and classifies the outcome INDETERMINATE — execution is never inferred from matching state alone`;
+  const pass = refusal.code === GATE_CODE && refusal.outcome === "CONFIRMED_NON_EXECUTION" && stored?.commit_receipt === undefined && stored?.commit_outcome?.outcome === "CONFIRMED_NON_EXECUTION" && mock.mutationCount === 0;
+  const evidence = `the lose-response fault was armed on the mock but never exercised: the commit dispatched nothing (provider mutation count ${mock.mutationCount}), so no response existed to lose and SCQ records no receipt. The refusal is CONFIRMED_NON_EXECUTION — a pre-dispatch preservation refusal is never classified INDETERMINATE. Lost-response INDETERMINATE semantics remain rehearsed at the ledger level by rh-04/rh-05. PR-14 migration (id retained for evidence continuity).`;
   store.close();
-  return result("rh-03-lost-response", "Lost response after provider-side effect", "INDETERMINATE", outcome, pass, evidence);
+  return result("rh-03-lost-response", "Armed lost-response fault is never exercised — the refusal precedes dispatch (PR-14)", "CONFIRMED_NON_EXECUTION", refusal.outcome, pass, evidence);
 }
 
 async function rh04(): Promise<RehearsalScenarioResult> {
@@ -230,53 +262,43 @@ async function rh05(): Promise<RehearsalScenarioResult> {
 }
 
 async function rh06(): Promise<RehearsalScenarioResult> {
-  const { store, adapter, quoteId } = await quoteAndCommit({ silentIgnoreUpdate: true });
-  let outcome = "";
-  try { await adapter.commitChangeQuote(quoteId); } catch (e) { outcome = e instanceof SCQError ? String((e.details as any)?.outcome ?? e.code) : "error"; }
+  const { store, adapter, quoteId, mock } = await quoteAndCommit({ silentIgnoreUpdate: true });
+  const refusal = await commitRefusal(adapter, quoteId);
   const stored = store.get(quoteId);
-  const pass = outcome === "INDETERMINATE" && stored?.commit_receipt === undefined;
+  const pass = refusal.code === GATE_CODE && refusal.outcome === "CONFIRMED_NON_EXECUTION" && stored?.commit_receipt === undefined && mock.mutationCount === 0;
   store.close();
-  return result("rh-06-wrong-item-set", "Success-shaped response with the WRONG resulting item set", "INDETERMINATE", outcome, pass,
-    "the response claimed success but the independently re-read item set does not match the authorized change; no receipt is recorded");
+  return result("rh-06-wrong-item-set", "Armed silent-ignore fault is never exercised — the refusal precedes dispatch (PR-14)", "CONFIRMED_NON_EXECUTION", refusal.outcome, pass,
+    `the silent-ignore fault was armed on the mock but never exercised: refusal ${GATE_CODE} preceded any dispatch (provider mutation count ${mock.mutationCount}), so no success-shaped response existed to misread, and no receipt is recorded. The success-shaped-but-unapplied classification remains implemented in the dispatch path for a future permitting capability. PR-14 migration (id retained for evidence continuity).`);
 }
 
 async function rh07(): Promise<RehearsalScenarioResult> {
-  const { store, adapter, quoteId } = await quoteAndCommit({ mandatoryAddonOnUpdate: "pilot-addon-mandatory" });
-  const receipt = await adapter.commitChangeQuote(quoteId);
-  const pass = receipt.outcome === "COMMITTED_AND_VERIFIED" && receipt.reconciliation?.status === "VIOLATED";
+  const { store, adapter, quoteId, mock } = await quoteAndCommit({ mandatoryAddonOnUpdate: "pilot-addon-mandatory" });
+  const refusal = await commitRefusal(adapter, quoteId);
+  const stored = store.get(quoteId);
+  const pass = refusal.code === GATE_CODE && refusal.outcome === "CONFIRMED_NON_EXECUTION" && stored?.commit_receipt === undefined && mock.mutationCount === 0;
   store.close();
-  return result("rh-07-mandatory-addon", "Unexpected mandatory addon in the resulting state", "COMMITTED_AND_VERIFIED", String(receipt.outcome ?? receipt.status), pass,
-    "the commit landed and is attributable (response state and independent re-read agree), so the receipt records it — with reconciliation VIOLATED: an item the change never requested (pilot-addon-mandatory) is in the resulting set. Reporting the violation does not roll anything back; compensation is a separate, separately authorized decision");
+  return result("rh-07-mandatory-addon", "Provider-attached-item hazard class removed — the refusal precedes dispatch (PR-14)", "CONFIRMED_NON_EXECUTION", refusal.outcome, pass,
+    `the mock was armed to attach pilot-addon-mandatory on update, but refusal ${GATE_CODE} preceded any dispatch (provider mutation count ${mock.mutationCount}): an item outside the authorized change can no longer appear in a landed set through this adapter at all — the preservation hazard class this scenario formerly recorded as a reconciliation VIOLATED receipt is removed by refusing the unsafe dispatch, not by detecting its result. Attributable-VIOLATED receipt semantics remain implemented for permitting capabilities and are covered by the simulator suites. PR-14 migration (id retained for evidence continuity).`);
 }
 
 async function rh08(): Promise<RehearsalScenarioResult> {
-  const { store, adapter, quoteId } = await quoteAndCommit({ incompleteUpdateResponse: true });
-  const receipt = await adapter.commitChangeQuote(quoteId);
-  const pass = receipt.outcome === "COMMITTED_UNVERIFIED" && receipt.reconciliation?.status === "UNVERIFIED";
+  const { store, adapter, quoteId, mock } = await quoteAndCommit({ incompleteUpdateResponse: true });
+  const refusal = await commitRefusal(adapter, quoteId);
+  const stored = store.get(quoteId);
+  const pass = refusal.code === GATE_CODE && refusal.outcome === "CONFIRMED_NON_EXECUTION" && stored?.commit_receipt === undefined && mock.mutationCount === 0;
   store.close();
-  return result("rh-08-unknown-financials", "Unknown financial actuals after a landed commit", "COMMITTED_UNVERIFIED", String(receipt.outcome ?? receipt.status), pass,
-    `the response establishes the landing but not the financial actuals; receipt is COMMITTED_UNVERIFIED with reconciliation ${receipt.reconciliation?.status} — unknown figures are never presented as verified`);
+  return result("rh-08-unknown-financials", "Unknown-financials response class unreachable — the refusal precedes dispatch (PR-14)", "CONFIRMED_NON_EXECUTION", refusal.outcome, pass,
+    `the incomplete-response fault was armed but never exercised: refusal ${GATE_CODE} preceded any dispatch (provider mutation count ${mock.mutationCount}), so no landed commit exists whose financials could be unknown, and no receipt is recorded. The COMMITTED_UNVERIFIED classification remains implemented in the dispatch path and is covered by the simulator and store suites. PR-14 migration (id retained for evidence continuity).`);
 }
 
 async function rh09(): Promise<RehearsalScenarioResult> {
-  const inflate: (inner: HttpTransport) => HttpTransport = (inner) => async (req) => {
-    const res = await inner(req);
-    if (req.method === "GET" && req.url.includes("/subscriptions/") && res.json) {
-      const json = JSON.parse(JSON.stringify(res.json));
-      for (const item of json.subscription.subscription_items ?? []) {
-        if (typeof item.amount === "number") item.amount += 1000;
-        if (typeof item.unit_price === "number") item.unit_price += 1000;
-      }
-      return { ...res, json };
-    }
-    return res;
-  };
-  const { store, adapter, quoteId } = await quoteAndCommit({}, inflate);
-  const receipt = await adapter.commitChangeQuote(quoteId);
-  const pass = receipt.reconciliation?.status === "VIOLATED";
-  const evidence = `post-commit actuals established from an independent re-read exceed the zero-tolerance envelope; reconciliation is VIOLATED on the committed receipt — reporting the violation does not roll anything back; compensation is a separate, separately authorized decision`;
+  const { store, adapter, quoteId, mock } = await quoteAndCommit();
+  const refusal = await commitRefusal(adapter, quoteId);
+  const stored = store.get(quoteId);
+  const pass = refusal.code === GATE_CODE && refusal.outcome === "CONFIRMED_NON_EXECUTION" && stored?.commit_receipt === undefined && mock.mutationCount === 0;
+  const evidence = `refusal ${GATE_CODE} preceded any dispatch (provider mutation count ${mock.mutationCount}), so no committed receipt exists whose post-commit actuals could violate the envelope. PR-14 migration: this scenario formerly inflated post-commit re-reads to manufacture an established envelope violation on a committed receipt — that outcome class is unreachable through this adapter while the preservation gate refuses its only dispatch. Pre-commit envelope enforcement (QUOTE_DRIFTED, before any dispatch) is unaffected and remains covered by the adapter suites. Scenario id retained for evidence continuity.`;
   store.close();
-  return result("rh-09-envelope-violation", "Financially established envelope violation", "COMMITTED_AND_VERIFIED", String(receipt.outcome ?? receipt.status), pass, evidence);
+  return result("rh-09-envelope-violation", "Post-commit envelope-violation class unreachable — the refusal precedes dispatch (PR-14)", "CONFIRMED_NON_EXECUTION", refusal.outcome, pass, evidence);
 }
 
 async function rh10(): Promise<RehearsalScenarioResult> {
@@ -346,15 +368,38 @@ async function rh12(): Promise<RehearsalScenarioResult> {
 }
 
 async function rh13(): Promise<RehearsalScenarioResult> {
-  const { path, store, adapter, quoteId } = await quoteAndCommit({ loseUpdateResponse: true });
-  await adapter.commitChangeQuote(quoteId).catch(() => undefined);
+  // PR-14: the unresolved attempt is constructed at the
+  // coordinator/ledger level — the construction rh-04/rh-05 always
+  // used — because the live adapter no longer creates one: its
+  // update commits refuse at the preservation gate before the
+  // ledger. The operator-review semantics under rehearsal are
+  // unchanged.
+  const path = tmpDb();
+  const store = openStore(path);
+  const quote = rehearsalQuote("rh13-quote");
+  store.put(quote);
+  const mock = new PilotMockChargebee({ loseUpdateResponse: true });
+  const client = new ChargebeeClient({ site: SITE, apiKey: "pilot-mock-key" }, mock.transport as HttpTransport);
+  const coordinator = new DurableMutationCoordinator(store);
+  const intent = {
+    quoteId: quote.quote_id, subscriptionId: SUB, provider: "chargebee" as const, site: SITE,
+    request: buildChargebeeUpdateParams([{ itemPriceId: ADDON, quantity: 21 }]),
+    idempotencyKey: `scq-${quote.quote_id}`,
+  };
+  await coordinator.execute(intent, async () => {
+    // The mocked dispatch's response is lost (armed fault); the
+    // coordinator records the attempt INDETERMINATE — execution is
+    // never inferred from state.
+    await client.updateForItems(SUB, intent.request, intent.idempotencyKey).catch(() => undefined);
+    return { type: "outcome" as const, outcome: "INDETERMINATE" as const };
+  }).catch(() => undefined);
   store.close();
   const reopened = openStore(path);
   const report = reopened.recoveryReport();
-  const entry = report.indeterminateOutcomes.find((a) => a.quoteId === quoteId);
-  const stillUnresolved = reopened.allAttempts().some((a) => a.quoteId === quoteId && a.state === "INDETERMINATE");
+  const entry = report.indeterminateOutcomes.find((a) => a.quoteId === quote.quote_id);
+  const stillUnresolved = reopened.allAttempts().some((a) => a.quoteId === quote.quote_id && a.state === "INDETERMINATE");
   const pass = !!entry && entry.state === "INDETERMINATE" && entry.operatorInterventionRequired === true && stillUnresolved;
-  const evidence = `recoveryReport lists the attempt as INDETERMINATE with operator intervention required (next permitted action: ${String(entry?.nextPermittedAction ?? "n/a")}); producing the report changed nothing — the attempt remains unresolved until a human resolves it through the append-only record`;
+  const evidence = `recoveryReport lists the attempt as INDETERMINATE with operator intervention required (next permitted action: ${String(entry?.nextPermittedAction ?? "n/a")}); producing the report changed nothing — the attempt remains unresolved until a human resolves it through the append-only record. PR-14: the attempt was constructed at the coordinator/ledger level because the live adapter's preservation gate now refuses OPERATION-authorized update commits before the ledger; the review semantics rehearsed here are unchanged`;
   reopened.close();
   return result("rh-13-operator-review-unresolved", "Operator review of an unresolved attempt", "INDETERMINATE", String(entry?.state ?? "missing"), pass, evidence);
 }
@@ -367,14 +412,13 @@ async function rh14(): Promise<RehearsalScenarioResult> {
     return inner(req);
   };
   const { store, adapter, quoteId, mock } = await quoteAndCommit({}, rejecting);
-  let outcome = "";
-  try { await adapter.commitChangeQuote(quoteId); } catch (e) { outcome = e instanceof SCQError ? String((e.details as any)?.outcome ?? e.code) : "error"; }
+  const refusal = await commitRefusal(adapter, quoteId);
   const stored = store.get(quoteId);
-  const attempt = store.allAttempts().find((a) => a.quoteId === quoteId);
-  const pass = outcome === "CONFIRMED_NON_EXECUTION" && stored?.commit_outcome?.outcome === "CONFIRMED_NON_EXECUTION" && stored?.commit_receipt === undefined && mock.mutationCount === 0 && attempt?.state === "CONFIRMED_NON_EXECUTION";
+  const attempts = store.allAttempts().filter((a) => a.quoteId === quoteId);
+  const pass = refusal.code === GATE_CODE && refusal.outcome === "CONFIRMED_NON_EXECUTION" && stored?.commit_outcome?.outcome === "CONFIRMED_NON_EXECUTION" && stored?.commit_receipt === undefined && mock.mutationCount === 0 && attempts.length === 0;
   store.close();
-  return result("rh-14-pre-effect-rejection", "Pre-effect provider rejection (documented parameter error)", "CONFIRMED_NON_EXECUTION", outcome, pass,
-    "HTTP 400 with the documented param_wrong_value validation code proves rejection before processing; the ledger records CONFIRMED_NON_EXECUTION and the provider state is untouched (mutation count 0) — only this narrow, code-allowlisted shape earns that classification");
+  return result("rh-14-pre-effect-rejection", "Preservation gate precedes the provider's pre-effect rejection (PR-14)", "CONFIRMED_NON_EXECUTION", refusal.outcome, pass,
+    `the rejecting transport was armed to answer any update dispatch with HTTP 400 param_wrong_value, but no dispatch occurred (provider mutation count ${mock.mutationCount}, zero ledger attempts): the PR-14 preservation gate (${GATE_CODE}) refused the commit first, recording CONFIRMED_NON_EXECUTION on the quote. PR-14 migration: the allowlisted pre-effect rejection classification remains implemented in the adapter's dispatch path — only that narrow, code-allowlisted shape earns CONFIRMED_NON_EXECUTION from a provider response — but through this adapter the gate now fires before it, so this scenario rehearses the gate's precedence (id retained for evidence continuity).`);
 }
 
 export async function runRehearsal(): Promise<RehearsalResult> {

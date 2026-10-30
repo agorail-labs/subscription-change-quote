@@ -276,9 +276,62 @@ type GuaranteeFields = {
  * protocol. `{ type: "IMMEDIATE" }` is the explicit spelling of what v0.5
  * defaulted to silently.
  */
+/**
+ * v0.7-candidate direction (PR-14, Issue #22; additive, provider-neutral):
+ * the breadth of mutation a caller has authorized.
+ *
+ * - `OPERATION` (the DEFAULT — every proposal or quote without an
+ *   explicit scope declaration is OPERATION-authorized): only the
+ *   requested mutation is authorized. Unrelated items, quantities,
+ *   and terms are protected state: an adapter must never treat the
+ *   proposal as consent to replace the subscription's item list
+ *   wholesale, and equality between a landed state and an intended
+ *   target state never by itself proves that protected state was
+ *   preserved.
+ * - `TARGET_REPLACEMENT`: the caller authorizes the dispatched
+ *   request's target state to REPLACE the recorded state wholesale,
+ *   including the removal of state not named by the proposal.
+ *   PR-14 records this value as a type only: no adapter honors it
+ *   yet — declaring it is refused as unsupported wherever the
+ *   adapter cannot yet give it reviewed semantics, never silently
+ *   downgraded to OPERATION.
+ */
+export type AuthorizationScope = "OPERATION" | "TARGET_REPLACEMENT";
+
+/**
+ * v0.7-candidate direction (PR-14, Issue #22; additive, provider-neutral):
+ * the mutation mechanism an adapter actually dispatches through for
+ * an operation class, declared BY THE ADAPTER from its own
+ * mechanism — never accepted from caller input.
+ *
+ * - `CONDITIONAL_WRITE`: the dispatch itself can be made conditional
+ *   on the recorded state (a server-enforced precondition), so an
+ *   OPERATION-authorized commit can preserve protected state
+ *   atomically.
+ * - `TARGETED_UPDATE`: the dispatch names only the authorized
+ *   mutation (a targeted update), so protected state is never part
+ *   of the request at all.
+ * - `FULL_REPLACEMENT_ONLY`: the only dispatch available replaces
+ *   the recorded state wholesale with the request's target state.
+ *   An OPERATION-authorized commit through this capability cannot
+ *   guarantee preservation of state that changes between validation
+ *   and dispatch, and a fail-closed adapter must refuse it before
+ *   dispatch rather than report a verified commit.
+ *
+ * An absent or unknown capability reads as the weakest
+ * (`FULL_REPLACEMENT_ONLY`): preservation is never assumed.
+ */
+export type MutationCapability = "CONDITIONAL_WRITE" | "TARGETED_UPDATE" | "FULL_REPLACEMENT_ONLY";
+
 export type SubscriptionChangeProposal = {
   changes: ChangeSpec[];
   effectiveIntent: EffectiveIntent;
+  /**
+   * The breadth of mutation authorized (see `AuthorizationScope`).
+   * Absent => OPERATION. Adapters record the effective scope on the
+   * quote they create; the commit path never widens it.
+   */
+  authorizationScope?: AuthorizationScope;
 } & GuaranteeFields;
 
 export type CommercialEffect = {
@@ -765,6 +818,22 @@ export type SubscriptionChangeQuote = {
   commercialEffect: CommercialEffect;
   validUntil: string;
   providerMetadata?: unknown;
+  /**
+   * PR-14 (additive): the effective authorization scope this quote
+   * was created under (the proposal's declaration, or OPERATION when
+   * undeclared). Recorded FROM the proposal at creation; a commit
+   * never re-derives or widens it.
+   */
+  authorizationScope?: AuthorizationScope;
+  /**
+   * PR-14 (additive): the mutation capability the CREATING ADAPTER
+   * declared for this quote's operation class, recorded at creation
+   * from the adapter's own declaration. Never accepted from caller
+   * input: a stored record claiming a capability the adapter does
+   * not declare is not authority — at commit, the adapter's current
+   * declaration governs, and a mismatch refuses.
+   */
+  mutationCapability?: MutationCapability;
 };
 
 /**
@@ -915,7 +984,19 @@ export type SCQErrorCode =
    * original record is always preserved; identity is never resolved
    * by overwriting.
    */
-  | "CONFLICTING_RECEIPT_IDENTITY";
+  | "CONFLICTING_RECEIPT_IDENTITY"
+  /**
+   * PR-14 (Issue #22, Finding 1): a pre-dispatch refusal — an
+   * OPERATION-authorized commit whose dispatch mechanism cannot
+   * enforce preservation of protected (unrelated) state was refused
+   * BEFORE any mutating request and BEFORE any durable dispatch
+   * attempt was created. The refusal carries CONFIRMED_NON_EXECUTION
+   * outcome semantics: nothing was dispatched, no receipt exists,
+   * and a retry of the same commit returns the same refusal
+   * deterministically. It is never INDETERMINATE: no dispatch was
+   * attempted, so there is nothing whose execution is unknown.
+   */
+  | "AUTHORIZATION_PRESERVATION_UNENFORCEABLE";
 
 export class SCQError extends Error {
   constructor(public code: SCQErrorCode, message: string, public details?: unknown) { super(message); }

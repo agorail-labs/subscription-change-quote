@@ -269,10 +269,12 @@
 import crypto from "node:crypto";
 import {
   SCQError,
+  type AuthorizationScope,
   type CommercialEffect,
   type CommittedFigureSource,
   type DimensionState,
   type GuaranteeCoverage,
+  type MutationCapability,
   type MutationOutcome,
   type PostCommitStateVerification,
   type ProviderCapabilities,
@@ -895,6 +897,24 @@ export function buildChargebeeUpdateParams(items: Array<{ itemPriceId: string; q
 }
 
 export class ChargebeeLiveAdapter implements SubscriptionProvider {
+  /**
+   * PR-14 (Issue #22, Finding 1): this adapter's mutation capability
+   * for its update operations, declared from its ACTUAL dispatch
+   * mechanism. The only mutating call this adapter makes is
+   * `update_for_items`, and `buildChargebeeUpdateParams` always
+   * sends `replace_items_list=true` with the quote-time item list:
+   * the dispatch REPLACES the subscription's item list wholesale.
+   * Chargebee's documented surface offers no conditional write (no
+   * compare-and-swap precondition — `resource_version` is an
+   * output-only timestamp) and no targeted item update for this
+   * operation class (PR #23 capability assessment,
+   * research/issue-22/CHARGEBEE-CAPABILITY-ASSESSMENT.md), so the
+   * capability is FULL_REPLACEMENT_ONLY. This declaration is
+   * authoritative at commit time: a quote record claiming a
+   * stronger capability is never consulted as authority.
+   */
+  readonly mutationCapability: MutationCapability = "FULL_REPLACEMENT_ONLY";
+
   private now: () => Date;
   constructor(
     private client: ChargebeeClient,
@@ -966,6 +986,15 @@ export class ChargebeeLiveAdapter implements SubscriptionProvider {
     const change = proposal.changes[0];
     if (change.action !== "CHANGE_QUANTITY" && change.action !== "CHANGE_PLAN") {
       throw new SCQError("UNSUPPORTED_CHANGE", `The experimental live Chargebee adapter does not implement ${change.action} (outside the validated scope); refused before any provider call.`);
+    }
+    // PR-14: TARGET_REPLACEMENT authorization is not honored by any
+    // adapter in this PR — its consent, migration, and receipt
+    // semantics are unreviewed. A proposal declaring it is refused
+    // here, before any provider call: never honored, never silently
+    // downgraded to OPERATION. OPERATION (declared or defaulted) is
+    // the only scope a quote can be created under.
+    if (proposal.authorizationScope === "TARGET_REPLACEMENT") {
+      throw new SCQError("UNSUPPORTED_CHANGE", "TARGET_REPLACEMENT authorization is not supported: no adapter in this build gives wholesale target-state replacement reviewed authorization semantics, and the declaration is never silently downgraded to OPERATION. Refused before any provider call.", { authorizationScope: proposal.authorizationScope });
     }
     // Refuse unsupported effective intents BEFORE any provider call at all
     // (stronger than the spec's "before preview/mutation" floor).
@@ -1049,6 +1078,12 @@ export class ChargebeeLiveAdapter implements SubscriptionProvider {
       effective_guarantee_mode: effectiveMode,
       guarantee_coverage: { ...COVERAGE },
       multi_change_consistency: "ATOMIC",
+      // PR-14: record the effective authorization scope (OPERATION
+      // unless the proposal declared it — TARGET_REPLACEMENT was
+      // refused above) and THIS ADAPTER's declared mutation
+      // capability on every quote, at creation.
+      authorization_scope: proposal.authorizationScope ?? "OPERATION",
+      authorization_capability: this.mutationCapability,
       provider_preview_input: { items: targetItems, idempotencyKey: `scq-${quoteId}`.slice(0, 100) },
       quoted_effect: commercialEffect,
       created_at: this.now().toISOString(),
@@ -1066,8 +1101,20 @@ export class ChargebeeLiveAdapter implements SubscriptionProvider {
       multiChangeConsistency: "ATOMIC",
       commercialEffect,
       validUntil: expiresAt,
+      // PR-14: the recorded scope + capability ride on the quote
+      // itself, so the commit consequence is disclosed at creation.
+      authorizationScope: proposal.authorizationScope ?? "OPERATION",
+      mutationCapability: this.mutationCapability,
       providerMetadata: {
         source: "chargebee-live-experimental",
+        // PR-14 disclosure: quotes remain useful read-only artifacts
+        // (estimates, preflight), but an OPERATION-authorized update
+        // commit on this FULL_REPLACEMENT_ONLY capability will be
+        // REFUSED at commit — preservation of unrelated state cannot
+        // be enforced by a non-atomic full-list replacement.
+        authorizationScope: proposal.authorizationScope ?? "OPERATION",
+        mutationCapability: this.mutationCapability,
+        authorizationPreservation: "This adapter's update dispatch replaces the subscription's item list wholesale (replace_items_list=true). OPERATION-authorized update commits are REFUSED at commit time (AUTHORIZATION_PRESERVATION_UNENFORCEABLE): the replacement cannot atomically preserve unrelated items or quantities that change after the quote, and no documented conditional write or targeted update exists for this operation class.",
         resourceVersion: sub.resource_version ?? null,
         hasScheduledChanges: sub.has_scheduled_changes ?? false,
         hasScheduledAdvanceInvoices: sub.has_scheduled_advance_invoices ?? false,
@@ -1152,6 +1199,75 @@ export class ChargebeeLiveAdapter implements SubscriptionProvider {
 
     if (!this.opts.liveCommitEnabled) {
       throw new SCQError("PROVIDER_ERROR", "BLOCKED — LIVE COMMIT DISABLED (SCQ_LIVE_COMMIT_ENABLED is not 'true'). Quote and pre-mutation revalidation completed; no mutating call was made.", { blocked: "LIVE_COMMIT_DISABLED" });
+    }
+
+    // PR-14 (Issue #22, Finding 1): AUTHORIZATION PRESERVATION GATE.
+    // This adapter's only dispatch is a full-list replacement
+    // (`update_for_items` with replace_items_list=true, built from
+    // the quote-time item list) on a FULL_REPLACEMENT_ONLY
+    // capability. Under OPERATION authorization — the default; only
+    // the requested mutation is authorized — such a dispatch cannot
+    // preserve unrelated items/quantities that change between the
+    // final validation read above and the dispatch: the replacement
+    // would silently delete them, and no post-commit comparison
+    // against the intended target set can detect the loss (the
+    // target set never contained them). Idempotency keys, an extra
+    // pre-dispatch read, and post-commit verification each fail to
+    // close the validate->dispatch window (see
+    // research/pr-14-authorization-preservation.md). Placement is
+    // deliberate: after expiry/fingerprint/revalidation-envelope and
+    // the live-commit-enabled check (their refusals keep their
+    // precedence, including QUOTE_STALE for a change that landed
+    // before the commit-phase read), and BEFORE the durable
+    // write-ahead gate below — a refused commit creates no durable
+    // DISPATCHING attempt and dispatches nothing. The refusal is
+    // recorded with CONFIRMED_NON_EXECUTION semantics (the same
+    // outcome class as a demonstrable pre-effect provider
+    // rejection): nothing was dispatched, no receipt exists, and a
+    // retry reaches this gate and refuses identically. It is never
+    // INDETERMINATE.
+    //
+    // The ADAPTER's declared capability is authoritative. The quote
+    // record's capability is a disclosure record, never authority:
+    // a record claiming a stronger capability (forged or stale)
+    // cannot bypass the gate — a mismatch refuses. An absent scope
+    // (legacy quote) reads OPERATION; an absent or unknown recorded
+    // capability classifies as the weakest.
+    {
+      const scope: AuthorizationScope = validated.authorization_scope ?? validated.proposal.authorizationScope ?? "OPERATION";
+      const recordedCapability = validated.authorization_capability;
+      const knownCapability = recordedCapability === "CONDITIONAL_WRITE" || recordedCapability === "TARGETED_UPDATE" || recordedCapability === "FULL_REPLACEMENT_ONLY"
+        ? recordedCapability
+        : undefined;
+      const refusePreservation = (reason: string): never => {
+        this.store.recordCommitOutcome(quoteId, {
+          outcome: "CONFIRMED_NON_EXECUTION",
+          at: this.now().toISOString(),
+          details: { blocked: "AUTHORIZATION_PRESERVATION_UNENFORCEABLE", authorizationScope: scope, mutationCapability: this.mutationCapability, recordedCapability: recordedCapability ?? null, reason },
+        });
+        throw new SCQError(
+          "AUTHORIZATION_PRESERVATION_UNENFORCEABLE",
+          `Commit refused before dispatch: this quote is ${scope}-authorized, but the adapter's update dispatch is a full-list replacement (replace_items_list=true) on a ${this.mutationCapability} capability, which cannot atomically preserve unrelated subscription state that changes after validation. ${reason} No mutating request was dispatched and no durable dispatch attempt was created. An OPERATION-authorized commit requires a documented conditional write or a documented targeted update for this operation class.`,
+          { outcome: "CONFIRMED_NON_EXECUTION", blocked: "AUTHORIZATION_PRESERVATION_UNENFORCEABLE", authorizationScope: scope, mutationCapability: this.mutationCapability, recordedCapability: recordedCapability ?? null },
+        );
+      };
+      if (scope === "TARGET_REPLACEMENT") {
+        // A stored record declaring TARGET_REPLACEMENT could only
+        // have been crafted outside createChangeQuote (which refuses
+        // the declaration): refuse it here too, as unsupported —
+        // never honored, never downgraded.
+        refusePreservation("The stored quote declares TARGET_REPLACEMENT authorization, which is unsupported in this build.");
+      }
+      if (knownCapability !== undefined && knownCapability !== this.mutationCapability) {
+        // The record disagrees with the adapter's authoritative
+        // declaration. The adapter's capability governs: refuse
+        // rather than honor a capability the dispatch does not have
+        // (a forged CONDITIONAL_WRITE claim lands here).
+        refusePreservation(`The quote record claims mutation capability ${knownCapability}, which does not match the adapter's declared capability ${this.mutationCapability}; the adapter's declaration is authoritative and the recorded claim is not honored.`);
+      }
+      if (this.mutationCapability === "FULL_REPLACEMENT_ONLY") {
+        refusePreservation("Dispatching would replace the subscription's item list with the quote-time list, deleting any unrelated item or quantity change that landed after the quote.");
+      }
     }
 
     // v0.6.2 (PR-8): durable write-ahead gate. When a durable
