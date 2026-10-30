@@ -72,6 +72,15 @@ export function makeObservation(quoteId = "q1", subscriptionId = "sub_1"): Provi
     committedEffect: {
       immediate: { net: 1000 },
       recurring: { resultingAmount: 5000, currency: "usd" },
+      // PR-10 (BC-1) fixture completion: this simulated provider read
+      // DETERMINES both dimensions — both figures are literal values
+      // from the read and the source is provider_actual — so the
+      // determinacy record says so. Without it, BC-1 reconciliation
+      // correctly reads the figures as UNKNOWN and establishment
+      // computes UNVERIFIED; the durable suites' subject is store
+      // recovery, not legacy-effect reconciliation (covered in
+      // test35). No assertion in the consuming suites changes.
+      determinacy: { immediateFinancialEffect: "DETERMINED", recurringFinancialEffect: "DETERMINED" },
       provenance: { committedSource: "provider_actual" },
     },
     resultingSnapshot: {

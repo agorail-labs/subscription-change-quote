@@ -7,7 +7,7 @@ import {
   reconcileCommittedEffect,
   enforceNoPartialExecutionRisk,
 } from "../src/core/scq-engine.js";
-import { SCQError, type SubscriptionChangeReceipt } from "../src/core/types.js";
+import { SCQError, type CommercialEffect, type SubscriptionChangeReceipt } from "../src/core/types.js";
 import { StripeAdapter } from "../src/adapters/stripe-adapter.js";
 import { PaddleAdapter } from "../src/adapters/paddle-adapter.js";
 import { freshStripeFixture, freshPaddleFixture } from "./fixtures.js";
@@ -35,20 +35,39 @@ import { freshStripeFixture, freshPaddleFixture } from "./fixtures.js";
 //      end-to-end); Paddle multi-change positive/negative tests (Test
 //      12i-12j, NEW — this was gap G-4).
 
+// PR-10 (BC-1) DISCLOSED FIXTURE UPDATE for 12a/12b: these v0.6.1-era
+// tests used bare legacy literals (no determinacy, no provenance).
+// Under BC-1 such a pair reconciles UNVERIFIED — neither side's
+// figures are established — which is pinned in test35 and updated
+// Test 14.4. To keep THESE tests exercising their original purpose
+// (the OK / VIOLATED verdicts for established effects), the fixtures
+// now carry the v0.6.2 established-effect shape every migrated
+// adapter emits: quoted DETERMINED with basis provenance; committed
+// DETERMINED with committedSource provider_actual. The asserted
+// verdicts and the BEST_EFFORT reason requirement are unchanged.
+const detQuoted12 = (net: number): CommercialEffect => ({
+  immediate: { net },
+  recurring: { resultingAmount: 5000, currency: "usd" },
+  determinacy: { immediateFinancialEffect: "DETERMINED", recurringFinancialEffect: "DETERMINED" },
+  provenance: { immediate: "test fixture: quote preview", recurring: "test fixture: quote preview" },
+});
+const detCommitted12 = (net: number): CommercialEffect => ({
+  immediate: { net },
+  recurring: { resultingAmount: 5000, currency: "usd" },
+  determinacy: { immediateFinancialEffect: "DETERMINED", recurringFinancialEffect: "DETERMINED" },
+  provenance: { committedSource: "provider_actual" },
+});
+
 test("Test 12a: post-commit reconciliation reports OK when the committed effect stays within the envelope", () => {
-  const quoted = { immediate: { net: 1000 }, recurring: { resultingAmount: 5000, currency: "usd" } };
-  const committed = { immediate: { net: 1000 }, recurring: { resultingAmount: 5000, currency: "usd" } };
-  const result = reconcileCommittedEffect(quoted, committed, { maxImmediateNetIncrease: 0, maxImmediateCreditDecrease: 0, maxRecurringIncrease: 0 });
+  const result = reconcileCommittedEffect(detQuoted12(1000), detCommitted12(1000), { maxImmediateNetIncrease: 0, maxImmediateCreditDecrease: 0, maxRecurringIncrease: 0 });
   assert.deepEqual(result, { status: "OK" });
 });
 
 test("Test 12b: post-commit reconciliation reports VIOLATED when the committed effect exceeds the envelope, and names why", () => {
-  const quoted = { immediate: { net: 1000 }, recurring: { resultingAmount: 5000, currency: "usd" } };
   // Simulates the BEST_EFFORT race: a concurrent write landed after the
   // last pre-mutation preview, so what actually got committed exceeds what
   // was checked and approved before the mutating call.
-  const committed = { immediate: { net: 50000 }, recurring: { resultingAmount: 5000, currency: "usd" } };
-  const result = reconcileCommittedEffect(quoted, committed, { maxImmediateNetIncrease: 0, maxImmediateCreditDecrease: 0, maxRecurringIncrease: 0 });
+  const result = reconcileCommittedEffect(detQuoted12(1000), detCommitted12(50000), { maxImmediateNetIncrease: 0, maxImmediateCreditDecrease: 0, maxRecurringIncrease: 0 });
   assert.equal(result.status, "VIOLATED");
   assert.ok((result as any).reason.includes("BEST_EFFORT"), "reconciliation failure reason must explain WHY this can happen despite the pre-mutation check having passed");
 });
@@ -57,7 +76,19 @@ test("Test 12c: post-commit reconciliation reports OK (not a fabricated violatio
   const quoted = { term: { createsCommitment: false } };
   const committed = { term: { createsCommitment: false } };
   const result = reconcileCommittedEffect(quoted, committed, undefined);
-  assert.deepEqual(result, { status: "OK" }, "no envelope means nothing to reconcile — must not report VIOLATED with no basis");
+  // PR-10 (BC-1) DISCLOSED EXPECTATION UPDATE: the original purpose —
+  // no envelope ⇒ never a fabricated VIOLATED — is retained (the
+  // verdict is not VIOLATED). The verdict itself is no longer OK:
+  // this term-only pair establishes NO financial dimension, and
+  // under BC-1 an unestablished financial outcome cannot masquerade
+  // as verified actuals merely because no envelope was stated. The
+  // positive half of the original purpose survives below: with no
+  // envelope, a committed effect whose figures ARE established
+  // provider actuals still reconciles OK ("nothing to compare" is
+  // the only gap).
+  assert.equal(result.status, "UNVERIFIED", "no envelope means nothing to reconcile — must not report VIOLATED with no basis; unestablished finances are UNVERIFIED under BC-1, not OK");
+  const established = reconcileCommittedEffect(quoted, detCommitted12(0), undefined);
+  assert.deepEqual(established, { status: "OK" });
 });
 
 test("Test 12d: commit after validUntil MUST fail QUOTE_EXPIRED with no mutation — direct unit test against validateCommit with an injected clock", () => {

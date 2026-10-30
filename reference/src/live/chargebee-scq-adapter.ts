@@ -105,12 +105,15 @@
 //       is ABSENT (never zero, never fabricated) and the quote is
 //       REFUSED (QUOTE_NOT_DETERMINISTIC), because the mandatory
 //       REVALIDATE acceptance envelope cannot be enforced on an
-//       unknown dimension. The frozen core engine's
-//       checkAcceptanceEnvelope treats absent dimensions as 0
-//       (`?? 0`); this adapter never feeds it an effect with an absent
-//       bounded dimension — it refuses first, at quote time and again
-//       at commit revalidation time. (Protocol gap, recorded for
-//       future spec work; the frozen engine is NOT modified here.)
+//       unknown dimension. The v0.6.1 core engine's
+//       checkAcceptanceEnvelope treated absent dimensions as 0
+//       (`?? 0`); this adapter never fed it an effect with an absent
+//       bounded dimension — it refused first, at quote time and again
+//       at commit revalidation time. (That protocol gap is closed by
+//       PR-10's BC-1 activation: the core envelope now refuses
+//       unenforceable dimensions itself; this adapter's earlier,
+//       adapter-specific refusal is retained, and the core gate is
+//       the backstop behind it.)
 //     * PR #4 REVIEW FIXES (2026-10-28, mocked — no live calls):
 //       (a) a provider-stated subscription_estimate item list is used
 //       as the recurring result ONLY after verifying it is the ENTIRE
@@ -1117,11 +1120,13 @@ export class ChargebeeLiveAdapter implements SubscriptionProvider {
     revalidated.effectiveAt = validated.quoted_effect.effectiveAt;
     // FAIL CLOSED (Phase 3 rule, v0.6.2 form): never feed an effect
     // with an UNKNOWN bounded dimension into checkAcceptanceEnvelope —
-    // the frozen core engine compares absent dimensions as 0, which
+    // the v0.6.1 core engine compared absent dimensions as 0, which
     // would silently "enforce" the envelope against an invented zero.
+    // PR-10's BC-1 activation makes the core gate refuse such pairs
+    // itself; these adapter-local calls remain the earlier refusal.
     assertEffectDeterminateForCommit(validated.quoted_effect, "quoted");
     assertEffectDeterminateForCommit(revalidated, "revalidated");
-    const violation = checkAcceptanceEnvelope(validated.quoted_effect, revalidated, proposal.acceptanceEnvelope!);
+    const violation = checkAcceptanceEnvelope(validated.quoted_effect, revalidated, proposal.acceptanceEnvelope!, proposal);
     if (violation) {
       throw new SCQError("QUOTE_DRIFTED", `Recomputed commercial effect fell outside the caller's acceptance envelope: ${violation}. No mutation was performed.`, { quoted: validated.quoted_effect, revalidated, envelope: proposal.acceptanceEnvelope });
     }
@@ -1640,7 +1645,7 @@ export class ChargebeeLiveAdapter implements SubscriptionProvider {
       };
       return this.recordOutcomeReceipt(validated, {
         effect,
-        reconciliation: reconcileCommittedEffect(quoted, effect, proposal.acceptanceEnvelope),
+        reconciliation: reconcileCommittedEffect(quoted, effect, proposal.acceptanceEnvelope, proposal),
         status: "COMMITTED",
         outcome: "COMMITTED_AND_VERIFIED",
         snapshot: snap,

@@ -74,7 +74,22 @@ function makeQuote(
     },
     multi_change_consistency: "ATOMIC",
     provider_preview_input: null,
-    quoted_effect: { immediate: { net: 1000 }, recurring: { resultingAmount: 5000, currency: "usd" } },
+    // PR-10 (BC-1) fixture completion: makeQuote models a CURRENT
+    // (v0.6.2) quote — the shape every migrated adapter emits, with
+    // determinacy and basis provenance on both dimensions. Only
+    // Test 15.5 states an acceptance envelope (where BC-1 compares
+    // the quoted side); the remaining tests are envelope-less, so
+    // this shape is inert there beyond round-tripping through the
+    // same fixture. Legacy-shaped quotes are covered by test35.
+    quoted_effect: {
+      immediate: { net: 1000 },
+      recurring: { resultingAmount: 5000, currency: "usd" },
+      determinacy: { immediateFinancialEffect: "DETERMINED", recurringFinancialEffect: "DETERMINED" },
+      provenance: {
+        immediate: "test fixture: quote-time preview figure",
+        recurring: "test fixture: quote-time preview figure",
+      },
+    },
     created_at: "2026-10-28T00:00:00.000Z",
     expires_at: "2026-10-28T01:00:00.000Z",
     status: "ACTIVE",
@@ -88,7 +103,22 @@ function makeReceipt(overrides: Partial<SubscriptionChangeReceipt> = {}): Subscr
     status: "COMMITTED",
     outcome: "COMMITTED_AND_VERIFIED",
     resultingSnapshot: { id: "sub_1", version: "v2", status: "active", items: [], billing: { currency: "usd" } },
-    quotedEffect: { immediate: { net: 1000 }, recurring: { resultingAmount: 5000, currency: "usd" } },
+    // PR-10 (BC-1) fixture completion: a receipt's quotedEffect IS
+    // the stored quote's effect — the same current-shape effect
+    // makeQuote builds (determinacy + basis provenance). Only Test
+    // 15.5's envelope recompute reads the quoted side; elsewhere the
+    // shape round-trips through the same fixture. A legacy recorded
+    // receipt is never re-reconciled to OK under BC-1 — that
+    // behavior is pinned in test35, not by these store fixtures.
+    quotedEffect: {
+      immediate: { net: 1000 },
+      recurring: { resultingAmount: 5000, currency: "usd" },
+      determinacy: { immediateFinancialEffect: "DETERMINED", recurringFinancialEffect: "DETERMINED" },
+      provenance: {
+        immediate: "test fixture: quote-time preview figure",
+        recurring: "test fixture: quote-time preview figure",
+      },
+    },
     committedEffect: { immediate: { net: 1000 }, recurring: { resultingAmount: 5000, currency: "usd" } },
     guaranteeMode: "REVALIDATE",
     consistencyGuarantee: "BEST_EFFORT",
@@ -131,6 +161,14 @@ function observationFor(
     committedEffect: {
       immediate: { net: figures.immediate },
       recurring: { resultingAmount: figures.recurring, currency: "usd" },
+      // PR-10 (BC-1) fixture completion: this observation IS an
+      // independent provider read whose two figures are the read's
+      // literal values (see the doc comment above) — the read
+      // determines both dimensions, so the determinacy record says
+      // so. BC-1 reconciliation otherwise (correctly) computes
+      // UNVERIFIED for a determinacy-less effect, and these tests'
+      // subject is store verification semantics, not legacy effects.
+      determinacy: { immediateFinancialEffect: "DETERMINED", recurringFinancialEffect: "DETERMINED" },
       provenance: { committedSource: "provider_actual" },
     },
     resultingSnapshot: {

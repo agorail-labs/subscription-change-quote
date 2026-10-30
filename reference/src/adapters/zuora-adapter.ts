@@ -269,9 +269,12 @@ function immediateParts(net: number): NonNullable<CommercialEffect["immediate"]>
  * revalidation — could pass the gate and proceed to MUTATE: the
  * adapter would commit a change whose financial effect it does not
  * know. Fail-closed treatment of UNKNOWN in the shared envelope is
- * BC-1, a separately gated activation; the engine is NOT changed
- * here. Until then, THIS adapter refuses such commits itself,
- * before any mutating call, with QUOTE_NOT_DETERMINISTIC.
+ * BC-1, activated in the core by PR-10: checkAcceptanceEnvelope
+ * now refuses unenforceable dimensions itself. THIS adapter still
+ * refuses such commits itself, before any mutating call, with
+ * QUOTE_NOT_DETERMINISTIC — the local gate is the earlier,
+ * adapter-specific refusal; the core gate is the protocol-level
+ * backstop behind it.
  *
  * A dimension passes iff it is DETERMINED with a finite value, or
  * NOT_APPLICABLE under the §3.10 license — which covers exactly
@@ -896,7 +899,7 @@ export class ZuoraAdapter implements SubscriptionProvider {
       // envelope gate runs — the v0.6.1 envelope would coerce an
       // absent revalidated figure to 0 and could pass it.
       assertEffectDeterminateForCommit(revalidated, proposal, "revalidated");
-      const violation = checkAcceptanceEnvelope(validated.quoted_effect, revalidated, proposal.acceptanceEnvelope!);
+      const violation = checkAcceptanceEnvelope(validated.quoted_effect, revalidated, proposal.acceptanceEnvelope!, proposal);
       if (violation) {
         throw new SCQError(
           "QUOTE_DRIFTED",
@@ -1299,7 +1302,7 @@ export class ZuoraAdapter implements SubscriptionProvider {
     }
     return {
       effect: committedEffect,
-      reconciliation: reconcileCommittedEffect(quoted, committedEffect, proposal.acceptanceEnvelope),
+      reconciliation: reconcileCommittedEffect(quoted, committedEffect, proposal.acceptanceEnvelope, proposal),
       status: "COMMITTED",
       outcome: "COMMITTED_AND_VERIFIED",
       snapshot: snap,
@@ -1637,7 +1640,7 @@ export class ZuoraAdapter implements SubscriptionProvider {
     };
     return {
       effect: committedEffect,
-      reconciliation: reconcileCommittedEffect(quoted, committedEffect, proposal.acceptanceEnvelope),
+      reconciliation: reconcileCommittedEffect(quoted, committedEffect, proposal.acceptanceEnvelope, proposal),
       status: "COMMITTED",
       outcome: "COMMITTED_AND_VERIFIED",
       snapshot: snap,
