@@ -309,17 +309,15 @@ const QUOTE_TTL_MS = 5 * 60 * 1000;
  * that API calls fail at the first error encountered while
  * VALIDATING them, i.e. before the operation is processed:
  *
- *   - `param_required`    — a required parameter is absent; the
- *                           request cannot enter processing at all.
  *   - `param_wrong_value` — a parameter value does not meet its
  *                           required specification; rejected at
  *                           request validation.
  *
- * Both codes describe defects in THIS request's own shape/values,
- * so neither carries prior-operation ambiguity: an idempotency key
+ * This code describes a defect in THIS request's own shape/values,
+ * so it carries no prior-operation ambiguity: an idempotency key
  * previously consumed by a processed request surfaces as HTTP 422
  * (`duplicate_request` / `unable_to_process_request`), never as one
- * of these 400 validation codes.
+ * of this 400 validation code.
  *
  * Deliberately EXCLUDED (they fail closed to INDETERMINATE):
  *   - payment-type 400s (`payment_processing_failed`,
@@ -339,7 +337,6 @@ const QUOTE_TTL_MS = 5 * 60 * 1000;
  *     exists for placing the failure at the validation stage.
  */
 const PRE_EFFECT_VALIDATION_ERROR_CODES: ReadonlySet<string> = new Set([
-  "param_required",
   "param_wrong_value",
 ]);
 
