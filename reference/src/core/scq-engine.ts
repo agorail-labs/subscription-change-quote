@@ -133,51 +133,274 @@ export function validateCommit(
 }
 
 /**
+ * v0.6.2 BC-1 — the shared fail-closed enforcement assessment.
+ *
+ * One per-dimension, per-side assessment drives BOTH the pre-mutation
+ * envelope gate (`checkAcceptanceEnvelope`) and post-commit
+ * reconciliation (`reconcileCommittedEffect`), so the two can never
+ * develop parallel interpretations of the three-state model. The
+ * state machine mirrors `auditDeterminacy`'s exactly (same
+ * `determinacyOf` reading, same value-validity rule, same
+ * applicability-table license and citation validation — the audit
+ * remains the report-only diagnostic over the same rules, and the
+ * BC-1 suite pins gate/audit agreement on the refusal cases).
+ *
+ * Two ROLE differences from the audit are deliberate and documented
+ * (research/bc1-fail-closed-enforcement.md):
+ *  - Quote role (the quoted effect in both functions; the
+ *    revalidated effect in the envelope gate): quote-side figures
+ *    are estimates by nature, so DETERMINED requires the dimension's
+ *    provenance NOTE (the audit's C4 basis record).
+ *    `provenance.committedSource` is meaningless on a quote-side
+ *    effect (types.ts: it is meaningful only on committed effects)
+ *    and is ignored here — including on revalidated effects, whose
+ *    role in the gate is quote-side and whose `revalidated_preview`
+ *    label is lineage metadata, not a claim of actuals.
+ *  - Committed role (the committed effect in reconciliation):
+ *    DETERMINED establishes actuals ONLY through an establishing
+ *    `committedSource` — "provider_actual" or
+ *    "defined_equal_exact". An estimate-derived source
+ *    ("revalidated_preview" / "pre_mutation_estimate") reports
+ *    PROVENANCE_NOT_ESTABLISHING; an absent or "unestablished"
+ *    source reports MISSING_PROVENANCE (types.ts: an absent
+ *    committedSource READS as "unestablished" for reconciliation —
+ *    a free-form basis note is not a source classification, and no
+ *    provenance string by itself authenticates a provider event;
+ *    adapters remain responsible for binding figures to their
+ *    operation-bound provider reads).
+ */
+type DimensionRole = "quote" | "committed";
+
+type SideAssessment = {
+  state: DimensionState;
+  /** The finite numeric value, present only for a valid DETERMINED side. */
+  value?: number;
+  findings: DeterminacyAuditFinding[];
+  /** "determined" (valid value + role provenance), "not-applicable" (justified), or "unenforceable". */
+  kind: "determined" | "not-applicable" | "unenforceable";
+};
+
+type DimensionAssessment = {
+  dimension: FinancialDimension;
+  quoted: SideAssessment;
+  compared: SideAssessment;
+  /** Both sides DETERMINED and valid: the dimension can be numerically compared. */
+  comparable: boolean;
+  /** Both sides justified NOT_APPLICABLE: the dimension is legitimately skipped — never compared as zero. */
+  skipped: boolean;
+};
+
+const ENFORCEMENT_DIMENSIONS: FinancialDimension[] = ["immediateFinancialEffect", "recurringFinancialEffect"];
+
+function dimensionValue(effect: CommercialEffect, dimension: FinancialDimension): unknown {
+  return dimension === "immediateFinancialEffect" ? effect.immediate?.net : effect.recurring?.resultingAmount;
+}
+
+/**
+ * The authoritative action context for applicability licensing: the
+ * proposal's single change action. A multi-change proposal has no
+ * single action context — its combined effect's dimensions genuinely
+ * arise — so NOT_APPLICABLE cannot be licensed for it (the same
+ * single-CANCEL rule the adapters' local gates apply). A caller that
+ * supplies no proposal supplies no context, and a self-asserted
+ * citation is never validated without it.
+ */
+function authoritativeAction(proposal?: SubscriptionChangeProposal): string | undefined {
+  return proposal && proposal.changes.length === 1 ? proposal.changes[0].action : undefined;
+}
+
+function assessDimensionSide(
+  effect: CommercialEffect,
+  dimension: FinancialDimension,
+  action: string | undefined,
+  role: DimensionRole
+): SideAssessment {
+  const state = determinacyOf(effect)[dimension];
+  if (state === "NOT_APPLICABLE") {
+    // Same justification preconditions, in the same order, as the
+    // audit: context, then license, then citation.
+    if (!action) return { state, findings: ["MISSING_ACTION_CONTEXT"], kind: "unenforceable" };
+    if (!applicabilityLicensed(action, dimension)) return { state, findings: ["UNJUSTIFIED_NOT_APPLICABLE"], kind: "unenforceable" };
+    const citation = effect.provenance?.applicabilityCitations?.[dimension];
+    if (!citation || citation.action !== action || citation.dimension !== dimension) {
+      return { state, findings: ["MISSING_APPLICABILITY_PROVENANCE"], kind: "unenforceable" };
+    }
+    return { state, findings: [], kind: "not-applicable" };
+  }
+  if (state !== "DETERMINED") {
+    // UNKNOWN — including a legacy payload's absent determinacy and
+    // any unrecognized state value at runtime.
+    return { state: "UNKNOWN", findings: ["WOULD_REFUSE_UNKNOWN"], kind: "unenforceable" };
+  }
+  const value = dimensionValue(effect, dimension);
+  if (typeof value !== "number" || !Number.isFinite(value)) {
+    return { state, findings: ["INVALID_DETERMINED_VALUE"], kind: "unenforceable" };
+  }
+  if (role === "committed") {
+    const source = effect.provenance?.committedSource;
+    if (source === "revalidated_preview" || source === "pre_mutation_estimate") {
+      return { state, findings: ["PROVENANCE_NOT_ESTABLISHING"], kind: "unenforceable" };
+    }
+    if (source !== "provider_actual" && source !== "defined_equal_exact") {
+      return { state, findings: ["MISSING_PROVENANCE"], kind: "unenforceable" };
+    }
+    return { state, value, findings: [], kind: "determined" };
+  }
+  // Quote role: the dimension's provenance note is the basis record.
+  const note = dimension === "immediateFinancialEffect" ? effect.provenance?.immediate : effect.provenance?.recurring;
+  if (typeof note !== "string" || note.length === 0) {
+    return { state, findings: ["MISSING_PROVENANCE"], kind: "unenforceable" };
+  }
+  return { state, value, findings: [], kind: "determined" };
+}
+
+function assessEnvelopePair(
+  quoted: CommercialEffect,
+  compared: CommercialEffect,
+  proposal: SubscriptionChangeProposal | undefined,
+  comparedRole: DimensionRole
+): DimensionAssessment[] {
+  const action = authoritativeAction(proposal);
+  return ENFORCEMENT_DIMENSIONS.map((dimension) => {
+    const q = assessDimensionSide(quoted, dimension, action, "quote");
+    const c = assessDimensionSide(compared, dimension, action, comparedRole);
+    return {
+      dimension,
+      quoted: q,
+      compared: c,
+      comparable: q.kind === "determined" && c.kind === "determined",
+      skipped: q.kind === "not-applicable" && c.kind === "not-applicable",
+    };
+  });
+}
+
+function describeAssessment(d: DimensionAssessment, comparedLabel: string): string {
+  const side = (s: SideAssessment) => (s.findings.length > 0 ? `${s.state} [${s.findings.join(", ")}]` : s.state);
+  return `${d.dimension}: quoted ${side(d.quoted)} vs ${comparedLabel} ${side(d.compared)}`;
+}
+
+/**
+ * v0.6.2 BC-1 — the fail-closed pre-mutation guard, exported for
+ * callers (and adapter gates) that need the enforcement decision
+ * without the comparison. Throws SCQError QUOTE_NOT_DETERMINISTIC —
+ * before any mutating call at every call site — naming each
+ * unenforceable dimension and which side failed it. A dimension is
+ * enforceable iff BOTH sides are DETERMINED with finite values and
+ * role-appropriate provenance, or BOTH sides assert a justified
+ * NOT_APPLICABLE under the proposal's authoritative action context.
+ * Anything else — UNKNOWN on either side (legacy payloads included),
+ * an invalid DETERMINED value, an unjustified or one-sided
+ * NOT_APPLICABLE — refuses: UNKNOWN is never zero, and a skipped
+ * dimension is never a zero comparison.
+ */
+export function assertEnvelopeEnforceable(
+  quoted: CommercialEffect,
+  compared: CommercialEffect,
+  proposal?: SubscriptionChangeProposal
+): void {
+  const assessments = assessEnvelopePair(quoted, compared, proposal, "quote");
+  const failing = assessments.filter((d) => !d.comparable && !d.skipped);
+  if (failing.length === 0) return;
+  throw new SCQError(
+    "QUOTE_NOT_DETERMINISTIC",
+    `Refusing before any mutation: the acceptance envelope cannot be enforced because ` +
+      `${failing.map((d) => describeAssessment(d, "revalidated")).join("; ")}. An UNKNOWN or ` +
+      `unjustified dimension is never compared as zero (BC-1). Re-derive the undetermined ` +
+      `dimension(s) from provider evidence or re-quote. No provider mutation was performed; ` +
+      `this refusal is a CONFIRMED_NON_EXECUTION.`,
+    {
+      outcome: "CONFIRMED_NON_EXECUTION",
+      dimensions: failing.map((d) => ({
+        dimension: d.dimension,
+        quoted: { state: d.quoted.state, findings: d.quoted.findings },
+        revalidated: { state: d.compared.state, findings: d.compared.findings },
+      })),
+    }
+  );
+}
+
+/**
+ * The v0.6.1 numeric comparison, restricted to dimensions BC-1 has
+ * established as comparable (both sides DETERMINED with finite
+ * values). Violation strings are unchanged from v0.6.1. Bounds not
+ * stated in the envelope default to "zero tolerance" for that
+ * dimension — a caller must opt into slack, not receive it
+ * implicitly (fail-closed governs the VALUES compared, not the
+ * caller's tolerances).
+ */
+function compareDeterminedDimensions(
+  quoted: CommercialEffect,
+  compared: CommercialEffect,
+  envelope: AcceptanceEnvelope,
+  comparable: ReadonlySet<FinancialDimension>
+): string | null {
+  if (comparable.has("immediateFinancialEffect")) {
+    const quotedNet = quoted.immediate!.net!;
+    const revalidatedNet = compared.immediate!.net!;
+    const netIncrease = revalidatedNet - quotedNet;
+
+    if (netIncrease > 0) {
+      const allowed = envelope.maxImmediateNetIncrease ?? 0;
+      if (netIncrease > allowed) {
+        return `immediate.net increased by ${netIncrease} (quoted ${quotedNet} -> revalidated ${revalidatedNet}), exceeding maxImmediateNetIncrease=${allowed}`;
+      }
+    } else if (netIncrease < 0) {
+      // Net moved in the caller's favor (smaller charge / bigger credit) —
+      // treat as a credit-side change, bounded separately since a caller may
+      // reasonably want a tighter or looser tolerance on "I got charged less
+      // than expected" than on being charged more.
+      const creditDecrease = -netIncrease;
+      const allowed = envelope.maxImmediateCreditDecrease ?? 0;
+      if (creditDecrease > allowed) {
+        return `immediate.net moved in the caller's favor by ${creditDecrease} (quoted ${quotedNet} -> revalidated ${revalidatedNet}), exceeding maxImmediateCreditDecrease=${allowed}`;
+      }
+    }
+  }
+
+  if (comparable.has("recurringFinancialEffect")) {
+    const quotedRecurring = quoted.recurring!.resultingAmount!;
+    const revalidatedRecurring = compared.recurring!.resultingAmount!;
+    const recurringIncrease = revalidatedRecurring - quotedRecurring;
+    if (recurringIncrease > 0) {
+      const allowed = envelope.maxRecurringIncrease ?? 0;
+      if (recurringIncrease > allowed) {
+        return `recurring.resultingAmount increased by ${recurringIncrease} (quoted ${quotedRecurring} -> revalidated ${revalidatedRecurring}), exceeding maxRecurringIncrease=${allowed}`;
+      }
+    }
+  }
+
+  return null;
+}
+
+/**
  * Checks a freshly-recomputed commercialEffect against the quoted one,
  * within the caller-stated acceptance envelope. Returns a human-readable
  * violation reason string if the envelope is exceeded, or null if the
  * recomputation is acceptable.
  *
- * Bounds not stated in the envelope default to "zero tolerance" for that
- * dimension — a caller must opt into slack, not receive it implicitly.
+ * v0.6.2 BC-1 (fail-closed activation): BEFORE any comparison, both
+ * sides' determinacy is established per dimension via
+ * `assertEnvelopeEnforceable` — an unenforceable dimension THROWS
+ * QUOTE_NOT_DETERMINISTIC (it does not return a drift string: no
+ * comparison took place, and callers must not mistake the refusal
+ * for drift). The v0.6.1 `?? 0` coercions are removed: a dimension
+ * is compared only when both sides are DETERMINED, and skipped only
+ * when both sides assert a NOT_APPLICABLE the proposal's action
+ * context licenses. `proposal` carries that authoritative context;
+ * omitting it leaves NOT_APPLICABLE assertions unjustified
+ * (MISSING_ACTION_CONTEXT) while DETERMINED/UNKNOWN handling is
+ * unaffected.
  */
 export function checkAcceptanceEnvelope(
   quoted: CommercialEffect,
   revalidated: CommercialEffect,
-  envelope: AcceptanceEnvelope
+  envelope: AcceptanceEnvelope,
+  proposal?: SubscriptionChangeProposal
 ): string | null {
-  const quotedNet = quoted.immediate?.net ?? 0;
-  const revalidatedNet = revalidated.immediate?.net ?? 0;
-  const netIncrease = revalidatedNet - quotedNet;
-
-  if (netIncrease > 0) {
-    const allowed = envelope.maxImmediateNetIncrease ?? 0;
-    if (netIncrease > allowed) {
-      return `immediate.net increased by ${netIncrease} (quoted ${quotedNet} -> revalidated ${revalidatedNet}), exceeding maxImmediateNetIncrease=${allowed}`;
-    }
-  } else if (netIncrease < 0) {
-    // Net moved in the caller's favor (smaller charge / bigger credit) —
-    // treat as a credit-side change, bounded separately since a caller may
-    // reasonably want a tighter or looser tolerance on "I got charged less
-    // than expected" than on being charged more.
-    const creditDecrease = -netIncrease;
-    const allowed = envelope.maxImmediateCreditDecrease ?? 0;
-    if (creditDecrease > allowed) {
-      return `immediate.net moved in the caller's favor by ${creditDecrease} (quoted ${quotedNet} -> revalidated ${revalidatedNet}), exceeding maxImmediateCreditDecrease=${allowed}`;
-    }
-  }
-
-  const quotedRecurring = quoted.recurring?.resultingAmount ?? 0;
-  const revalidatedRecurring = revalidated.recurring?.resultingAmount ?? 0;
-  const recurringIncrease = revalidatedRecurring - quotedRecurring;
-  if (recurringIncrease > 0) {
-    const allowed = envelope.maxRecurringIncrease ?? 0;
-    if (recurringIncrease > allowed) {
-      return `recurring.resultingAmount increased by ${recurringIncrease} (quoted ${quotedRecurring} -> revalidated ${revalidatedRecurring}), exceeding maxRecurringIncrease=${allowed}`;
-    }
-  }
-
-  return null;
+  assertEnvelopeEnforceable(quoted, revalidated, proposal);
+  const assessments = assessEnvelopePair(quoted, revalidated, proposal, "quote");
+  const comparable = new Set(assessments.filter((d) => d.comparable).map((d) => d.dimension));
+  return compareDeterminedDimensions(quoted, revalidated, envelope, comparable);
 }
 
 /**
@@ -202,21 +425,73 @@ export function checkAcceptanceEnvelope(
  * the caller needs the mutated state regardless.
  *
  * (The `ReconciliationResult` type itself lives in types.ts — see the
- * re-export at the top of this file. Its v0.6.2 UNVERIFIED variant is
- * produced by adapter-side committed-effect construction and, in a
- * later v0.6.2 step, by a reworked reconciliation gate; THIS
- * function's v0.6.1 verdict behavior is unchanged.)
+ * re-export at the top of this file.)
+ *
+ * v0.6.2 BC-1 (truthful reconciliation): the verdict is computed from
+ * the SAME shared assessment as the pre-mutation gate (the committed
+ * side assessed under the committed role), and this function NEVER
+ * throws a pre-mutation refusal — the mutation has already landed,
+ * so an unenforceable dimension is reported, not refused:
+ *
+ *  - VIOLATED — an ESTABLISHED violation: a dimension both sides
+ *    establish (quoted DETERMINED; committed DETERMINED through an
+ *    establishing committedSource) whose committed value exceeds
+ *    the envelope. Precedence: an established violation is reported
+ *    even when ANOTHER dimension remains unestablished — a proven
+ *    violation is never downgraded by an unrelated unknown.
+ *  - UNVERIFIED — no established violation, but at least one
+ *    dimension cannot be established (UNKNOWN on either side, an
+ *    invalid DETERMINED value, committed figures of estimate or
+ *    unestablished provenance, an unjustified NOT_APPLICABLE):
+ *    compliance was not proven, so OK is not available. An UNKNOWN
+ *    committed dimension cannot produce OK by absence, by numeric
+ *    coincidence, or by sharing the quote's number.
+ *  - OK — every dimension is established and within the envelope
+ *    (or legitimately skipped as justified NOT_APPLICABLE on both
+ *    sides).
+ *
+ * No-envelope case (CANCEL-only REVALIDATE proposals may omit one —
+ * see enforceGuaranteeRequest): there is nothing to COMPARE, and OK
+ * keeps its v0.6.1 meaning of "no comparison applies" — but only
+ * when the committed figures the receipt reports are themselves
+ * established actuals (every dimension DETERMINED through an
+ * establishing source, or justified NOT_APPLICABLE). If any
+ * committed dimension is unestablished, the result is UNVERIFIED:
+ * an unknown financial outcome must not masquerade as verified
+ * actuals merely because no envelope was stated. The distinction is
+ * between "nothing to reconcile against" (no envelope) and "the
+ * figures were established" (provenance) — OK requires the former
+ * to be the ONLY gap.
  */
 export function reconcileCommittedEffect(
   quoted: CommercialEffect,
   committed: CommercialEffect,
-  envelope: AcceptanceEnvelope | undefined
+  envelope: AcceptanceEnvelope | undefined,
+  proposal?: SubscriptionChangeProposal
 ): ReconciliationResult {
-  // No envelope (CANCEL-only REVALIDATE proposals are permitted to omit
-  // one — see enforceGuaranteeRequest) means there is nothing to reconcile
-  // against; report OK rather than fabricate a violation with no basis.
-  if (!envelope) return { status: "OK" };
-  const violation = checkAcceptanceEnvelope(quoted, committed, envelope);
+  const assessments = assessEnvelopePair(quoted, committed, proposal, "committed");
+  const undetermined = assessments.filter((d) => !d.comparable && !d.skipped);
+
+  if (!envelope) {
+    // Judge the COMMITTED side alone: with nothing to compare
+    // against, the quoted side's determinacy is not the question —
+    // whether the reported actuals are established is.
+    const unestablishedCommitted = assessments.filter(
+      (d) => d.compared.kind === "unenforceable"
+    );
+    if (unestablishedCommitted.length === 0) return { status: "OK" };
+    return {
+      status: "UNVERIFIED",
+      reason:
+        `Post-commit reconciliation cannot be established: no acceptance envelope applies, and the committed ` +
+        `financial outcome is itself unestablished (${unestablishedCommitted.map((d) => describeAssessment(d, "committed")).join("; ")}). ` +
+        `Reporting OK would present unmeasured figures as verified actuals; the commit stands, but its finances are unverified.`,
+      undeterminedDimensions: unestablishedCommitted.map((d) => d.dimension),
+    };
+  }
+
+  const comparable = new Set(assessments.filter((d) => d.comparable).map((d) => d.dimension));
+  const violation = compareDeterminedDimensions(quoted, committed, envelope, comparable);
   if (violation) {
     return {
       status: "VIOLATED",
@@ -226,6 +501,17 @@ export function reconcileCommittedEffect(
         `because ConsistencyGuarantee is BEST_EFFORT — a concurrent write may have landed between the ` +
         `pre-mutation preview and the mutating call itself. The mutation has already occurred and cannot be ` +
         `rolled back by this reconciliation check; it exists solely so this is never reported silently.`,
+    };
+  }
+  if (undetermined.length > 0) {
+    return {
+      status: "UNVERIFIED",
+      reason:
+        `Post-commit reconciliation cannot be established: ${undetermined.map((d) => describeAssessment(d, "committed")).join("; ")}. ` +
+        `Missing evidence is never proof of compliance — an UNKNOWN or unestablished dimension is not ` +
+        `compared as zero and cannot reconcile OK (BC-1). The mutation has already occurred; its ` +
+        `unestablished dimension(s) require operator follow-up, not a silent OK.`,
+      undeterminedDimensions: undetermined.map((d) => d.dimension),
     };
   }
   return { status: "OK" };
@@ -444,12 +730,11 @@ export function enforceEffectiveIntent(intent: EffectiveIntent, supportedTypes: 
  * number is not provenance. This function is the single place that
  * reading lives.
  *
- * PR-1 note: in this step the reading is consumed ONLY by
- * `auditDeterminacy` below (report-only). No enforcement or
- * reconciliation path reads it yet; wiring it into
- * `checkAcceptanceEnvelope` / `reconcileCommittedEffect` is the
- * separately gated fail-closed activation step (BC-1), and those
- * functions' v0.6.1 behavior is unchanged here.
+ * History: in PR-1 this reading was consumed ONLY by
+ * `auditDeterminacy` (report-only). PR-10 (BC-1) activates it in
+ * enforcement: `checkAcceptanceEnvelope` and
+ * `reconcileCommittedEffect` now assess through the same reading
+ * (see the BC-1 assessment above `checkAcceptanceEnvelope`).
  */
 export function determinacyOf(effect: CommercialEffect): {
   immediateFinancialEffect: DimensionState;
@@ -586,10 +871,13 @@ function auditOneEffect(
  * v0.6.2 TRANSITIONAL determinacy audit (implementation plan §A.2) —
  * NON-NORMATIVE, report-only diagnostic tooling. It computes, per
  * financial dimension, exactly what the v0.6.2 fail-closed envelope
- * guard WOULD refuse about a (quoted, compared) effect pair, and
- * changes no verdict: it never throws on malformed payloads, it
- * mutates nothing, `checkAcceptanceEnvelope` does not call it, and
- * nothing in any commit/enforcement path may branch on its output.
+ * guard refuses about a (quoted, compared) effect pair, and changes
+ * no verdict: it never throws on malformed payloads, it mutates
+ * nothing, and nothing in any commit/enforcement path branches on
+ * its output (the BC-1 gate shares the audit's RULES through the
+ * common assessment above `checkAcceptanceEnvelope`; it does not
+ * consume this function's output — this diagnostic stays
+ * independent so gate/audit agreement can be tested, per PR-10).
  * Its purpose is pre-activation migration gating: adapter migrations
  * run it over their conformance fixtures in CI, and a migrated
  * adapter's fixtures must produce no findings (except where a

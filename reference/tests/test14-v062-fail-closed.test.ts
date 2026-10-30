@@ -131,6 +131,12 @@ function mintEvidenceFor(store: QuoteStore): VerificationEvidence {
     committedEffect: {
       immediate: { net: 1000 },
       recurring: { resultingAmount: 5000, currency: "usd" },
+      // PR-10 (BC-1) fixture completion: the simulated provider read
+      // determines both dimensions (literal read values,
+      // provider_actual) — the determinacy record says so, as in
+      // test15/test16. Test 14.18's subject is the verification
+      // transition, not legacy-effect reconciliation.
+      determinacy: { immediateFinancialEffect: "DETERMINED", recurringFinancialEffect: "DETERMINED" },
       provenance: { committedSource: "provider_actual" },
     },
     resultingSnapshot: {
@@ -201,8 +207,19 @@ test("Test 14.4: UNVERIFIED reconciliation is constructible through the engine r
     undeterminedDimensions: ["recurringFinancialEffect"],
   };
   assert.equal(unverified.status, "UNVERIFIED");
-  // The engine's own function keeps its v0.6.1 behavior in this PR.
-  assert.deepEqual(reconcileCommittedEffect({ immediate: { net: 1 } }, { immediate: { net: 1 } }, undefined), { status: "OK" });
+  // PR-10 DISCLOSED UPDATE (BC-1 activation): PR-1 pinned the
+  // engine's v0.6.1 behavior here ("keeps its v0.6.1 behavior in
+  // this PR") — a legacy pair with no envelope reconciled OK. That
+  // pin held only until the separately gated activation step, and
+  // PR-10 IS that step: a determinacy-less committed effect's
+  // outcome is unestablished, so even with no envelope to compare
+  // against, reconciliation is UNVERIFIED — never a silent OK. The
+  // CORE-4 purpose (the UNVERIFIED variant is real and reachable
+  // through the engine re-export) is retained and strengthened:
+  // the engine now PRODUCES the variant this test constructs.
+  const legacyPair = reconcileCommittedEffect({ immediate: { net: 1 } }, { immediate: { net: 1 } }, undefined);
+  assert.equal(legacyPair.status, "UNVERIFIED");
+  assert.ok(legacyPair.status === "UNVERIFIED" && legacyPair.undeterminedDimensions?.includes("immediateFinancialEffect"));
 });
 
 test("Test 14.5: an exhaustive v0.6.1-shaped consumer fails to compile against the widened union, naming UNVERIFIED (BC-5)", () => {
@@ -228,23 +245,45 @@ test("Test 14.5: an exhaustive v0.6.1-shaped consumer fails to compile against t
 });
 
 // ---------------------------------------------------------------------------
-// Behavior pin: PR-1 changes no verdict
+// Behavior pin: PR-1 changes no verdict — SUPERSEDED by PR-10 (BC-1)
 // ---------------------------------------------------------------------------
 
-test("Test 14.6: checkAcceptanceEnvelope behavior is byte-for-byte v0.6.1 in PR-1 (missing values still coerce; activation is a later gate)", () => {
-  assert.equal(checkAcceptanceEnvelope({}, {}, {}), null);
-  assert.equal(
-    checkAcceptanceEnvelope(
-      { immediate: { net: 1000 }, recurring: { resultingAmount: 5000, currency: "usd" } },
-      { immediate: { net: 1000 }, recurring: { resultingAmount: 5000, currency: "usd" } },
-      {}
-    ),
-    null
+test("Test 14.6: checkAcceptanceEnvelope under BC-1 (PR-10) — the PR-1 v0.6.1 pin is superseded by the activation it deferred to", () => {
+  // PR-10 DISCLOSED UPDATE: PR-1 pinned checkAcceptanceEnvelope as
+  // "byte-for-byte v0.6.1 ... activation is a later gate". PR-10 is
+  // that gate. What survives of the pin: for dimensions BC-1
+  // establishes as comparable (both sides DETERMINED with finite
+  // values and provenance), the numeric comparison and its
+  // violation strings are byte-for-byte v0.6.1. What the activation
+  // removes: the `?? 0` coercions — a legacy/absent dimension now
+  // REFUSES (QUOTE_NOT_DETERMINISTIC) instead of comparing as zero.
+  const det = (net: number, recurring: number): CommercialEffect => ({
+    immediate: { net },
+    recurring: { resultingAmount: recurring, currency: "usd" },
+    determinacy: { immediateFinancialEffect: "DETERMINED", recurringFinancialEffect: "DETERMINED" },
+    provenance: { immediate: "test fixture", recurring: "test fixture" },
+  });
+  const refuses = (e: unknown): boolean => e instanceof SCQError && e.code === "QUOTE_NOT_DETERMINISTIC";
+  // Legacy pairs refuse — they no longer compare as 0 == 0.
+  assert.throws(() => checkAcceptanceEnvelope({}, {}, {}), refuses);
+  assert.throws(
+    () =>
+      checkAcceptanceEnvelope(
+        { immediate: { net: 1000 }, recurring: { resultingAmount: 5000, currency: "usd" } },
+        { immediate: { net: 1000 }, recurring: { resultingAmount: 5000, currency: "usd" } },
+        {}
+      ),
+    refuses
   );
-  // v0.6.1 semantics: an absent revalidated dimension reads as 0, so
-  // this is a credit-side drift of 1000 against zero tolerance.
-  const violation = checkAcceptanceEnvelope({ immediate: { net: 1000 } }, {}, {});
+  // Established pairs compare exactly as v0.6.1 did.
+  assert.equal(checkAcceptanceEnvelope(det(1000, 5000), det(1000, 5000), {}), null);
+  // A DETERMINED 1000 -> 0 move is still the same credit-side drift
+  // string v0.6.1 produced...
+  const violation = checkAcceptanceEnvelope(det(1000, 5000), det(0, 5000), {});
   assert.ok(typeof violation === "string" && violation.includes("1000"));
+  // ...but an ABSENT revalidated dimension is no longer read as
+  // that 0: it refuses instead of drifting.
+  assert.throws(() => checkAcceptanceEnvelope(det(1000, 5000), {}, {}), refuses);
 });
 
 // ---------------------------------------------------------------------------

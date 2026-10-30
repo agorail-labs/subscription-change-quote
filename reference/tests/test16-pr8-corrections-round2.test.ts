@@ -121,6 +121,14 @@ function verifiedStoreViaRestore(): QuoteStore {
     committedEffect: {
       immediate: { net: 1000 },
       recurring: { resultingAmount: 5000, currency: "usd" },
+      // PR-10 (BC-1) fixture completion: this persisted evidence
+      // models an established observation's figures — literal
+      // provider-actual values — so its determinacy record states
+      // DETERMINED for both dimensions, as the observation that
+      // minted it would carry. Restore content-validation recomputes
+      // the reconciliation under BC-1; a determinacy-less evidence
+      // effect now (correctly) recomputes UNVERIFIED.
+      determinacy: { immediateFinancialEffect: "DETERMINED", recurringFinancialEffect: "DETERMINED" },
       provenance: { committedSource: "provider_actual" },
     },
     committedSource: "provider_actual",
@@ -303,6 +311,13 @@ function standardObservation(overrides: Partial<ProviderObservation> = {}): Prov
     committedEffect: {
       immediate: { net: 1000 },
       recurring: { resultingAmount: 5000, currency: "usd" },
+      // PR-10 (BC-1) fixture completion: the simulated provider read
+      // determines both dimensions (literal read values,
+      // provider_actual), so the determinacy record says so — the
+      // same completion as test15's observationFor. These tests'
+      // subject is the trusted establishment path, not legacy
+      // effects (test35 covers those).
+      determinacy: { immediateFinancialEffect: "DETERMINED", recurringFinancialEffect: "DETERMINED" },
       provenance: { committedSource: "provider_actual" },
     },
     resultingSnapshot: {
@@ -416,6 +431,12 @@ test("Test 16.15 (R3): defined_equal_exact is also an establishing source — es
       committedEffect: {
         immediate: { net: 1000 },
         recurring: { resultingAmount: 5000, currency: "usd" },
+        // PR-10 (BC-1): this override replaces the whole effect, so
+        // it carries the determinacy record itself — under the
+        // EXACT premise of this test the figures ARE determined
+        // (by the definitional-equality contract), which is exactly
+        // what defined_equal_exact asserts.
+        determinacy: { immediateFinancialEffect: "DETERMINED", recurringFinancialEffect: "DETERMINED" },
         provenance: { committedSource: "defined_equal_exact" },
       },
     })

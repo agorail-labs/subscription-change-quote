@@ -166,9 +166,13 @@ function immediateParts(net: number): NonNullable<CommercialEffect["immediate"]>
  * revalidation — could pass the gate and proceed to MUTATE: the
  * adapter would commit a change whose financial effect it does not
  * know. Fail-closed treatment of UNKNOWN in the shared envelope is
- * BC-1, PR-9's separately gated activation; the engine is NOT
- * changed here. Until then, THIS adapter refuses such commits
- * itself, before any mutating call, with QUOTE_NOT_DETERMINISTIC.
+ * BC-1, activated in the core by PR-10 (this PR series' PR-10):
+ * checkAcceptanceEnvelope now refuses unenforceable dimensions
+ * itself. THIS adapter still refuses such commits itself, before
+ * any mutating call, with QUOTE_NOT_DETERMINISTIC — the local gate
+ * is the earlier, adapter-specific refusal (it names this
+ * adapter's stage and fires before the core gate is reached); the
+ * core gate is the protocol-level backstop behind it.
  *
  * A dimension passes iff it is DETERMINED with a finite value, or
  * NOT_APPLICABLE under the §3.10 license — which covers exactly
@@ -700,7 +704,7 @@ export class StripeAdapter implements SubscriptionProvider {
       // against an effect it does not know. Refuse here, still
       // before any mutating call.
       assertEffectDeterminateForCommit(revalidated, proposal, "revalidated");
-      const violation = checkAcceptanceEnvelope(validated.quoted_effect, revalidated, proposal.acceptanceEnvelope!);
+      const violation = checkAcceptanceEnvelope(validated.quoted_effect, revalidated, proposal.acceptanceEnvelope!, proposal);
       if (violation) {
         throw new SCQError(
           "QUOTE_DRIFTED",
@@ -783,7 +787,7 @@ export class StripeAdapter implements SubscriptionProvider {
       // re-check the committed effect against the same envelope used
       // pre-mutation. It cannot undo the mutation; it exists so a
       // violation is never silent.
-      reconciliation = reconcileCommittedEffect(validated.quoted_effect, committedEffect, proposal.acceptanceEnvelope);
+      reconciliation = reconcileCommittedEffect(validated.quoted_effect, committedEffect, proposal.acceptanceEnvelope, proposal);
       receiptStatus = "COMMITTED";
       receiptOutcome = "COMMITTED_AND_VERIFIED";
       snap = snapshotFrom(resultingSub);

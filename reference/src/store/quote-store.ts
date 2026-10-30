@@ -506,7 +506,8 @@ export class QuoteStore {
     const recomputed = reconcileCommittedEffect(
       recorded.quotedEffect,
       evidence.committedEffect,
-      q.proposal.acceptanceEnvelope
+      q.proposal.acceptanceEnvelope,
+      q.proposal
     );
     if (recomputed.status !== evidence.reconciliation.status) {
       throw new Error(
@@ -964,7 +965,7 @@ export function establishVerification(quote: StoredQuote, observation: ProviderO
         ...(observation.observedAt ? { observedAt: observation.observedAt } : {}),
       }
     ).verdict,
-    reconciliation: reconcileCommittedEffect(quote.quoted_effect, observation.committedEffect, quote.proposal.acceptanceEnvelope),
+    reconciliation: reconcileCommittedEffect(quote.quoted_effect, observation.committedEffect, quote.proposal.acceptanceEnvelope, quote.proposal),
     ...(observation.observedAt ? { at: observation.observedAt } : {}),
   };
   establishedEvidenceTokens.add(token);

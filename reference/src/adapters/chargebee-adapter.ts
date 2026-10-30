@@ -384,10 +384,12 @@ function canonicalJson(value: unknown): string {
  * in the commit-time revalidation — could pass the gate and
  * proceed to MUTATE: the adapter would commit a change whose
  * financial effect it does not know. Fail-closed treatment of
- * UNKNOWN in the shared envelope is BC-1, a separately gated
- * activation; the engine is NOT changed here. Until then, THIS
- * adapter refuses such commits itself, before any mutating call,
- * with QUOTE_NOT_DETERMINISTIC.
+ * UNKNOWN in the shared envelope is BC-1, activated in the core
+ * by PR-10: checkAcceptanceEnvelope now refuses unenforceable
+ * dimensions itself. THIS adapter still refuses such commits
+ * itself, before any mutating call, with QUOTE_NOT_DETERMINISTIC —
+ * the local gate is the earlier, adapter-specific refusal; the
+ * core gate is the protocol-level backstop behind it.
  *
  * A dimension passes iff it is DETERMINED with a finite value.
  * This adapter asserts NOT_APPLICABLE for no Chargebee dimension
@@ -842,7 +844,7 @@ export class ChargebeeAdapter implements SubscriptionProvider {
           committedSource: "revalidated_preview",
         };
         assertEffectDeterminateForCommit(revalidated, "revalidated");
-        const violation = checkAcceptanceEnvelope(validated.quoted_effect, revalidated, proposal.acceptanceEnvelope!);
+        const violation = checkAcceptanceEnvelope(validated.quoted_effect, revalidated, proposal.acceptanceEnvelope!, proposal);
         if (violation) {
           throw new SCQError(
             "QUOTE_DRIFTED",
@@ -870,7 +872,7 @@ export class ChargebeeAdapter implements SubscriptionProvider {
         };
         assertEffectDeterminateForCommit(revalidated, "revalidated");
         if (proposal.acceptanceEnvelope) {
-          const violation = checkAcceptanceEnvelope(validated.quoted_effect, revalidated, proposal.acceptanceEnvelope);
+          const violation = checkAcceptanceEnvelope(validated.quoted_effect, revalidated, proposal.acceptanceEnvelope, proposal);
           if (violation) {
             throw new SCQError(
               "QUOTE_DRIFTED",
@@ -1277,7 +1279,7 @@ export class ChargebeeAdapter implements SubscriptionProvider {
     }
     return {
       effect: committedEffect,
-      reconciliation: reconcileCommittedEffect(quoted, committedEffect, proposal.acceptanceEnvelope),
+      reconciliation: reconcileCommittedEffect(quoted, committedEffect, proposal.acceptanceEnvelope, proposal),
       status: "COMMITTED",
       outcome: "COMMITTED_AND_VERIFIED",
       snapshot: snap,
@@ -1702,7 +1704,7 @@ export class ChargebeeAdapter implements SubscriptionProvider {
     };
     return {
       effect: committedEffect,
-      reconciliation: reconcileCommittedEffect(quoted, committedEffect, proposal.acceptanceEnvelope),
+      reconciliation: reconcileCommittedEffect(quoted, committedEffect, proposal.acceptanceEnvelope, proposal),
       status: "COMMITTED",
       outcome: "COMMITTED_AND_VERIFIED",
       snapshot: snap,
