@@ -259,11 +259,10 @@ occurred.
   HTTP 400) — a parameter value not meeting its required
   specification — and the documentation
   states that API calls fail at the first error encountered while
-  VALIDATING them, i.e. before the operation is processed. Both
-  code describes invalid request parameters, so it carries
-  no prior idempotency-key ambiguity (a consumed key
-  reused with a different payload surfaces as HTTP 422, not as one
-  this code).
+  VALIDATING them, i.e. before the operation is processed. This
+  code describes invalid request parameters, so it carries no
+  prior idempotency-key ambiguity (a consumed key reused with a
+  different payload surfaces as HTTP 422, not as this code).
 - **Fail closed.** A 400 carrying a payment-stage code
   (`payment_processing_failed`, `payment_method_verification_failed`,
   `payment_intent_invalid`, and the other payment-type codes), the
