@@ -533,3 +533,165 @@ Condition 3 semantics are unchanged by this hardening: PASS still
 requires structural real provenance, attestation, an ESTABLISHED
 binding from an issuance record, verified provider identity, and
 zero blockers; the overall assessment remains NO-GO.
+
+## 12. PF4 + PF5 — provenance handle opacity and the Condition 3 unknown gate (2026-10-30, re-review)
+
+Two findings remained after §10/§11. PF2 and the §11 manifest
+hardening were accepted by the reviewer; this section governs over
+§2/§6/§10 wording where they describe the transport handle or the
+Condition 3 gate.
+
+### PF4 — live-evidence provenance was still forgeable through the genuine handle
+
+**Audit of the §10 design (head `2899921`).** PF1 made provenance
+structural via a module-private brand on the handle returned by
+`createRealPreflightTransport()` — but the handle carried the
+genuine guarded transport and its observed log as WRITABLE public
+properties, and `runPreflight` trusted those properties as the
+live network path and its evidence log. The reviewer's
+counterexample: call the factory once (no network request needed),
+overwrite `handle.transport` and `handle.log` with a mocked
+guarded transport and its log, and the preflight produced
+LIVE_PASS classification and a Condition 3 PASS from simulated
+responses (with attestation and a v2 origin manifest supplied). A
+private Symbol cannot fix this class: the symbol is readable off
+any genuine handle via `Object.getOwnPropertySymbols`, and a
+copied brand is indistinguishable from a genuine one. Test40.7
+exercised only a wholly caller-assembled object without the
+symbol; it did not cover modification or replay of a genuine
+handle.
+
+**Design (pilot layer only — `src/live/pilot/preflight.ts`).**
+
+1. **Opaque handle.** `createRealPreflightTransport()` now returns
+   a handle exposing NO transport, no log, and no other state. Its
+   only meaning is its object identity.
+2. **Module-private registry.** The factory — which takes NO
+   caller transport — constructs the guarded real-network
+   transport exactly as before and stores `{ transport, log }` in
+   a module-private `WeakMap` keyed by the handle.
+   `runPreflight` resolves real-mode exclusively through this
+   registry and NEVER reads handle properties. A mutated handle, a
+   clone, and a property-copied forgery (own keys including
+   symbols, copied via `Reflect.ownKeys`) are all simply absent
+   from the registry and are refused with the same error as a
+   caller-assembled handle. The PF1 brand check is gone; registry
+   membership is the only authority.
+3. **The authoritative log never leaves the module.** No
+   caller-reachable reference to the registry's log array exists:
+   the handle does not expose it, and reports carry only the
+   transport SUMMARY computed from it inside `runPreflight`. (The
+   handle is deliberately not frozen either: freezing was never
+   the control — a frozen handle with an externally reachable log
+   array would still leak the evidence, which is why the log lives
+   only in the registry.)
+4. **Injected path unchanged.** A caller-supplied transport is
+   still wrapped by `createPreflightTransport` and always
+   classified injected/simulated.
+
+**Test seam, stated plainly.** Tests cannot place real network
+calls, yet the PF5 regressions need a structurally real run whose
+read completes. Test42 therefore stubs the platform `fetch`
+BENEATH the module's own `fetchTransport` (delegating to the
+synthetic pilot mock, restored after each test) while the
+transport itself comes from `createRealPreflightTransport()`.
+Provenance is a property of the module's construction, which the
+stub does not touch — the stub sits exactly where a proxy or DNS
+override would sit in a real deployment. This is a property of
+the test process only; no exported seam exists, and no caller of
+the module can use it to upgrade evidence (a host that replaces
+its own process's `fetch` is outside the module's trust boundary
+by definition, like a host that controls its own network).
+LIVE_PASS classifications inside those synthetic harness runs
+classify the structural path only and are never presented as
+real-tenant evidence.
+
+### PF5 — UNKNOWN scheduled-change status could not stop a Condition 3 PASS
+
+**Audit.** The independent read correctly reports
+`has_scheduled_changes` / `has_scheduled_advance_invoices` as
+UNKNOWN when the provider response omits them (never fabricated
+as "none"). But the Condition 3 aggregation counted only
+BLOCKERS: an unknown check is not a blocker, so a structurally
+real run with attestation, established origin, verified identity,
+and no blockers marked Condition 3 PASS while unable to establish
+whether outstanding scheduled changes or advance invoices would
+be disturbed — the exact interferences issue #12 and
+COMMIT-RECOVERY-SAFETY §2 require checking. Uncertainty was
+silently treated as clearance. The same shape applied to request
+coherence: an unresolved `request_matches_proposal` (no
+independent baseline) also could not stop a PASS on its own.
+
+**Design.** The Condition 3 gate now evaluates safety-critical
+UNKNOWN checks explicitly (`COND3_UNKNOWN_GATES` in
+`runPreflight`): `scheduled_changes`,
+`scheduled_advance_invoices`, and `request_matches_proposal`.
+Each unresolved one appends a named unmet requirement — e.g.
+"scheduled-change status is UNKNOWN — the provider read did not
+establish whether outstanding scheduled changes exist that this
+change would disturb; uncertainty is not clearance". The other
+safety-critical unknowns were already gated by dedicated
+requirements and remain so (operator attestation; provider
+subscription identity via the verified-identity requirement).
+Status mapping is unchanged: unknowns alone yield UNVERIFIED;
+BLOCKED still requires blockers. Both flags provider-reported
+false leave the gate fully permeable (test42.10: Condition 3 PASS
+on the structurally real path), and both flags TRUE still block
+exactly as before (test42.11).
+
+**Failing-first (test42, written against `2899921` before the
+fix; profile verified twice, including a stash re-run of the
+final file against the pre-fix source: 7 fail / 4 pass pre-fix,
+11/11 post-fix).**
+
+| Test | Pre-fix | Post-fix | Class |
+| --- | --- | --- | --- |
+| 42.1 genuine handle, transport + log overwritten with a mock's (reviewer's counterexample) | FAIL — the substituted mock served the read (4 run calls), its log became the evidence: LIVE_PASS + Condition 3 PASS | Substituted mock never invoked by the run; no LIVE_PASS; provider state null; Condition 3 not PASS | merits failure (PF4) |
+| 42.2 forged handle copying all own properties incl. symbols from a genuine handle | FAIL — accepted (brand copied); run resolved instead of refusing | Refused: not in the registry | merits failure (PF4) |
+| 42.3 genuine handle, ONLY log replaced (fabricated log incl. a dispatched update_for_items) | FAIL — the fabricated log was summarized into the report: updateForItemsDispatched 1, mutatingCalls 1 | Report evidence computed from the registry's log only: 0 / 0 | merits failure (PF4) |
+| 42.4 genuine handle, ONLY transport replaced | FAIL — mock responses became provider state; Condition 3 PASS | Mock never invoked by the run; provider state null; Condition 3 not PASS | merits failure (PF4) |
+| 42.5 unmutated genuine handle, no network | pass — provenance "real", read fails closed, NO-GO | pass (identical) | control |
+| 42.6 the genuine handle exposes no transport / no log | FAIL — both properties present and writable | Both absent; authority is the registry | merits failure (PF4) |
+| 42.7 real-path run, provider omits has_scheduled_changes | FAIL — Condition 3 PASS (blockers [] and the unknown counted for nothing) | Condition 3 UNVERIFIED; reason names the UNKNOWN scheduled-change status | merits failure (PF5) |
+| 42.8 real-path run, provider omits has_scheduled_advance_invoices | FAIL — Condition 3 PASS | Condition 3 UNVERIFIED; reason names the UNKNOWN advance-invoice status | merits failure (PF5) |
+| 42.9 injected run, both flags present and false | pass — Condition 3 UNVERIFIED (provenance), no scheduled-change reason | pass (identical) | control |
+| 42.10 real-path run, both flags present and false | pass — Condition 3 PASS | pass — the gate permits when the facts are established | positive control |
+| 42.11 both flags present and TRUE | pass — both checks blocker; Condition 3 BLOCKED | pass (identical) | control |
+
+**Disclosures.**
+
+- *Test42 assertion correction during development:* 42.1/42.4
+  initially asserted the mock's TOTAL call count was zero; the
+  fixture's own issuance also calls the mock, so the assertions
+  are now run-relative (the count must not increase during the
+  preflight run). The correction does not change any outcome:
+  pre-fix the run adds its calls and both tests still fail on the
+  merits — re-verified by running the final file against the
+  pre-fix source (stash), same 7 fail / 4 pass profile.
+- *No pre-existing test file was modified in this round.*
+  Test40.7's forged-handle rejection and test40.8's genuine-path
+  behavior hold unchanged against the registry design (the
+  rejection error text still names the factory); test37.20's
+  UNKNOWN reporting is unchanged — only the Condition 3
+  aggregation learned to count it.
+- *Sample mocked run NOT regenerated:* the CLI's mocked run was
+  re-executed into a scratch directory under the corrected code
+  and compared with the committed sample after normalizing
+  run-volatile fields (timestamps, generated ids/digests). The
+  reports are identical in substance — the sample's path is
+  injected (PF4 does not touch its shape) and its scheduled flags
+  are provider-reported false (the PF5 gate adds nothing) — so the
+  committed sample stands as accurate.
+
+**Verification.** Fresh clean build (`rm -rf node_modules dist &&
+npm ci`, Node 22.14): **612/612** (601 baseline + test42 ×11).
+Demo, demo:commit, smoke:pack, and the pilot harness all pass;
+pilot reports 0 observed mutating calls. Gated-surface diff for
+the round and for the whole PR remains **0 lines** (`spec/*`,
+`reference/src/core/types.ts`, `reference/src/core/scq-engine.ts`,
+and `reference/src/store/*` untouched) — the freeze guard is
+expected to PASS and no label is needed or applied. Condition 3
+semantics are otherwise unchanged, PF2 and the §11 hardening are
+untouched, and the overall assessment remains NO-GO: the
+controlled Chargebee test-site commit still requires the four
+human/spec approvals of §9.

@@ -39,10 +39,28 @@
  *   There is no origin input. A caller-supplied transport is always
  *   "injected" (simulated evidence); the only LIVE-eligible
  *   transport is the one this module constructs itself around the
- *   real network transport (`createRealPreflightTransport`), whose
- *   handle carries a module-private brand a caller cannot forge.
+ *   real network transport (`createRealPreflightTransport`).
  *   Condition 3 additionally requires actual operator attestation of
  *   test-tenant ownership/mode and verified provider identity.
+ * - PF4 (re-review): the PF1 construction originally returned the
+ *   genuine transport and its log as WRITABLE properties of the
+ *   branded handle, and runPreflight trusted those properties — a
+ *   caller could overwrite both with a mocked transport and its log
+ *   and obtain LIVE_PASS + a Condition 3 PASS from simulated
+ *   responses (a private-symbol brand cannot prevent this: the
+ *   symbol is readable off any genuine handle). The handle is now
+ *   OPAQUE and the authoritative transport + observed log live in a
+ *   module-private registry keyed by the handle; runPreflight
+ *   resolves real-mode only through that registry and never reads
+ *   handle properties, so a mutated, cloned, or property-copied
+ *   handle is simply absent from the registry and is refused.
+ * - PF5 (re-review): Condition 3's gate counted only blockers, so
+ *   safety-critical UNKNOWN checks (scheduled changes, scheduled
+ *   advance invoices, request coherence) could not stop a PASS —
+ *   uncertainty was silently treated as clearance. The gate now
+ *   evaluates the safety-critical unknowns explicitly: while any is
+ *   unresolved, Condition 3 stays UNVERIFIED (or BLOCKED when
+ *   blockers also stand) and the reason names each unresolved fact.
  * - PF2: the exact-request check validates the FULL resulting
  *   (itemPriceId, quantity) multiset: the authorized proposal
  *   applied to the INDEPENDENTLY re-read current item set, compared
@@ -94,35 +112,58 @@ export function createPreflightTransport(inner: HttpTransport): { transport: Htt
 // ---------------------------------------------------------------------------
 
 /**
- * The brand marking a transport handle as constructed by THIS
- * module around the real network transport. The symbol is
- * module-private and never exported: a caller cannot assemble a
- * handle carrying it — the only way to obtain one is
- * `createRealPreflightTransport()` below, which takes NO caller
- * transport. Provenance therefore derives from how the transport
- * was obtained, never from a caller-supplied label (the pre-PF1
- * `transportOrigin: "real"` input let a mocked transport forge
- * LIVE_PASS and a Condition 3 PASS).
+ * PF4: the authoritative real transport and its observed log live
+ * in this module-private registry, keyed by the opaque handle
+ * `createRealPreflightTransport()` returns. The PF1 design returned
+ * `{ brand, transport, log }` with transport and log as WRITABLE
+ * public properties, and runPreflight trusted them: a caller could
+ * take a genuine handle, overwrite both properties with a mocked
+ * transport and its log, and the preflight treated simulated
+ * responses as real-network evidence (LIVE_PASS + Condition 3
+ * PASS). No brand or symbol fixes that class — a private symbol is
+ * readable off any genuine handle via Object.getOwnPropertySymbols,
+ * and a copied brand is indistinguishable from a genuine one.
+ *
+ * The registry is therefore the ONLY authority. The factory below —
+ * which takes NO caller transport — constructs the guarded real
+ * network transport, stores `{ transport, log }` here, and returns
+ * an opaque handle carrying neither. runPreflight resolves
+ * real-mode exclusively through this registry and never reads
+ * handle properties: a mutated handle, a clone, and a
+ * property-copied forgery are all simply ABSENT from the registry
+ * and are refused. The authoritative log never leaves the module —
+ * no caller-reachable reference to it exists; reports carry only
+ * summaries computed from it inside runPreflight.
  */
-const REAL_PREFLIGHT_TRANSPORT_BRAND: unique symbol = Symbol("scq-real-preflight-transport");
+const REAL_TRANSPORT_REGISTRY = new WeakMap<RealPreflightTransport, { transport: HttpTransport; log: TransportLogEntry[] }>();
 
-export type RealPreflightTransport = {
-  readonly [REAL_PREFLIGHT_TRANSPORT_BRAND]: true;
-  transport: HttpTransport;
-  log: TransportLogEntry[];
-};
+const REAL_HANDLE_MARKER: unique symbol = Symbol("scq-real-preflight-transport-handle");
+
+/**
+ * An OPAQUE handle for the preflight's own internally constructed
+ * guarded real-network transport. It exposes no transport, no log,
+ * and no other state: its only meaning is its identity as a key in
+ * the module-private registry above. (The marker property exists
+ * only to give the type a nominal shape; authority is registry
+ * membership, never the marker — a handle copied property-for-
+ * property, marker included, is still refused.)
+ */
+export type RealPreflightTransport = { readonly [REAL_HANDLE_MARKER]: true };
 
 /**
  * Constructs the preflight's own guarded REAL-network transport
- * (the pilot allowlist wrapped around the real fetch transport).
- * This is the only LIVE-eligible transport source: runs over it are
- * classified by what the observed log shows, exactly as runs over
+ * (the pilot allowlist wrapped around the real fetch transport) and
+ * returns its opaque handle. This is the only LIVE-eligible
+ * transport source: runs over it are classified by what the
+ * registry's observed log shows, exactly as runs over
  * caller-supplied transports are classified SIMULATED — the
  * difference is construction, not assertion.
  */
 export function createRealPreflightTransport(): RealPreflightTransport {
   const { transport, log } = createGuardedLiveTransport(fetchTransport);
-  return { [REAL_PREFLIGHT_TRANSPORT_BRAND]: true, transport, log };
+  const handle: RealPreflightTransport = { [REAL_HANDLE_MARKER]: true };
+  REAL_TRANSPORT_REGISTRY.set(handle, { transport, log });
+  return handle;
 }
 
 // ---------------------------------------------------------------------------
@@ -290,10 +331,12 @@ export type PreflightInput = {
    */
   transport?: HttpTransport;
   /**
-   * The preflight's own internally constructed guarded real-network
-   * transport, obtained ONLY from `createRealPreflightTransport()`.
-   * This is the sole LIVE-eligible source. A handle not constructed
-   * by that factory is refused (brand check) rather than classified.
+   * The opaque handle for the preflight's own internally
+   * constructed guarded real-network transport, obtained ONLY from
+   * `createRealPreflightTransport()`. This is the sole LIVE-eligible
+   * source. A handle not constructed by that factory — including a
+   * mutated genuine handle or a property-copied forgery — is
+   * refused (module-private registry lookup) rather than classified.
    */
   realTransport?: RealPreflightTransport;
   /**
@@ -486,17 +529,21 @@ export async function runPreflight(input: PreflightInput): Promise<PreflightRepo
     if (status === "blocker") blockers.push(`${id}: ${detail}`);
   };
 
-  // --- Structural transport provenance (PF1) -------------------------
+  // --- Structural transport provenance (PF1 + PF4) -------------------
   // Provenance is decided HERE, from how the transport was obtained:
-  // the module-branded internally constructed handle is "real";
-  // every caller-supplied transport is "injected". There is no
-  // origin input, and a forged handle is refused outright — a
-  // caller must not be able to assemble the appearance of the real
-  // network path around a mocked transport.
+  // a handle found in the module-private registry is "real"; every
+  // caller-supplied transport is "injected". There is no origin
+  // input. PF4: the registry — never handle properties — is the
+  // authority, so a forged, cloned, or property-mutated handle is
+  // refused outright: a caller must not be able to assemble the
+  // appearance of the real network path around a mocked transport,
+  // nor substitute a fabricated log for the observed one.
   let provenance: PreflightTransportOrigin;
+  let realEntry: { transport: HttpTransport; log: TransportLogEntry[] } | undefined;
   if (input.realTransport !== undefined) {
-    if ((input.realTransport as unknown as Record<symbol, unknown>)[REAL_PREFLIGHT_TRANSPORT_BRAND] !== true) {
-      throw new Error("runPreflight: realTransport was not constructed by createRealPreflightTransport() — refusing to classify a caller-assembled handle as the internally constructed real-network transport");
+    realEntry = REAL_TRANSPORT_REGISTRY.get(input.realTransport);
+    if (realEntry === undefined) {
+      throw new Error("runPreflight: realTransport was not constructed by createRealPreflightTransport() — refusing to classify a caller-assembled, cloned, or property-mutated handle as the internally constructed real-network transport");
     }
     provenance = "real";
   } else if (input.transport !== undefined) {
@@ -768,10 +815,12 @@ export async function runPreflight(input: PreflightInput): Promise<PreflightRepo
   let identityVerified = false;
   if (!report.refused && stored && derivedParams) {
     // The internally constructed real transport is already guarded
-    // by its factory (its log is the run's log); a caller-supplied
-    // transport is wrapped in the same guard here.
+    // by its factory; its authoritative transport + log come from
+    // the module-private registry (PF4) — handle properties are
+    // never read. A caller-supplied transport is wrapped in the
+    // same guard here.
     const { transport: guarded, log } = provenance === "real"
-      ? { transport: input.realTransport!.transport, log: input.realTransport!.log }
+      ? realEntry!
       : createPreflightTransport(input.transport!);
     runLog = log;
     const client = new ChargebeeClient({ site: input.site, apiKey: input.apiKey ?? "" }, guarded);
@@ -996,6 +1045,26 @@ export async function runPreflight(input: PreflightInput): Promise<PreflightRepo
   if (report.durableReadiness.originBinding !== "ESTABLISHED") cond3Unmet.push("quote-origin site/subscription binding is not established by an issuance record");
   if (report.providerState === null) cond3Unmet.push("the independent provider re-read did not complete");
   else if (!identityVerified) cond3Unmet.push("the re-read subscription identity was not verified against the bound subscription id");
+  // PF5: safety-critical UNKNOWN checks gate Condition 3 explicitly.
+  // An "unknown" check is not a blocker, so the blocker count alone
+  // let a structurally real, otherwise complete run PASS Condition 3
+  // without establishing whether outstanding scheduled changes or
+  // advance invoices would be disturbed — uncertainty silently
+  // treated as clearance. While any safety-critical check is
+  // unresolved, Condition 3 stays UNVERIFIED (BLOCKED only when
+  // blockers also stand) and each unresolved fact is named here.
+  // (The remaining safety-critical unknowns are gated by their
+  // dedicated requirements above: operator attestation, and provider
+  // subscription identity via identityVerified.)
+  const COND3_UNKNOWN_GATES: ReadonlyArray<{ id: string; unmet: string }> = [
+    { id: "scheduled_changes", unmet: "scheduled-change status is UNKNOWN — the provider read did not establish whether outstanding scheduled changes exist that this change would disturb; uncertainty is not clearance" },
+    { id: "scheduled_advance_invoices", unmet: "scheduled-advance-invoice status is UNKNOWN — the provider read did not establish whether scheduled advance invoices are outstanding; uncertainty is not clearance" },
+    { id: "request_matches_proposal", unmet: "request coherence is not established — the exact request was not validated against an independent provider baseline (the request_matches_proposal check is unresolved/UNKNOWN)" },
+  ];
+  for (const gate of COND3_UNKNOWN_GATES) {
+    const c = checks.find((x) => x.id === gate.id);
+    if (c && c.status === "unknown") cond3Unmet.push(gate.unmet);
+  }
   if (report.refused) cond3Unmet.push("the run was refused before provider reads");
   if (blockers.length > 0) cond3Unmet.push(`${blockers.length} blocker(s) stand (see checks)`);
   const cond3Status: ReadinessCondition["status"] = cond3Unmet.length === 0 ? "PASS" : blockers.length > 0 ? "BLOCKED" : "UNVERIFIED";
@@ -1021,7 +1090,7 @@ export async function runPreflight(input: PreflightInput): Promise<PreflightRepo
       status: cond3Status,
       evidence: provenance === "real" ? "this report, produced over the internally constructed guarded real-network transport" : "this report was produced over a caller-supplied (injected) transport",
       reason: cond3Unmet.length === 0
-        ? "the exact commit was preflighted against the real tenant: structural real-network provenance, test-tenant attestation supplied, quote-origin binding established, provider identity verified, no blockers"
+        ? "the exact commit was preflighted against the real tenant: structural real-network provenance, test-tenant attestation supplied, quote-origin binding established, provider identity verified, scheduled-change and scheduled-advance-invoice status established, request coherence validated, no blockers"
         : `Condition 3 is not met — ${cond3Unmet.join("; ")}`,
     },
     {
