@@ -374,10 +374,43 @@ type FinancialDimension = "immediateFinancialEffect" | "recurringFinancialEffect
      Agreement between two effects asserting the same NOT_APPLICABLE is not proof of
      applicability; a self-asserted citation without the proposal context validates
      nothing.
-- **UNKNOWN** — the dimension applies but its value could not be determined from the
-  provider's response or a justified computation. An UNKNOWN dimension MUST NOT be
-  represented by a number and MUST NOT be silently omitted where omission would be read
-  as NOT_APPLICABLE.
+- **UNKNOWN** — the dimension applies but its value could not be established from the
+  provider's response or a justified computation. An UNKNOWN dimension is not an
+  established value in any representation: on quote-side and revalidated effects, and
+  in any DETERMINED or NOT_APPLICABLE representation, an UNKNOWN dimension MUST NOT be
+  represented by a number. The single bounded exception is the committed-role
+  *candidate* defined below. An UNKNOWN dimension MUST NOT be silently omitted where
+  omission would be read as NOT_APPLICABLE.
+
+**Candidates (committed role only).** A numerical value recorded on a committed-role
+dimension whose determinacy is UNKNOWN is a **candidate**, not an established actual;
+the two terms are not interchangeable anywhere in this specification. A candidate MAY
+be recorded ONLY when ALL of the following hold: (a) the effect is the committed effect
+of a `COMMITTED_UNVERIFIED` receipt (§3.12); (b) the dimension's determinacy is UNKNOWN
+and the effect's provenance carries `committedSource: "unestablished"` (§3.11), with
+the dimension's provenance note disclosing the candidate's source; and (c) the receipt's
+reconciliation is UNVERIFIED, naming the dimension in `undeterminedDimensions`. The
+candidate's source is data already in hand at recording time, and is one of exactly
+two: the mutating call's own response, or — for cancellation constructions — the
+quote's post-cancellation level as recorded in the stored quote. No other source is
+permitted: in particular, a candidate is never derived from a further provider read
+performed after the mutation landed, and never copied from a pre-mutation estimate or
+preview as if it were a committed figure. A candidate is recorded deliberately, so
+that a later independent verification has the ORIGINAL figures to verify against: the
+candidate is part of the recorded receipt's canonical identity (§6.16) and MUST NOT be
+silently replaced, recomputed, or dropped before that verification. A candidate is NOT
+compliance evidence: no envelope assessment (§6.13) and no reconciliation (§6.14) may
+treat it as DETERMINED or established, and it can never by itself produce
+reconciliation OK or a verified transition. What establishes the dimension later is
+the §6.15 upgrade procedure — independent post-commit evidence whose committed figures
+must EQUAL the recorded candidate amounts; evidence about different figures is refused
+as a conflicting receipt identity, and the recorded receipt is never rewritten.
+Consumers MUST NOT present a candidate as a verified, reconciled, or charged amount.
+Outside this carve-out the rule remains categorical, and §6.13 enforcement is
+unchanged: a number under UNKNOWN determinacy on a quote-side or revalidated effect
+establishes nothing and rescues nothing — the fail-closed gate refuses on the
+dimension's state, not on its digits. Candidates are permitted, never required: an
+implementation MAY instead leave an unestablished committed dimension's figure absent.
 
 **Purity.** The three states are mutually exclusive and exhaustive for every financial
 dimension. No implicit conversion between states is permitted, in either direction, at any
@@ -431,6 +464,10 @@ type CommittedFigureSource =
 - `defined_equal_exact` establishes ONLY where the applicable EXACT contract justifies it:
   EXACT mode, with the dimension's determinacy established. An EXACT-shaped assertion
   without establishing evidence does not verify.
+- `unestablished` is the committed-role source of every dimension that could not be
+  established. Where such a dimension carries a number on a COMMITTED_UNVERIFIED
+  receipt, that number is a **candidate** under §3.10's carve-out — recorded, labeled,
+  and identity-bearing, but establishing nothing.
 - **A provenance label is not authentication.** A `committedSource` value is an
   adapter-recorded classification; neither the core nor the store treats the string itself
   as proof that a provider event occurred. Adapters remain responsible for binding figures
@@ -492,10 +529,15 @@ type MutationOutcome =
   original indeterminate record stays in the audit trail.
 - **COMMITTED_UNVERIFIED** — the landing is established (by operation-bound evidence,
   §6.15), but at least one financial dimension or the state verification could not be
-  established. The receipt's committed effect contains only established figures;
-  unestablished dimensions are absent, read UNKNOWN, and named in the reconciliation's
+  established. The receipt's committed effect records, per dimension: the established
+  actual, where one was established (a dimension can be fully established while the
+  receipt is unverified for another dimension, or for attribution/state reasons); a
+  labeled **candidate**, where the implementation recorded one under §3.10's carve-out
+  (UNKNOWN determinacy, `committedSource: "unestablished"`, source disclosed in the
+  dimension's provenance note); and no figure, where neither exists. Every
+  unestablished dimension reads UNKNOWN and is named in the reconciliation's
   `undeterminedDimensions`. Such a receipt MUST NOT be reported as, or aggregated with,
-  OK.
+  OK, and a candidate on it MUST NOT be presented as a verified or charged amount.
 - **COMMITTED_AND_VERIFIED** — the landing is established, the intended state is verified
   (§6.12), and the committed actuals reconcile OK or VIOLATED over established figures
   (a verified-with-violation commit is COMMITTED_AND_VERIFIED with reconciliation
@@ -853,7 +895,9 @@ landed, so an unenforceable dimension is reported, not refused. The verdict is:
    of estimate or unestablished provenance, an unjustified NOT_APPLICABLE, or a
    NOT_APPLICABLE over a present field). Compliance was not proven, so OK is not
    available; an UNKNOWN committed dimension cannot produce OK by absence, by numeric
-   coincidence, or by sharing the quote's number.
+   coincidence, or by sharing the quote's number. This includes a dimension carrying a
+   §3.10 candidate: the candidate is recorded *because* the dimension is unestablished,
+   and its presence beside the UNKNOWN label changes nothing.
 3. **OK** — every dimension is established and within the envelope, or legitimately
    skipped as justified NOT_APPLICABLE on both sides.
 
@@ -863,7 +907,8 @@ ONLY when the committed figures the receipt reports are themselves established a
 (every dimension DETERMINED through an establishing source, or justified
 NOT_APPLICABLE). If any committed dimension is unestablished, the result is UNVERIFIED:
 an unknown financial outcome must not masquerade as verified actuals merely because no
-envelope was stated.
+envelope was stated. A dimension carrying only a §3.10 candidate is unestablished for
+this purpose.
 
 **Legacy receipts.** Historical receipts recorded under v0.6.1 remain valid historical
 records with their original identities. They MUST NOT be re-reconciled under v0.6.2 and
@@ -919,7 +964,10 @@ evidence into verified financial actuals (§6.16).
     recorded receipt);
   - requires the evidence's committed figures to equal the amounts RECORDED on the
     receipt at commit time (a VIOLATED outcome is expressed through reconciliation,
-    never by substituting different figures);
+    never by substituting different figures) — where the recorded amount is a §3.10
+    candidate, this equality is the comparison the candidate exists for: the
+    independent evidence must confirm the candidate's figures exactly, and a candidate
+    that independent evidence contradicts can never be upgraded on this record;
   - refuses transitions whose recomputed reconciliation is UNVERIFIED, and refuses
     non-VERIFIED state results.
   A successful transition ends in exactly one of two terminal shapes, both with outcome
@@ -1126,6 +1174,7 @@ carries their full entries, severities, and recommended resolutions.
 | (new) | NEW §3.10: three-state determinacy, purity, N/A licensing (field absence + single-action context + citation; recurring never N/A; multi-change unlicensable), legacy UNKNOWN reading, finding order, snapshot determinacy. |
 | (new) | NEW §3.11: committed-figure provenance sources; only provider_actual / defined_equal_exact establish; label ≠ authentication (OPEN DECISION G-01). |
 | (new) | NEW §3.12: four-class mutation-outcome taxonomy with retry rules — including the confirmed-non-execution re-dispatch doctrine (one same-quote, same-key re-dispatch per CONFIRMED_NON_EXECUTION settlement, §6.16 gates; SPEC2 correction — an earlier draft of this candidate said "as a new quote", contradicting the merged ledger; doctrine is OPEN DECISION G-13/U-13). |
+| (new) | §3.10/§3.12 candidate clarification (SPEC3 correction): an UNKNOWN committed dimension on a COMMITTED_UNVERIFIED receipt MAY carry a labeled, non-establishing **candidate** (source disclosed; `committedSource: "unestablished"`; part of the recorded receipt's identity; established later only by §6.15 evidence equal to the recorded candidate). An earlier draft of this candidate stated the no-number rule categorically for UNKNOWN and required committed effects to contain only established figures — wording that declared the merged adapters' deliberate candidate construction (PR #10/#11 doctrine, present in all five adapters) nonconforming. The categorical rule is unchanged for quote/revalidated roles and for §6.13 enforcement. |
 | (new) | NEW §3.13/§6.12: provider-neutral post-commit state-verification contract (verdicts, coverage, multiset tuples, partial/malformed handling, scheduled-cancel timing incl. premature-termination and SV6 classification, constant-false boundary fields). |
 | §4.1 EXACT scope | Unchanged; v0.6.2 note ties EXACT establishment to §3.11. |
 | §4.2 REVALIDATE | Clarifications preserved; NEW fail-closed determinacy paragraph (§6.13 summary). |
@@ -1168,7 +1217,14 @@ equality is NOT a criterion and committed-side provenance/evidence metadata may 
 where §3.11 requires, must — differ · **V62-EVD-02** preview/estimate sources never establish ·
 **V62-EVD-03** precedence: established VIOLATED > UNVERIFIED > OK · **V62-EVD-04**
 no-envelope OK only over established actuals · **V62-EVD-05** legacy receipts never
-re-reconciled to OK · **V62-EVD-06** provenance label is not authentication.
+re-reconciled to OK · **V62-EVD-06** provenance label is not authentication ·
+**V62-EVD-08** candidate rule (§3.10/§3.12): an UNKNOWN committed dimension on a
+COMMITTED_UNVERIFIED receipt MAY carry a labeled candidate (source disclosed in
+provenance, `committedSource: "unestablished"`, reconciliation UNVERIFIED); the
+candidate is part of the recorded receipt's identity, is never compliance evidence,
+never produces OK or a verified transition by itself, and is established later only by
+§6.15 evidence whose figures equal the recorded candidate; on quote/revalidated roles
+an UNKNOWN dimension carries no number, and fail-closed enforcement is unchanged.
 
 Outcomes & recovery (§3.12/§6.15): **V62-OUT-01** four-class taxonomy; receipts only for
 COMMITTED_* · **V62-OUT-02** CONFIRMED_NON_EXECUTION only for never-dispatched or
