@@ -10,7 +10,8 @@
     "demo": "npm run build && node dist/demo/seat-expansion.js",
     "demo:commit": "npm run build && node dist/demo/seat-expansion.js --simulate-approved-commit",
     "smoke:pack": "npm run build && node scripts/smoke-pack.mjs",
-    "pilot:chargebee": "npm run build && node dist/src/live/pilot/run-pilot.js"
+    "pilot:chargebee": "npm run build && node dist/src/live/pilot/run-pilot.js",
+    "preflight:chargebee": "npm run build && node dist/src/live/pilot/run-preflight.js"
   },
   "devDependencies": {
     "@types/better-sqlite3": "^9.6.0",

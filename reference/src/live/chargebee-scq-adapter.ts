@@ -359,7 +359,7 @@ type LivePreviewInput = {
   idempotencyKey: string;
 };
 
-type CbSubscription = {
+export type CbSubscription = {
   id: string;
   status: string;
   currency_code?: string;
@@ -372,7 +372,14 @@ type CbSubscription = {
   subscription_items?: Array<{ item_price_id: string; quantity: number; unit_price?: number; amount?: number; free_quantity?: number }>;
 };
 
-function fingerprintOf(sub: CbSubscription): string {
+/**
+ * The subscription fingerprint the adapter stores on every quote
+ * (`subscription_version_at_quote`) and re-checks at commit time.
+ * Exported unchanged (PR-11) so the read-only exact-commit preflight
+ * compares provider state with the SAME function the commit path
+ * uses — a preflight must never invent its own staleness rule.
+ */
+export function chargebeeSubscriptionFingerprint(sub: CbSubscription): string {
   if (typeof sub.resource_version === "number") return `rv:${sub.resource_version}`;
   const material = JSON.stringify({
     status: sub.status,
@@ -419,7 +426,7 @@ function snapshotFrom(sub: CbSubscription): SubscriptionSnapshot {
   const recurringAmount = "amount" in strict ? strict.amount : undefined;
   return {
     id: sub.id,
-    version: fingerprintOf(sub),
+    version: chargebeeSubscriptionFingerprint(sub),
     status: sub.status === "cancelled" ? "canceled" : sub.status,
     // For the live API, the stable per-item identifier available in every
     // payload is item_price_id; SCQ itemId in this adapter IS the
@@ -757,7 +764,7 @@ export function interpretChargebeeEstimate(
  * `committedSource` is set only for commit-side roles (the
  * revalidated gate effect); quote-side effects assert none.
  */
-function withDeterminacy(
+export function chargebeeEffectWithDeterminacy(
   interpreted: InterpretedEstimate,
   opts: { committedSource?: CommittedFigureSource } = {},
 ): CommercialEffect {
@@ -855,6 +862,38 @@ export type ChargebeeLiveAdapterOptions = {
   providerSite?: string;
 };
 
+/**
+ * THE request builder for update_for_items — the single source of
+ * truth for the parameters both the live commit path and the PR-11
+ * read-only exact-commit preflight derive from. Extracted verbatim
+ * from the adapter (zero behavior change) so a preflight can show the
+ * COMPLETE request a future commit would issue without re-implementing
+ * it and risking divergence.
+ */
+export function buildChargebeeUpdateParams(items: Array<{ itemPriceId: string; quantity: number }>): Record<string, unknown> {
+  return {
+    subscription_items: items.map((i) => ({ item_price_id: i.itemPriceId, quantity: i.quantity })),
+    // Full-list replacement semantics are REQUIRED for the SCQ intent
+    // ("the item list becomes exactly this") — Chargebee's documented
+    // default (false) is additive and would silently retain addons.
+    // Documented caveat (Phase 2A re-verified on the update page):
+    // with a plan in the list, replace_items_list=true replaces the
+    // ENTIRE list; with an addons-only list the plan is always
+    // retained and mandatory addons survive replacement unless named
+    // in `mandatory_items_to_remove`. This adapter sends no
+    // mandatory_items_to_remove and targets plan-inclusive lists, so
+    // it does NOT claim the resulting item set is exact for
+    // subscriptions carrying mandatory addons auto-attached to the
+    // target plan — post-commit reconciliation reads the ACTUAL
+    // state rather than assuming the sent list is the final list.
+    replace_items_list: true,
+    prorate: true,
+    // No default invoice collection: charges land as unbilled charges.
+    invoice_immediately: false,
+    change_option: "immediately",
+  };
+}
+
 export class ChargebeeLiveAdapter implements SubscriptionProvider {
   private now: () => Date;
   constructor(
@@ -916,27 +955,7 @@ export class ChargebeeLiveAdapter implements SubscriptionProvider {
   }
 
   private updateParams(items: Array<{ itemPriceId: string; quantity: number }>): Record<string, unknown> {
-    return {
-      subscription_items: items.map((i) => ({ item_price_id: i.itemPriceId, quantity: i.quantity })),
-      // Full-list replacement semantics are REQUIRED for the SCQ intent
-      // ("the item list becomes exactly this") — Chargebee's documented
-      // default (false) is additive and would silently retain addons.
-      // Documented caveat (Phase 2A re-verified on the update page):
-      // with a plan in the list, replace_items_list=true replaces the
-      // ENTIRE list; with an addons-only list the plan is always
-      // retained and mandatory addons survive replacement unless named
-      // in `mandatory_items_to_remove`. This adapter sends no
-      // mandatory_items_to_remove and targets plan-inclusive lists, so
-      // it does NOT claim the resulting item set is exact for
-      // subscriptions carrying mandatory addons auto-attached to the
-      // target plan — post-commit reconciliation reads the ACTUAL
-      // state rather than assuming the sent list is the final list.
-      replace_items_list: true,
-      prorate: true,
-      // No default invoice collection: charges land as unbilled charges.
-      invoice_immediately: false,
-      change_option: "immediately",
-    };
+    return buildChargebeeUpdateParams(items);
   }
 
   async createChangeQuote(subscriptionId: string, proposal: SubscriptionChangeProposal): Promise<SubscriptionChangeQuote> {
@@ -999,7 +1018,7 @@ export class ChargebeeLiveAdapter implements SubscriptionProvider {
     const interpreted = interpretChargebeeEstimate(estimate, { currency, currentItems: this.itemStatesOf(sub), targetItems, priceInfo });
     // v0.6.2 (PR-7): the quoted effect carries the three-state
     // determinacy record and field-level provenance (CORE-1/CORE-2).
-    const commercialEffect = withDeterminacy(interpreted);
+    const commercialEffect = chargebeeEffectWithDeterminacy(interpreted);
     commercialEffect.effectiveAt = this.now().toISOString();
     // FAIL CLOSED: the REVALIDATE acceptance envelope (mandatory for
     // these actions) is enforced by comparing immediate.net and
@@ -1025,7 +1044,7 @@ export class ChargebeeLiveAdapter implements SubscriptionProvider {
       quote_id: quoteId,
       provider: "chargebee",
       subscription_id: subscriptionId,
-      subscription_version_at_quote: fingerprintOf(sub),
+      subscription_version_at_quote: chargebeeSubscriptionFingerprint(sub),
       proposal,
       effective_guarantee_mode: effectiveMode,
       guarantee_coverage: { ...COVERAGE },
@@ -1040,7 +1059,7 @@ export class ChargebeeLiveAdapter implements SubscriptionProvider {
     return {
       id: quoteId,
       subscriptionRef: subscriptionId,
-      preconditions: { subscriptionVersion: fingerprintOf(sub) },
+      preconditions: { subscriptionVersion: chargebeeSubscriptionFingerprint(sub) },
       proposal,
       guaranteeMode: effectiveMode,
       guaranteeCoverage: { ...COVERAGE },
@@ -1099,9 +1118,9 @@ export class ChargebeeLiveAdapter implements SubscriptionProvider {
 
     const input = stored0.provider_preview_input as LivePreviewInput;
     const current = await this.readSubscription(stored0.subscription_id);
-    const validated = validateCommit(this.store, quoteId, fingerprintOf(current), this.now);
+    const validated = validateCommit(this.store, quoteId, chargebeeSubscriptionFingerprint(current), this.now);
     const proposal = validated.proposal;
-    const preDispatchFingerprint = fingerprintOf(current);
+    const preDispatchFingerprint = chargebeeSubscriptionFingerprint(current);
 
     // Final pre-mutation preview (REVALIDATE): envelope is enforced
     // against THIS preview, before mutation (spec §4.2 clarification 1).
@@ -1113,7 +1132,7 @@ export class ChargebeeLiveAdapter implements SubscriptionProvider {
     if (!freshEstimate) throw new SCQError("PROVIDER_ERROR", "Chargebee revalidation estimate returned no estimate object");
     const currency = current.currency_code ?? "USD";
     const priceInfo = await this.fetchPriceInfo(input.items.map((i) => i.itemPriceId));
-    const revalidated = withDeterminacy(
+    const revalidated = chargebeeEffectWithDeterminacy(
       interpretChargebeeEstimate(freshEstimate, { currency, currentItems: this.itemStatesOf(current), targetItems: input.items, priceInfo }),
       { committedSource: "revalidated_preview" },
     );
@@ -1356,7 +1375,7 @@ export class ChargebeeLiveAdapter implements SubscriptionProvider {
         input.items,
         "chargebee-live adapter: post-dispatch state re-read after an unestablishable dispatch (GET /subscriptions/{id})",
       ).verdict === "VERIFIED";
-    const fingerprintMoved = after !== undefined && fingerprintOf(after) !== preDispatchFingerprint;
+    const fingerprintMoved = after !== undefined && chargebeeSubscriptionFingerprint(after) !== preDispatchFingerprint;
     this.store.recordCommitOutcome(quoteId, {
       outcome: "INDETERMINATE",
       at: this.now().toISOString(),
@@ -1532,8 +1551,8 @@ export class ChargebeeLiveAdapter implements SubscriptionProvider {
       "chargebee-live adapter: independent post-commit subscription re-read (GET /subscriptions/{id})",
     );
     const mismatches = stateVerification.contradictions;
-    const afterFingerprint = fingerprintOf(after);
-    const respFingerprint = respSub ? fingerprintOf(respSub) : undefined;
+    const afterFingerprint = chargebeeSubscriptionFingerprint(after);
+    const respFingerprint = respSub ? chargebeeSubscriptionFingerprint(respSub) : undefined;
     const bracketClosed = respFingerprint !== undefined && respFingerprint === afterFingerprint;
     const strictRecurring = strictRecurringFromItems(after.subscription_items);
     const recurringAmount = "amount" in strictRecurring ? strictRecurring.amount : undefined;
