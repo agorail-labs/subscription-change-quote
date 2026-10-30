@@ -66,7 +66,13 @@
  *     lookup would miss — and an unidentifiable entry anywhere
  *     in the collection blocks a VERIFIED for the targeted item,
  *     because a contradictory duplicate of it cannot be ruled
- *     out.
+ *     out. A PARTIAL collection blocks a VERIFIED for the same
+ *     reason (SV7): a present, agreeing target cannot be
+ *     verified while the unreturned portion could contain a
+ *     conflicting duplicate — the full-item-set path likewise
+ *     never establishes VERIFIED from a partial collection.
+ *     Established contradictions from present entries keep
+ *     precedence in both cases.
  *   - Precedence: any established contradiction => MISMATCH (a
  *     determined negative verification never collapses into
  *     UNVERIFIABLE); else any unverifiable required check =>
@@ -79,15 +85,24 @@
  *     scheduled cancellation is not an immediate termination).
  *     For TERM_END / DATE intents, verification requires
  *     independently established schedule evidence
- *     (`cancellationSchedule`) whose KIND or INSTANT aligns with
- *     the authorized intent: TERM_END verifies from provider
- *     schedule-kind evidence, or from an established instant equal
- *     to the authorized term boundary carried on the EXPECTATION
- *     side (`termBoundaryAt` — never a boundary read out of the
- *     observed snapshot, which would be the state proving itself);
- *     a schedule whose kind and instant cannot be aligned is
- *     UNVERIFIABLE, and an established instant contradicting the
- *     authorized boundary/date is MISMATCH. For a terminal DATE /
+ *     (`cancellationSchedule`) that aligns with the authorized
+ *     intent: TERM_END verifies from provider schedule-kind
+ *     evidence, or from an established instant equal to the
+ *     authorized term boundary carried on the EXPECTATION side
+ *     (`termBoundaryAt` — never a boundary read out of the
+ *     observed snapshot, which would be the state proving itself).
+ *     A DATE intent verifies ONLY from an established instant
+ *     equal to the intended date with no contradictory schedule
+ *     kind (SV6): DATE kind evidence alone establishes the
+ *     schedule type, not when the termination took effect, so
+ *     kind-only DATE evidence is UNVERIFIABLE; and an equal
+ *     instant paired with a kind contradicting the intent is
+ *     UNVERIFIABLE — the provider evidence is then inconsistent
+ *     about which schedule the termination belongs to, an
+ *     ambiguity, not an established contradiction of the
+ *     effective time. A schedule whose kind and instant cannot
+ *     be aligned is UNVERIFIABLE, and an established instant
+ *     contradicting the authorized boundary/date is MISMATCH. For a terminal DATE /
  *     TERM_END state, the READ TIME is tested first (SV4): a
  *     subscription already terminal when read before the
  *     authorized instant is a premature termination (MISMATCH)
@@ -526,6 +541,15 @@ function absenceNotEstablishedDetail(itemId: string, observation: PostCommitStat
   return `item ${itemId} is absent from the observed item collection, but ${reasons.join(" and ")} — its absence is not established`;
 }
 
+/** Why a present, agreeing target still cannot be VERIFIED from a partial return (SV7): the unreturned portion could contain a conflicting duplicate entry for the item. */
+function partialCollectionDetail(itemId: string, dimension: "quantity" | "offering", intended: string | number): string {
+  return (
+    `the observed entries for item ${itemId} agree with the intended ${dimension} ${intended}, but the item collection is a partial return ` +
+    `(itemsComplete: false) — the unreturned portion could contain a conflicting entry for the item, so the resulting ${dimension} ` +
+    `cannot be verified from a partial collection`
+  );
+}
+
 /** Why a present, agreeing target still cannot be VERIFIED (SV5): an unidentifiable entry could be a contradictory duplicate of it. */
 function unidentifiableDuplicateDetail(itemId: string, unidentifiable: number): string {
   return (
@@ -575,6 +599,15 @@ function checkChange(
         col.add(name, dimension, "UNVERIFIABLE", `an observed entry for item ${change.itemId} carries no quantity; not every entry for the item can be verified`);
         return;
       }
+      if (observation.itemsComplete === false) {
+        // SV7: agreement among the RETURNED entries does not
+        // verify the target — the unreturned portion of a
+        // partial collection could contain a conflicting entry
+        // for it. The established contradiction above (a
+        // disagreeing returned entry) keeps precedence.
+        col.add(name, dimension, "UNVERIFIABLE", partialCollectionDetail(change.itemId, "quantity", change.quantity));
+        return;
+      }
       if (unidentifiable > 0) {
         col.add(name, dimension, "UNVERIFIABLE", unidentifiableDuplicateDetail(change.itemId, unidentifiable));
         return;
@@ -604,6 +637,12 @@ function checkChange(
       const disagreeing = targets.find((candidate) => candidate.offeringRef !== change.offeringRef);
       if (disagreeing) {
         col.add(name, dimension, "CONTRADICTED", `offering mismatch for item ${change.itemId}: intended ${change.offeringRef}, actual ${disagreeing.offeringRef}`);
+        return;
+      }
+      if (observation.itemsComplete === false) {
+        // SV7: as for CHANGE_QUANTITY — a partial return cannot
+        // verify a present, agreeing target.
+        col.add(name, dimension, "UNVERIFIABLE", partialCollectionDetail(change.itemId, "offering", change.offeringRef));
         return;
       }
       if (unidentifiable > 0) {
@@ -699,18 +738,24 @@ function checkChange(
           );
           return;
         }
-        // Next (SV2): an established cancellation instant
-        // overrides kind evidence, exactly as on the
-        // not-yet-effective path. Provider schedule-kind
-        // evidence matching the intent kind is the provider's
-        // own attestation that the termination is the scheduled
-        // one, and verifies only when no established instant
-        // contradicts it.
+        // Next (SV2, tightened by SV6): an established
+        // cancellation instant is compared against the
+        // authorized one. An equal instant verifies ONLY when
+        // the schedule kind does not contradict the intent: a
+        // matching instant paired with a contradictory kind
+        // leaves the provider evidence inconsistent about WHICH
+        // schedule the termination belongs to. The effective
+        // time is not contradicted, but the termination is not
+        // established as the authorized one either — ambiguity,
+        // so the conservative verdict is UNVERIFIABLE, not
+        // VERIFIED and not MISMATCH. (The not-yet-effective
+        // path below classifies a wrong-kind schedule as
+        // CONTRADICTED: there the schedule itself is the
+        // evidence under verification and is affirmatively of
+        // the wrong kind. Here a termination has already
+        // occurred and only its attribution to the authorized
+        // schedule is in doubt.)
         const cmp = compareInstants(effectiveAt, authorizedAt);
-        if (cmp === "equal") {
-          col.add(name, DIM_CANCELLATION, "VERIFIED", `the subscription is in the terminal state "${status}" and the established cancellation instant ${effectiveAt} matches the authorized instant`);
-          return;
-        }
         if (cmp === "earlier") {
           col.add(name, DIM_CANCELLATION, "CONTRADICTED", prematureDetail(effectiveAt as string, authorizedAt as string));
           return;
@@ -719,12 +764,47 @@ function checkChange(
           col.add(name, DIM_CANCELLATION, "CONTRADICTED", `the subscription was cancelled effective ${effectiveAt}, after the authorized instant ${authorizedAt} — not the authorized cancellation`);
           return;
         }
-        if (kind === intent.type) {
+        if (cmp === "equal") {
+          if (kind !== undefined && kind !== intent.type) {
+            col.add(
+              name,
+              DIM_CANCELLATION,
+              "UNVERIFIABLE",
+              `the established cancellation instant ${effectiveAt} matches the authorized instant ${authorizedAt}, but the established schedule kind is ${kind}, not the intended ${intent.type} schedule — the provider evidence is inconsistent about which schedule the termination belongs to, so the termination is not established as the authorized ${intent.type} cancellation`
+            );
+            return;
+          }
+          col.add(name, DIM_CANCELLATION, "VERIFIED", `the subscription is in the terminal state "${status}" and the established cancellation instant ${effectiveAt} matches the authorized instant`);
+          return;
+        }
+        // No established instant can be aligned with the
+        // authorized one. What remains is schedule-kind
+        // evidence, whose force differs by intent (SV6): for
+        // TERM_END, provider kind evidence is the provider's own
+        // attestation that the termination is the term-end one,
+        // and it verifies. For DATE, kind evidence establishes
+        // only the schedule TYPE — not when the termination took
+        // effect — and a DATE cancellation is verified only by
+        // an established instant equal to the intended date;
+        // kind alone is UNVERIFIABLE. (It is a MISMATCH only
+        // when prematurity is positively established: by the
+        // SV4 read-time test above, or by an earlier established
+        // instant.)
+        if (intent.type === "TERM_END" && kind === "TERM_END") {
           col.add(
             name,
             DIM_CANCELLATION,
             "VERIFIED",
-            `the subscription is in the terminal state "${status}" and the established cancellation evidence carries the ${intent.type} schedule kind — the scheduled cancellation took effect`
+            `the subscription is in the terminal state "${status}" and the established cancellation evidence carries the TERM_END schedule kind — the scheduled cancellation took effect`
+          );
+          return;
+        }
+        if (intent.type === "DATE" && kind === "DATE") {
+          col.add(
+            name,
+            DIM_CANCELLATION,
+            "UNVERIFIABLE",
+            `the subscription is in the terminal state "${status}" and the established cancellation evidence carries the DATE schedule kind, but no established cancellation instant — the kind establishes the schedule type, not when the termination took effect; a DATE cancellation is verified only by an established instant equal to the intended date${authorizedAt ? ` ${authorizedAt}` : ""}`
           );
           return;
         }

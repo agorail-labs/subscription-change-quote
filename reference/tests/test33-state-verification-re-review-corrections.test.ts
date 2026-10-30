@@ -189,12 +189,33 @@ test("Test 33.7 (SV4): absent or unparseable observedAt — prematurity is NOT i
   assert.equal(absent.verdict, "VERIFIED", "absent observedAt: no read-time prematurity is invented");
 
   // An unparseable read time is not evidence of prematurity
-  // either; provider kind evidence decides as before.
+  // either.
+  //
+  // SV6 CORRECTION (PR #18 final review round, head a79cb91):
+  // this sub-case previously asserted VERIFIED here, on the
+  // reasoning that "kind evidence decides" — that pinned
+  // exactly the overclaim SV6 removes. Schedule KIND evidence
+  // establishes the schedule TYPE, not when the termination
+  // took effect; with no established cancellation instant, a
+  // terminal DATE state cannot be verified as the authorized
+  // DATE cancellation (the termination could predate the
+  // intended date). The assertion is therefore corrected to
+  // UNVERIFIABLE. This is a disclosed pre-existing test
+  // modification: the fixture is unchanged, the expected
+  // verdict changes because the behavior it pinned was the
+  // defect under correction. The SV4 point of this test —
+  // an unparseable read time invents no prematurity (no
+  // MISMATCH) — is preserved and is now the assertion's focus.
   const unparseable = verify(
     { proposal: cancelProposal({ type: "DATE", at: AUTHORIZED }) },
     observeAt(snap([], { status: "cancelled" }), "not-a-timestamp", { cancellationSchedule: { kind: "DATE" } })
   );
-  assert.equal(unparseable.verdict, "VERIFIED", "unparseable observedAt: kind evidence decides; nothing is invented");
+  assert.equal(
+    unparseable.verdict,
+    "UNVERIFIABLE",
+    "unparseable observedAt: no prematurity is invented, and kind-only DATE evidence establishes no effective instant (SV6)"
+  );
+  assert.deepEqual(unparseable.contradictions, []);
 
   // Absent read time AND no schedule evidence at all: the bare
   // terminal state stays UNVERIFIABLE, as before.

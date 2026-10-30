@@ -377,14 +377,14 @@ detected at this coverage.
 
 | Action | Verified when | MISMATCH when | UNVERIFIABLE when |
 |---|---|---|---|
-| CHANGE_QUANTITY (action-level) | every identified entry for the targeted item present at the intended quantity, and no unidentifiable entries in the collection | item absent from a complete, fully identified collection; any identified entry at a different quantity (including a disagreeing duplicate entry for the target) | items omitted; target absent from a partial collection or one containing unidentifiable entries (absence not established, SV5); an entry for the target carrying no quantity; unidentifiable entries beside an agreeing target (a contradictory duplicate cannot be ruled out) |
+| CHANGE_QUANTITY (action-level) | every identified entry for the targeted item present at the intended quantity, no unidentifiable entries in the collection, and the collection complete (not a partial return) | item absent from a complete, fully identified collection; any identified entry at a different quantity (including a disagreeing duplicate entry for the target) | items omitted; target absent from a partial collection or one containing unidentifiable entries (absence not established, SV5); an entry for the target carrying no quantity; unidentifiable entries beside an agreeing target (a contradictory duplicate cannot be ruled out); a present, agreeing target in a partial collection (the unreturned portion could contain a conflicting duplicate, SV7) |
 | CHANGE_QUANTITY (full-set) | the complete resulting multiset equals the expected set (incl. the target at its intended quantity) | any multiset contradiction (missing / extra / duplicate / wrong quantity) | collection omitted or partial-without-contradiction; an entry unidentifiable |
-| CHANGE_PLAN (action-level) | every identified entry for the targeted item carrying the intended offering, and no unidentifiable entries in the collection | item absent from a complete, fully identified collection; any identified entry carrying a different offering (including a disagreeing duplicate) | items omitted; target absent from a partial collection or one containing unidentifiable entries (absence not established, SV5); unidentifiable entries beside an agreeing target |
+| CHANGE_PLAN (action-level) | every identified entry for the targeted item carrying the intended offering, no unidentifiable entries in the collection, and the collection complete (not a partial return) | item absent from a complete, fully identified collection; any identified entry carrying a different offering (including a disagreeing duplicate) | items omitted; target absent from a partial collection or one containing unidentifiable entries (absence not established, SV5); unidentifiable entries beside an agreeing target; a present, agreeing target in a partial collection (SV7) |
 | CHANGE_PLAN (full-set) | resulting multiset matches incl. the expected offering for the item | offering differs; any multiset contradiction | as above |
 | CHANGE_CADENCE | observed `billing.cadence` equals the intended cadence | cadence present and differs | cadence absent/empty |
 | CANCEL, IMMEDIATE intent | status terminal (cancelled/canceled/terminated) | status non-terminal — **including** an active subscription carrying a TERM_END schedule: a scheduled cancellation is not an immediate termination | status absent |
-| CANCEL, TERM_END intent | status non-terminal with independently established schedule evidence that **aligns**: provider schedule-kind evidence (`cancellationSchedule.kind: "TERM_END"`), or an established instant equal to the authorized term boundary carried on the expectation (`termBoundaryAt`); status terminal with kind evidence, or with an established cancellation instant equal to the boundary — and not read before the boundary | a terminal state read **before** the authorized boundary — premature by the read time itself, taking precedence over schedule-kind evidence and any stated schedule instant (SV4); an established instant (or a terminal state's established instant) **before** the authorized boundary — a premature termination; an established schedule of a different kind; an established instant after the boundary | a schedule whose kind and instant cannot be aligned (no kind evidence, no supplied boundary, or an unalignable instant); a terminal state with no established instant and no kind evidence — premature-vs-compliant is indistinguishable |
-| CANCEL, DATE intent | status non-terminal with an established schedule whose instant equals the intended date; status terminal with an established cancellation instant equal to the intended date, or DATE kind evidence with no contradicting instant and not read before the intended date | an established instant different from the intended date; a terminal state read **before** the intended date (premature — established by the read time itself), including when the schedule claims that very date or carries DATE kind evidence (SV4); an established schedule of a different kind | a terminal state at/after the intended date with no established cancellation instant — premature-vs-compliant is indistinguishable; a schedule with no/unalignable date; no schedule evidence at all |
+| CANCEL, TERM_END intent | status non-terminal with independently established schedule evidence that **aligns**: provider schedule-kind evidence (`cancellationSchedule.kind: "TERM_END"`), or an established instant equal to the authorized term boundary carried on the expectation (`termBoundaryAt`); status terminal with kind evidence, or with an established cancellation instant equal to the boundary and no contradictory schedule kind — and not read before the boundary | a terminal state read **before** the authorized boundary — premature by the read time itself, taking precedence over schedule-kind evidence and any stated schedule instant (SV4); an established instant (or a terminal state's established instant) **before** the authorized boundary — a premature termination; an established schedule of a different kind; an established instant after the boundary | a schedule whose kind and instant cannot be aligned (no kind evidence, no supplied boundary, or an unalignable instant); an established instant equal to the boundary paired with a contradictory schedule kind (ambiguity, SV6); a terminal state with no established instant and no kind evidence — premature-vs-compliant is indistinguishable |
+| CANCEL, DATE intent | status non-terminal with an established schedule whose instant equals the intended date; status terminal with an established cancellation instant equal to the intended date **and no contradictory schedule kind** — kind evidence alone never verifies a terminal DATE cancellation (SV6) | an established instant different from the intended date; a terminal state read **before** the intended date (premature — established by the read time itself), including when the schedule claims that very date or carries DATE kind evidence (SV4); an established schedule of a different kind (non-terminal path) | a terminal state at/after the intended date with no established cancellation instant — premature-vs-compliant is indistinguishable; DATE kind evidence with no established instant (the kind establishes the schedule type, not when the termination took effect, SV6); an established instant equal to the date paired with a contradictory schedule kind (the evidence is inconsistent about which schedule the termination belongs to — ambiguity, SV6); a schedule with no/unalignable date; no schedule evidence at all |
 
 Notes on the CANCEL rows (**revised by the SV2 review
 correction**): "terminal now" is not "cancelled at the authorized
@@ -420,9 +420,21 @@ VERIFIED ignored further entries for the same target: every
 identified entry for the target must now agree, and an
 unidentifiable entry anywhere in the collection blocks a
 VERIFIED for the targeted item, because a contradictory
-duplicate of it cannot be ruled out. This is the full-item-set
-discipline (§4) applied to the targeted item; §11 records the
-correction and the audit of the remaining action-level checks.
+duplicate of it cannot be ruled out. SV7 (§12) extends the
+same reasoning to partial returns: a present, *agreeing*
+target in a partial collection is likewise not VERIFIED,
+because the unreturned portion could contain a conflicting
+duplicate — SV5's unidentifiable-entry case and SV7's
+partial-return case are the same unexcluded duplicate in two
+guises. This is the full-item-set discipline (§4) applied to
+the targeted item; §11 records the SV5 correction and the
+audit of the remaining action-level checks, and §12 the SV7
+extension. The CANCEL rows are likewise tightened by SV6
+(§12): DATE *kind* evidence alone no longer verifies a
+terminal DATE cancellation — a kind establishes the schedule
+type, not when the termination took effect — and an equal
+established instant no longer verifies against a
+contradictory kind.
 
 ## 6. Integrations performed in PR-9
 
@@ -867,3 +879,150 @@ both correction rounds). The freeze guard still fails by
 design: `types.ts` is in its pathspec and the
 `protocol-change-approved` label remains withheld by the owner
 pending this review.
+
+## 12. Final review corrections SV6–SV7 (PR #18 final review round)
+
+The owner's final review of PR #18 at head `a79cb91` accepted
+SV1–SV5 and found two related false-verification paths
+remaining — both in `reference/src/core/state-verification.ts`,
+both the same discipline the earlier rounds applied elsewhere:
+a verdict must not claim more than the observation
+establishes. Corrections were worked failing-first: new suite
+`reference/tests/test34-state-verification-sv6-sv7.test.ts`
+(14 tests) was written against the unmodified `a79cb91` code
+and run before any fix: **9 failed, 5 passed** — the failures
+are the SV6 kind-only and kind-conflict counterexamples
+(returned VERIFIED) and the SV7 partial-collection matches
+(returned VERIFIED); the 5 passes are the controls (equal
+instant with matching or absent kind, the preserved TERM_END
+kind attestation, complete-collection matches, a partial
+present contradiction). The corrected test33.7 sub-case (see
+the disclosure below) also failed against `a79cb91`, as
+designed. After the fixes: **test34 14/14, test33 20/20,
+full suite 483/483** (469 + 14 new).
+
+**SV6 — a terminal DATE cancellation could still verify on
+schedule kind alone (SV2 follow-up, blocker).** In the
+terminal scheduled-CANCEL path, when
+`compareInstants(effectiveAt, authorizedAt)` yielded no
+comparison (no established instant, or an unalignable one),
+the code fell through to `kind === intent.type ⇒ VERIFIED` —
+for either intent. For TERM_END that fall-through is the
+accepted kind attestation (below). For a DATE intent it is
+not evidence of the effective date at all: intent DATE
+2026-11-15, status cancelled, read 2026-11-20, schedule
+`{kind: "DATE"}` with no `effectiveAt` returned VERIFIED,
+although the termination might have occurred on Nov 1 — the
+kind establishes the schedule TYPE, not when the termination
+took effect. The same path verified a DATE intent whose
+established instant EQUALLED the date but whose kind was
+`TERM_END`: the equal-instant branch ran before any kind
+examination. **Fix (§5, revised DATE row):** terminal DATE
+verification now requires (a) an independently established
+cancellation instant equal to the intended date AND (b) no
+contradictory provider schedule kind. Kind-only DATE evidence
+(no instant, or an unparseable one) computes UNVERIFIABLE;
+prematurity remains MISMATCH only where positively
+established (the SV4 early-terminal read, or an earlier
+established instant — both precede this logic and are
+unchanged). **Classification of the kind-conflict case,
+pinned:** equal instant + contradictory kind ⇒ UNVERIFIABLE,
+not MISMATCH. Reasoning: the established instant proves the
+*effective time* matches the authorized instant, so the
+outcome's timing is not contradicted; what the conflicting
+kind contradicts is the schedule's *identity* — which
+authorized schedule the termination belongs to. The two pieces
+of provider evidence cannot both be taken at face value and
+neither can be preferred without inventing a precedence, so
+the evidence is ambiguous, and ambiguity computes
+UNVERIFIABLE. This differs from the not-yet-effective path,
+where a wrong-kind schedule is CONTRADICTED: there no
+termination has occurred and the schedule itself is the
+evidence under verification, affirmatively of the wrong kind.
+The guard is applied symmetrically in the equal-instant
+branch (TERM_END intent + `kind: "DATE"` + instant equal to
+the boundary ⇒ UNVERIFIABLE, pinned in 34.5) — the same
+evidence inconsistency, and no prior pin exercised it.
+**TERM_END kind behavior is preserved where independently
+supported:** the terminal TERM_END kind attestation (32.16,
+33.6, re-pinned as control 34.9) and every non-terminal
+TERM_END kind/instant pin (31.16, 32.8, 32.9) hold unmodified.
+**Audit of DATE kind-only VERIFIED pins:** every DATE-intent
+VERIFIED assertion in test31/32/33 was examined. Exactly one
+pinned the removed behavior: test33.7's unparseable-`observedAt`
+sub-case (disclosed modification, below). Every other DATE
+VERIFIED pin carries an established instant equal to the date
+(32.13, 33.5, 33.7's first sub-case) or sits on the
+non-terminal schedule path, which already required an
+alignable instant and is untouched (31.16). Regressions:
+34.1–34.3 (kind-only DATE ⇒ UNVERIFIABLE: read after the
+date, no read time, unparseable read time), 34.4 (equal
+instant + contradictory kind ⇒ UNVERIFIABLE), 34.5 (the
+symmetric TERM_END case), 34.6 (unparseable established
+instant + DATE kind ⇒ UNVERIFIABLE), 34.7–34.9 (controls:
+equal instant with matching kind ⇒ VERIFIED; equal instant
+with no kind ⇒ VERIFIED; TERM_END kind-only attestation ⇒
+VERIFIED).
+
+**Disclosed pre-existing test modification (SV6 round —
+exactly one):** `test33-state-verification-re-review-corrections.test.ts`,
+test 33.7, second sub-case. It asserted VERIFIED for a
+terminal DATE intent with an unparseable `observedAt` and a
+kind-only schedule `{kind: "DATE"}`, on the stated reasoning
+that "kind evidence decides" — i.e. it pinned the precise
+overclaim SV6 removes. The fixture is unchanged; the expected
+verdict is corrected to UNVERIFIABLE, with an in-file comment
+recording the correction and its justification. The SV4 point
+of 33.7 — an unparseable read time invents no prematurity —
+is preserved: the corrected assertion also pins that no
+contradiction is produced. No other pre-existing test was
+modified in this round, and the full suite confirms no other
+pre-existing verdict changed.
+
+**SV7 — a matching target in a partial collection could
+still verify at ACTION_LEVEL (SV5 follow-up, blocker).** SV5
+withheld VERIFIED when an *unidentifiable* entry could hide a
+contradictory duplicate, but not when `itemsComplete: false`
+and the target was present and agreeing: CHANGE_QUANTITY
+x→5 with observed `[{x, 5}]` in a partial return verified,
+although the unreturned portion could contain `{x, 3}`. The
+full-item-set path never establishes VERIFIED from a partial
+collection (§4); the action level now matches that
+discipline. **Fix (§5, revised action-level rows):** for both
+CHANGE_QUANTITY and CHANGE_PLAN, after the
+present-identified-contradiction check — whose MISMATCH
+precedence is preserved, including in partial returns — a
+partial collection (`itemsComplete: false`) refuses VERIFIED
+and computes UNVERIFIABLE, with the partial-return limitation
+stated in the check detail. A complete, fully identified
+collection with an agreeing target still verifies (controls
+33.12/33.20 and 34.13). Regressions: 34.10 (quantity,
+partial present match ⇒ UNVERIFIABLE — the reviewer's exact
+counterexample shape), 34.11 (plan, same), 34.12 (partial,
+duplicates both matching ⇒ still UNVERIFIABLE), 34.13
+(controls: complete-collection matches ⇒ VERIFIED, both
+actions), 34.14 (control: partial present contradiction ⇒
+MISMATCH, precedence preserved). **Consumer audit:** no
+in-repo consumer sets `itemsComplete` — the store's
+`establishVerification` path and both hook integrations
+(Chargebee-live FULL_ITEM_SET; the store's ACTION_LEVEL
+consumption) construct observations without it, so they are
+treated as complete and are unaffected. Within the suites,
+`itemsComplete: false` appears only in test31/32/33: 31.6a/31.6b
+and 32.4 are FULL_ITEM_SET cases (per-change checks subsumed,
+verdicts unchanged), and 33.8/33.15/33.16 exercise absence and
+present-entry contradictions, whose verdicts the fix
+preserves by construction (the partial check runs only after
+a present, agreeing target survives the contradiction
+checks). The full-suite result confirms the audit: apart from
+the disclosed 33.7 correction, no pre-existing outcome flips.
+
+**Scope held:** no spec changes, no BC-1 activation, no
+durable-coordinator changes, no adapter changes, no
+billing-math changes, no real Chargebee calls;
+`SCQ_LIVE_COMMIT_ENABLED` never set. `types.ts` is untouched
+in this round (vs main it remains purely additive: 191
+insertions, 0 deletions across PR-9 and all correction
+rounds). The freeze guard still fails by design: `types.ts`
+is in its pathspec and the `protocol-change-approved` label
+remains withheld by the owner pending this review.
