@@ -566,6 +566,22 @@ export type PostCommitStateExpectation = {
    * ACTION_LEVEL coverage, reported as such.
    */
   expectedItems?: ReadonlyArray<ExpectedItemState>;
+  /**
+   * The authorized current-term boundary instant, where the caller
+   * can derive it from the authorized quote / request context (for
+   * example the quoted period boundary recorded at quote time).
+   * Used ONLY to align a TERM_END cancellation: a schedule or
+   * effected cancellation is verified for TERM_END when its
+   * independently established instant equals this boundary, or
+   * when provider schedule-kind evidence establishes the TERM_END
+   * kind directly. This value must come from the expectation
+   * (authorized) side — never from the post-commit snapshot being
+   * checked: a boundary read out of the observed state would be
+   * the state proving itself. Absent => TERM_END alignment rests
+   * on schedule-kind evidence alone, and a schedule carrying
+   * neither kind nor an alignable instant is UNVERIFIABLE.
+   */
+  termBoundaryAt?: string;
 };
 
 /**
@@ -602,15 +618,22 @@ export type PostCommitStateObservation = {
    */
   itemsComplete?: boolean;
   /**
-   * An independently established cancellation schedule, for
-   * scheduled (TERM_END / DATE) CANCEL intents: the subscription
-   * snapshot carries no schedule, so a scheduled cancellation can
-   * only be verified from schedule evidence established by a
-   * provider read (e.g. a scheduled-change record bound to the
-   * operation). Absent => a non-terminal scheduled cancel is
-   * UNVERIFIABLE; a schedule is never invented.
+   * Independently established cancellation schedule / cancellation
+   * evidence, for scheduled (TERM_END / DATE) CANCEL intents: the
+   * subscription snapshot carries no schedule, so a scheduled
+   * cancellation can only be verified from evidence established by
+   * a provider read (e.g. a scheduled-change record bound to the
+   * operation). `kind` is the provider-established schedule kind
+   * (TERM_END evidence can verify a TERM_END intent without a
+   * numeric boundary); `effectiveAt` is the established scheduled
+   * instant — or, for an already-terminal subscription, the
+   * established instant the cancellation took effect. Absent => a
+   * non-terminal scheduled cancel is UNVERIFIABLE; a schedule is
+   * never invented, and a terminal state carrying no cancellation
+   * instant cannot be distinguished from a premature termination
+   * for a DATE / TERM_END intent.
    */
-  cancellationSchedule?: { effectiveAt?: string };
+  cancellationSchedule?: { kind?: EffectiveIntent["type"]; effectiveAt?: string };
   /** Descriptor of the read that produced this observation (provenance, for the audit trail). */
   source: string;
   /** When the observation was made (ISO timestamp). */

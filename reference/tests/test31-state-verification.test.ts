@@ -61,7 +61,7 @@ function snap(
 
 function observe(
   snapshot: PostCommitObservedSnapshot | undefined,
-  extra: { itemsComplete?: boolean; cancellationSchedule?: { effectiveAt?: string } } = {}
+  extra: { itemsComplete?: boolean; cancellationSchedule?: { kind?: "TERM_END" | "DATE" | "IMMEDIATE"; effectiveAt?: string } } = {}
 ) {
   return { snapshot, source: SRC, observedAt: AT, ...extra };
 }
@@ -308,10 +308,16 @@ test("Test 31.16 (row 16, NEW): scheduled cancellation with an independently est
   // Inexpressible before PR-9: the snapshot carries no schedule, so
   // the private verifier computed UNVERIFIABLE for every
   // non-terminal scheduled cancel (cf. row 17).
+  // SV2 review correction (PR #18): a bare schedule effectiveAt no
+  // longer verifies a TERM_END intent — the schedule must align
+  // with the authorized term end, via provider schedule-KIND
+  // evidence (as here) or an established instant equal to the
+  // authorized boundary on the expectation. This fixture now
+  // supplies the kind evidence; the assertion is unchanged.
   const termEnd = verifyPostCommitState(
     { proposal: cancelProposal({ type: "TERM_END" }) },
     observe(snap(ITEMS_BEFORE, { status: "active" }), {
-      cancellationSchedule: { effectiveAt: "2026-11-01T00:00:00.000Z" },
+      cancellationSchedule: { kind: "TERM_END", effectiveAt: "2026-11-01T00:00:00.000Z" },
     })
   );
   assert.equal(termEnd.verdict, "VERIFIED");

@@ -40,11 +40,13 @@
  * SEMANTICS (research/core-state-verification.md §4–§5):
  *   - Coverage is reported, never implied. With `expectedItems`,
  *     coverage is FULL_ITEM_SET: expected vs observed are compared
- *     as MULTISETS over item identifiers + quantities (+ stated
- *     offerings). Without it, coverage is ACTION_LEVEL — the
- *     historical per-change checks — and the result's limitations
- *     say plainly that state outside the targeted items is not
- *     examined.
+ *     as MULTISETS of complete item TUPLES — (identifier,
+ *     quantity, offering where the expectation states offerings) —
+ *     never as independent quantity and offering lists, which
+ *     would accept a pairing that exists in neither set. Without
+ *     it, coverage is ACTION_LEVEL — the historical per-change
+ *     checks — and the result's limitations say plainly that state
+ *     outside the targeted items is not examined.
  *   - An OMITTED item collection is UNVERIFIABLE, never an empty
  *     set; a present EMPTY collection against a nonempty
  *     expectation is a MISMATCH (a stated empty set is data).
@@ -58,15 +60,31 @@
  *     UNVERIFIABLE); else any unverifiable required check =>
  *     UNVERIFIABLE; else VERIFIED — only when every required check
  *     passed.
- *   - CANCEL: a terminal state verifies any intent. A non-terminal
- *     state contradicts an IMMEDIATE intent (an established
- *     TERM_END schedule does not rescue it — a scheduled
- *     cancellation is not an immediate termination). For a
- *     TERM_END / DATE intent, verification requires independently
- *     established schedule evidence (`cancellationSchedule`); the
- *     snapshot carries no schedule, so without it the check is
- *     UNVERIFIABLE — a schedule is never invented. For a DATE
- *     intent the established date must equal the intended date.
+ *   - CANCEL: "terminal now" is not "cancelled at the authorized
+ *     time". A terminal state verifies an IMMEDIATE intent. A
+ *     non-terminal state contradicts an IMMEDIATE intent (an
+ *     established TERM_END schedule does not rescue it — a
+ *     scheduled cancellation is not an immediate termination).
+ *     For TERM_END / DATE intents, verification requires
+ *     independently established schedule evidence
+ *     (`cancellationSchedule`) whose KIND or INSTANT aligns with
+ *     the authorized intent: TERM_END verifies from provider
+ *     schedule-kind evidence, or from an established instant equal
+ *     to the authorized term boundary carried on the EXPECTATION
+ *     side (`termBoundaryAt` — never a boundary read out of the
+ *     observed snapshot, which would be the state proving itself);
+ *     a schedule whose kind and instant cannot be aligned is
+ *     UNVERIFIABLE, and an established instant contradicting the
+ *     authorized boundary/date is MISMATCH. For a terminal DATE /
+ *     TERM_END state, the established cancellation instant is
+ *     compared the same way: earlier than authorized is a
+ *     premature termination (MISMATCH, the Paddle P3 precedent);
+ *     no established instant at all is UNVERIFIABLE — a bare
+ *     terminal status cannot distinguish premature from compliant
+ *     (the one exception: a DATE intent read back BEFORE its
+ *     authorized date with the subscription already terminal
+ *     establishes prematurity from the read time itself). A
+ *     schedule is never invented.
  */
 import type {
   PostCommitObservedSnapshot,
@@ -106,22 +124,77 @@ class CheckCollector {
   }
 }
 
+/**
+ * The identifier of a collection entry, or undefined when the
+ * entry cannot carry one. Totality (SV3): provider collections
+ * are runtime data — an entry may be null, a primitive, or an
+ * object without a usable id — and every dereference of an entry
+ * goes through this guard so malformed entries compute
+ * UNVERIFIABLE instead of throwing.
+ */
+function entryId(entry: unknown): string | undefined {
+  if (entry === null || (typeof entry !== "object" && typeof entry !== "function")) return undefined;
+  const id = (entry as { id?: unknown }).id;
+  return typeof id === "string" && id.length > 0 ? id : undefined;
+}
+
 function groupById<T extends { id?: unknown }>(entries: ReadonlyArray<T>): Map<string, T[]> {
   const byId = new Map<string, T[]>();
   for (const entry of entries) {
-    if (typeof entry.id !== "string" || entry.id.length === 0) continue;
-    const list = byId.get(entry.id) ?? [];
+    const id = entryId(entry);
+    if (id === undefined) continue;
+    const list = byId.get(id) ?? [];
     list.push(entry);
-    byId.set(entry.id, list);
+    byId.set(id, list);
   }
   return byId;
 }
 
+type ItemShape = { quantity?: number; offeringRef?: string };
+
+/** Multiset surplus: the values whose observed multiplicity exceeds the expected multiplicity (each repeated per excess occurrence). */
+function multisetSurplus<T>(expected: ReadonlyArray<T>, observed: ReadonlyArray<T>): T[] {
+  const remaining = new Map<T, number>();
+  for (const value of expected) remaining.set(value, (remaining.get(value) ?? 0) + 1);
+  const surplus: T[] = [];
+  for (const value of observed) {
+    const left = remaining.get(value) ?? 0;
+    if (left > 0) remaining.set(value, left - 1);
+    else surplus.push(value);
+  }
+  return surplus;
+}
+
+function multisetsEqual<T>(a: ReadonlyArray<T>, b: ReadonlyArray<T>): boolean {
+  return a.length === b.length && multisetSurplus(a, b).length === 0;
+}
+
+function tupleLabel(entry: ItemShape, includeOffering: boolean): string {
+  return includeOffering ? `(quantity ${entry.quantity}, offering ${entry.offeringRef})` : `(quantity ${entry.quantity})`;
+}
+
+function tupleList(entries: ReadonlyArray<ItemShape>, includeOffering: boolean): string {
+  return entries.map((e) => tupleLabel(e, includeOffering)).join(", ");
+}
+
 /**
- * The FULL_ITEM_SET comparison: expected vs observed as multisets
- * over item identifiers, per-identifier quantities, and stated
- * offerings. Emits one check entry per established problem (or per
- * unverifiable aspect), or a single VERIFIED entry.
+ * The FULL_ITEM_SET comparison (SV1): expected vs observed as
+ * multisets of complete item TUPLES — (identifier, quantity, and
+ * offering where the expectation states offerings) — never as
+ * independent per-dimension lists: comparing sorted quantities
+ * and sorted offerings separately accepts a quantity/offering
+ * PAIRING that exists in neither set. Emits one check entry per
+ * established problem (or per unverifiable aspect), or a single
+ * VERIFIED entry.
+ *
+ * Malformed entries (SV3): an entry without a usable identifier
+ * cannot be compared. On the OBSERVED side it makes the dimension
+ * unverifiable and suppresses absence-based judgments (the entry
+ * might BE the apparently-missing item), while contradictions
+ * established by present, identified entries still stand. On the
+ * EXPECTED side the expectation itself is compromised, so no
+ * contradiction is fabricated from it: the dimension is
+ * unverifiable.
  */
 function compareItemSets(
   expected: NonNullable<PostCommitStateExpectation["expectedItems"]>,
@@ -140,22 +213,65 @@ function compareItemSets(
     return;
   }
   const complete = observation.itemsComplete !== false;
-  const unidentifiable = observed.filter((e) => typeof e?.id !== "string" || e.id.length === 0).length;
-  if (unidentifiable > 0) {
+  const unidentifiableObserved = observed.filter((e) => entryId(e) === undefined).length;
+  const unidentifiableExpected = expected.filter((e) => entryId(e) === undefined).length;
+  if (unidentifiableObserved > 0) {
     col.add(
       "item-set",
       DIM_ITEM_SET,
       "UNVERIFIABLE",
-      `${unidentifiable} observed item entr${unidentifiable === 1 ? "y carries" : "ies carry"} no identifier and cannot be compared against the expected set`
+      `${unidentifiableObserved} observed item entr${unidentifiableObserved === 1 ? "y carries" : "ies carry"} no identifier and cannot be compared against the expected set`
     );
   }
+  if (unidentifiableExpected > 0) {
+    col.add(
+      "item-set",
+      DIM_ITEM_SET,
+      "UNVERIFIABLE",
+      `${unidentifiableExpected} expected item entr${unidentifiableExpected === 1 ? "y carries" : "ies carry"} no identifier — the expected set itself is malformed, so no item-set conclusion can be drawn from it`
+    );
+    if (!complete) {
+      col.add(
+        "item-set",
+        DIM_ITEM_SET,
+        "UNVERIFIABLE",
+        "the item collection is a partial return (itemsComplete: false): items absent from it are not established " +
+          "as missing, and unreturned items cannot be ruled out — the item-set dimension cannot be fully verified " +
+          "from a partial collection"
+      );
+    }
+    return;
+  }
+  // An absence (an expected identifier with too few identified
+  // observed entries) is established only from a complete
+  // collection with no unidentifiable entries that could account
+  // for the shortfall. Present-entry contradictions are unaffected.
+  const absenceEstablished = complete && unidentifiableObserved === 0;
   const expectedById = groupById(expected);
   const observedById = groupById(observed);
   const ids = new Set([...expectedById.keys(), ...observedById.keys()]);
   let problems = 0;
+  const addMissing = (id: string, exp: ReadonlyArray<ItemShape>, obs: ReadonlyArray<ItemShape>): void => {
+    problems += 1;
+    if (obs.length === 0) {
+      col.add(
+        "item-set",
+        DIM_ITEM_SET,
+        "CONTRADICTED",
+        exp[0].quantity === undefined ? `missing item ${id}` : `missing item ${id} (intended quantity ${exp[0].quantity})`
+      );
+    } else {
+      col.add(
+        "item-set",
+        DIM_ITEM_SET,
+        "CONTRADICTED",
+        `item ${id} appears ${exp.length} times in the expected set but ${obs.length} times in the observed set`
+      );
+    }
+  };
   for (const id of ids) {
-    const exp = expectedById.get(id) ?? [];
-    const obs = observedById.get(id) ?? [];
+    const exp = (expectedById.get(id) ?? []) as ReadonlyArray<ItemShape>;
+    const obs = (observedById.get(id) ?? []) as ReadonlyArray<ItemShape>;
     if (obs.length > exp.length) {
       problems += 1;
       if (exp.length === 0) {
@@ -165,35 +281,97 @@ function compareItemSets(
       }
       continue;
     }
-    if (obs.length < exp.length) {
-      if (complete) {
-        problems += 1;
-        if (obs.length === 0) {
-          col.add(
-            "item-set",
-            DIM_ITEM_SET,
-            "CONTRADICTED",
-            exp[0].quantity === undefined ? `missing item ${id}` : `missing item ${id} (intended quantity ${exp[0].quantity})`
-          );
-        } else {
-          col.add(
-            "item-set",
-            DIM_ITEM_SET,
-            "CONTRADICTED",
-            `item ${id} appears ${exp.length} times in the expected set but ${obs.length} times in the observed set`
-          );
-        }
-      }
-      // Partial collection: absence is not established; the
-      // partial rule below marks the dimension unverifiable.
-      continue;
-    }
     if (exp.length === 0) continue; // id present in neither (defensive; unreachable via the union)
-    // Equal multiplicity: compare the quantity multiset.
-    const quantitiesOf = (entries: ReadonlyArray<{ quantity?: number }>): number[] | undefined =>
-      entries.every((e) => typeof e.quantity === "number") ? entries.map((e) => e.quantity as number) : undefined;
+
+    const offeringRequired = exp.some((e) => typeof e.offeringRef === "string");
+    const quantitiesOf = (entries: ReadonlyArray<ItemShape>): number[] | undefined =>
+      entries.every((e) => typeof e.quantity === "number" && Number.isFinite(e.quantity))
+        ? entries.map((e) => e.quantity as number)
+        : undefined;
+    const offeringsOf = (entries: ReadonlyArray<ItemShape>): string[] | undefined =>
+      entries.every((e) => typeof e.offeringRef === "string") ? entries.map((e) => e.offeringRef as string) : undefined;
     const expQ = quantitiesOf(exp);
     const obsQ = quantitiesOf(obs);
+    const expO = offeringRequired ? offeringsOf(exp) : undefined;
+    const obsO = offeringRequired ? offeringsOf(obs) : undefined;
+    const tupleComparable = expQ !== undefined && obsQ !== undefined && (!offeringRequired || (expO !== undefined && obsO !== undefined));
+
+    if (tupleComparable) {
+      // Canonical tuple multiset for this identifier.
+      const keyOf = (e: ItemShape): string => JSON.stringify([e.quantity, offeringRequired ? e.offeringRef : null]);
+      const surplusKeys = multisetSurplus(exp.map(keyOf), obs.map(keyOf));
+      if (obs.length < exp.length) {
+        if (surplusKeys.length > 0) {
+          // A PRESENT tuple that exists nowhere in the expected
+          // configuration: established by the entry itself, even
+          // in a partial return and even below expected
+          // multiplicity — it is not an absence-based judgment.
+          problems += 1;
+          const surplusEntries = surplusKeys.map((k) => obs.find((e) => keyOf(e) === k) as ItemShape);
+          col.add(
+            "item-set",
+            DIM_ITEM_SET,
+            "CONTRADICTED",
+            `item configuration mismatch for item ${id}: observed tuple ${tupleList(surplusEntries, offeringRequired)} is not part of the expected item configuration`
+          );
+        } else if (absenceEstablished) {
+          addMissing(id, exp, obs);
+        }
+        continue;
+      }
+      // Equal multiplicity.
+      if (surplusKeys.length === 0) continue; // the tuple multiset matches exactly
+      problems += 1;
+      const qtyEqual = multisetsEqual(expQ as number[], obsQ as number[]);
+      const offEqual = !offeringRequired || multisetsEqual(expO as string[], obsO as string[]);
+      if (!qtyEqual && offEqual) {
+        const sortedExp = [...(expQ as number[])].sort((a, b) => a - b);
+        const sortedObs = [...(obsQ as number[])].sort((a, b) => a - b);
+        col.add(
+          "item-set",
+          DIM_ITEM_SET,
+          "CONTRADICTED",
+          exp.length === 1
+            ? `quantity mismatch for item ${id}: intended ${(expQ as number[])[0]}, actual ${(obsQ as number[])[0]}`
+            : `quantity mismatch for item ${id}: intended quantities [${sortedExp.join(", ")}], actual [${sortedObs.join(", ")}]`
+        );
+      } else if (qtyEqual && !offEqual) {
+        const sortedExp = [...(expO as string[])].sort();
+        const sortedObs = [...(obsO as string[])].sort();
+        col.add(
+          "item-set",
+          DIM_ITEM_SET,
+          "CONTRADICTED",
+          (expO as string[]).length === 1
+            ? `offering mismatch for item ${id}: intended ${sortedExp[0]}, actual ${sortedObs[0]}`
+            : `offering mismatch for item ${id}: intended [${sortedExp.join(", ")}], actual [${sortedObs.join(", ")}]`
+        );
+      } else if (qtyEqual && offEqual) {
+        // The SV1 case: each dimension matches independently, but
+        // no expected (quantity, offering) pairing actually exists.
+        col.add(
+          "item-set",
+          DIM_ITEM_SET,
+          "CONTRADICTED",
+          `item configuration mismatch for item ${id}: the quantities and offerings match independently, but their pairing differs — expected tuples ${tupleList(exp, offeringRequired)}, actual tuples ${tupleList(obs, offeringRequired)}`
+        );
+      } else {
+        col.add(
+          "item-set",
+          DIM_ITEM_SET,
+          "CONTRADICTED",
+          `item configuration mismatch for item ${id}: expected tuples ${tupleList(exp, offeringRequired)}, actual tuples ${tupleList(obs, offeringRequired)}`
+        );
+      }
+      continue;
+    }
+
+    // The full tuple cannot be formed for this identifier (a
+    // quantity or a required offering is absent on one side): the
+    // dimension is unverifiable for the incompletely shaped part,
+    // while each completely shaped dimension is still compared on
+    // its own — a contradiction established by present entries in
+    // a shaped dimension stands.
     if (expQ === undefined || obsQ === undefined) {
       const side = expQ === undefined ? "expected" : "observed";
       col.add(
@@ -202,11 +380,34 @@ function compareItemSets(
         "UNVERIFIABLE",
         `the quantity of item ${id} is absent from the ${side} set — its resulting quantity cannot be verified`
       );
-    } else {
-      const sortedExp = [...expQ].sort((a, b) => a - b);
-      const sortedObs = [...obsQ].sort((a, b) => a - b);
-      if (JSON.stringify(sortedExp) !== JSON.stringify(sortedObs)) {
+    } else if (offeringRequired && (expO === undefined || obsO === undefined)) {
+      const side = expO === undefined ? "expected" : "observed";
+      col.add(
+        "item-set",
+        DIM_ITEM_SET,
+        "UNVERIFIABLE",
+        `the offering of item ${id} is absent from the ${side} set — its resulting offering cannot be verified`
+      );
+    }
+    let establishedProblem = false;
+    if (expQ !== undefined && obsQ !== undefined) {
+      const surplusQ = multisetSurplus(expQ, obsQ);
+      if (surplusQ.length > 0 && obs.length < exp.length) {
         problems += 1;
+        establishedProblem = true;
+        col.add(
+          "item-set",
+          DIM_ITEM_SET,
+          "CONTRADICTED",
+          exp.length === 1
+            ? `quantity mismatch for item ${id}: intended ${expQ[0]}, actual ${surplusQ[0]}`
+            : `quantity mismatch for item ${id}: observed quantity ${surplusQ[0]} is not part of the expected quantities [${[...expQ].sort((a, b) => a - b).join(", ")}]`
+        );
+      } else if (obs.length === exp.length && !multisetsEqual(expQ, obsQ)) {
+        problems += 1;
+        establishedProblem = true;
+        const sortedExp = [...expQ].sort((a, b) => a - b);
+        const sortedObs = [...obsQ].sort((a, b) => a - b);
         col.add(
           "item-set",
           DIM_ITEM_SET,
@@ -215,35 +416,38 @@ function compareItemSets(
             ? `quantity mismatch for item ${id}: intended ${expQ[0]}, actual ${obsQ[0]}`
             : `quantity mismatch for item ${id}: intended quantities [${sortedExp.join(", ")}], actual [${sortedObs.join(", ")}]`
         );
-        continue;
       }
     }
-    // Offerings, where the expectation states them.
-    const expOfferings = exp.map((e) => e.offeringRef).filter((o): o is string => typeof o === "string");
-    if (expOfferings.length > 0) {
-      if (obs.some((e) => typeof e.offeringRef !== "string")) {
+    if (offeringRequired && expO !== undefined && obsO !== undefined) {
+      const surplusO = multisetSurplus(expO, obsO);
+      if (surplusO.length > 0 && obs.length < exp.length) {
+        problems += 1;
+        establishedProblem = true;
         col.add(
           "item-set",
           DIM_ITEM_SET,
-          "UNVERIFIABLE",
-          `the offering of item ${id} is absent from the observed set — its resulting offering cannot be verified`
+          "CONTRADICTED",
+          expO.length === 1
+            ? `offering mismatch for item ${id}: intended ${expO[0]}, actual ${surplusO[0]}`
+            : `offering mismatch for item ${id}: observed offering ${surplusO[0]} is not part of the expected offerings [${[...expO].sort().join(", ")}]`
         );
-      } else {
-        const obsOfferings = obs.map((e) => e.offeringRef as string);
-        const sortedExp = [...expOfferings].sort();
-        const sortedObs = [...obsOfferings].sort();
-        if (JSON.stringify(sortedExp) !== JSON.stringify(sortedObs)) {
-          problems += 1;
-          col.add(
-            "item-set",
-            DIM_ITEM_SET,
-            "CONTRADICTED",
-            expOfferings.length === 1
-              ? `offering mismatch for item ${id}: intended ${sortedExp[0]}, actual ${sortedObs[0]}`
-              : `offering mismatch for item ${id}: intended [${sortedExp.join(", ")}], actual [${sortedObs.join(", ")}]`
-          );
-        }
+      } else if (obs.length === exp.length && !multisetsEqual(expO, obsO)) {
+        problems += 1;
+        establishedProblem = true;
+        const sortedExp = [...expO].sort();
+        const sortedObs = [...obsO].sort();
+        col.add(
+          "item-set",
+          DIM_ITEM_SET,
+          "CONTRADICTED",
+          expO.length === 1
+            ? `offering mismatch for item ${id}: intended ${sortedExp[0]}, actual ${sortedObs[0]}`
+            : `offering mismatch for item ${id}: intended [${sortedExp.join(", ")}], actual [${sortedObs.join(", ")}]`
+        );
       }
+    }
+    if (obs.length < exp.length && absenceEstablished && !establishedProblem) {
+      addMissing(id, exp, obs);
     }
   }
   if (!complete) {
@@ -262,7 +466,7 @@ function compareItemSets(
       "item-set",
       DIM_ITEM_SET,
       "VERIFIED",
-      "the observed item collection establishes the expected resulting item set exactly (multiset over identifiers and quantities)"
+      "the observed item collection establishes the expected resulting item set exactly (multiset of complete item tuples: identifiers, quantities, and stated offerings)"
     );
   }
 }
@@ -272,6 +476,7 @@ function checkChange(
   change: PostCommitStateExpectation["proposal"]["changes"][number],
   index: number,
   proposal: PostCommitStateExpectation["proposal"],
+  expectation: PostCommitStateExpectation,
   snapshot: PostCommitObservedSnapshot,
   observation: PostCommitStateObservation,
   col: CheckCollector
@@ -284,7 +489,7 @@ function checkChange(
         col.add(name, dimension, "UNVERIFIABLE", `the observation omits the item collection; the resulting quantity of item ${change.itemId} cannot be verified`);
         return;
       }
-      const item = snapshot.items.find((candidate) => candidate.id === change.itemId);
+      const item = snapshot.items.find((candidate) => entryId(candidate) === change.itemId);
       if (!item) {
         col.add(name, dimension, "CONTRADICTED", `item ${change.itemId} is absent from the observed post-commit state (intended quantity ${change.quantity})`);
         return;
@@ -306,7 +511,7 @@ function checkChange(
         col.add(name, dimension, "UNVERIFIABLE", `the observation omits the item collection; the resulting offering of item ${change.itemId} cannot be verified`);
         return;
       }
-      const item = snapshot.items.find((candidate) => candidate.id === change.itemId);
+      const item = snapshot.items.find((candidate) => entryId(candidate) === change.itemId);
       if (!item) {
         col.add(name, dimension, "CONTRADICTED", `item ${change.itemId} is absent from the observed post-commit state (intended offering ${change.offeringRef})`);
         return;
@@ -337,12 +542,110 @@ function checkChange(
         col.add(name, DIM_CANCELLATION, "UNVERIFIABLE", "the observed subscription status is absent; the cancellation cannot be verified");
         return;
       }
-      if (TERMINAL_SUBSCRIPTION_STATES.has(status.toLowerCase())) {
-        col.add(name, DIM_CANCELLATION, "VERIFIED", `the subscription is in the terminal state "${status}"`);
-        return;
-      }
       const intent = proposal.effectiveIntent;
       const schedule = observation.cancellationSchedule;
+      const terminal = TERMINAL_SUBSCRIPTION_STATES.has(status.toLowerCase());
+      // The authorized instant the cancellation is supposed to
+      // take effect, where the intent type carries one: for DATE
+      // the intended date itself; for TERM_END the authorized
+      // term boundary, which only the EXPECTATION side may supply
+      // (expectation.termBoundaryAt) — a boundary read from the
+      // observed snapshot (billing.nextBillingAt,
+      // term.commitmentUntil) would be the state proving itself
+      // and is never used. IMMEDIATE carries no future instant.
+      const authorizedAt = intent?.type === "DATE" ? intent.at : intent?.type === "TERM_END" ? expectation.termBoundaryAt : undefined;
+      const kind = schedule?.kind;
+      const effectiveAt = typeof schedule?.effectiveAt === "string" && schedule.effectiveAt.length > 0 ? schedule.effectiveAt : undefined;
+      // Compare an established instant against the authorized one:
+      // "earlier" | "equal" | "later" | undefined (either side
+      // missing or unparseable-and-unequal — unalignable).
+      const compareInstants = (established: string | undefined, authorized: string | undefined): "earlier" | "equal" | "later" | undefined => {
+        if (established === undefined || authorized === undefined) return undefined;
+        const a = Date.parse(established);
+        const b = Date.parse(authorized);
+        if (Number.isNaN(a) || Number.isNaN(b)) return established === authorized ? "equal" : undefined;
+        return a < b ? "earlier" : a > b ? "later" : "equal";
+      };
+      const prematureDetail = (established: string, authorized: string): string =>
+        intent?.type === "TERM_END"
+          ? `the subscription was cancelled effective ${established}, before the authorized term boundary ${authorized} — a premature termination, not the authorized term-end cancellation`
+          : `the subscription was cancelled effective ${established}, before the intended date ${authorized} — a premature termination, not the authorized cancellation`;
+      if (terminal) {
+        if (intent?.type !== "DATE" && intent?.type !== "TERM_END") {
+          // IMMEDIATE (or an intent-less cancel): terminal now IS
+          // the authorized outcome.
+          col.add(name, DIM_CANCELLATION, "VERIFIED", `the subscription is in the terminal state "${status}"`);
+          return;
+        }
+        // Scheduled intent, already terminal (SV2): an
+        // established cancellation instant decides first — it
+        // overrides kind evidence, exactly as on the
+        // not-yet-effective path. Provider schedule-kind evidence
+        // matching the intent kind is the provider's own
+        // attestation that the termination is the scheduled one,
+        // and verifies only when no established instant
+        // contradicts it.
+        const cmp = compareInstants(effectiveAt, authorizedAt);
+        if (cmp === "equal") {
+          col.add(name, DIM_CANCELLATION, "VERIFIED", `the subscription is in the terminal state "${status}" and the established cancellation instant ${effectiveAt} matches the authorized instant`);
+          return;
+        }
+        if (cmp === "earlier") {
+          col.add(name, DIM_CANCELLATION, "CONTRADICTED", prematureDetail(effectiveAt as string, authorizedAt as string));
+          return;
+        }
+        if (cmp === "later") {
+          col.add(name, DIM_CANCELLATION, "CONTRADICTED", `the subscription was cancelled effective ${effectiveAt}, after the authorized instant ${authorizedAt} — not the authorized cancellation`);
+          return;
+        }
+        if (kind === intent.type) {
+          col.add(
+            name,
+            DIM_CANCELLATION,
+            "VERIFIED",
+            `the subscription is in the terminal state "${status}" and the established cancellation evidence carries the ${intent.type} schedule kind — the scheduled cancellation took effect`
+          );
+          return;
+        }
+        if (intent.type === "TERM_END" && authorizedAt === undefined) {
+          // No boundary was supplied and no kind evidence: if the
+          // evidence carries an instant it cannot be aligned with
+          // anything, so nothing here is MISMATCH evidence either.
+          col.add(
+            name,
+            DIM_CANCELLATION,
+            "UNVERIFIABLE",
+            `the subscription is in the terminal state "${status}", but no authorized term boundary was supplied with the expectation and the established cancellation evidence carries no TERM_END schedule kind — the termination cannot be aligned with the authorized term end`
+          );
+          return;
+        }
+        if (intent.type === "DATE") {
+          // No established cancellation instant. For a DATE intent
+          // the read time itself can still establish prematurity:
+          // already terminal BEFORE the authorized date means the
+          // cancellation took effect early. Read at/after the
+          // date, premature-vs-compliant is indistinguishable.
+          const observedMs = Date.parse(observation.observedAt ?? "");
+          const intendedMs = Date.parse(authorizedAt as string);
+          if (!Number.isNaN(observedMs) && !Number.isNaN(intendedMs) && observedMs < intendedMs) {
+            col.add(
+              name,
+              DIM_CANCELLATION,
+              "CONTRADICTED",
+              `the subscription is already in the terminal state "${status}" when read at ${observation.observedAt}, before the intended date ${authorizedAt} — a premature termination, not the authorized cancellation`
+            );
+            return;
+          }
+        }
+        col.add(
+          name,
+          DIM_CANCELLATION,
+          "UNVERIFIABLE",
+          `the subscription is in the terminal state "${status}", but the established evidence carries no aligned cancellation instant — a terminal state alone cannot distinguish a premature termination from the authorized ${intent.type} cancellation`
+        );
+        return;
+      }
+      // Non-terminal.
       if (intent?.type === "IMMEDIATE") {
         col.add(
           name,
@@ -356,21 +659,76 @@ function checkChange(
       }
       if (schedule) {
         if (intent?.type === "DATE") {
-          if (typeof schedule.effectiveAt !== "string" || schedule.effectiveAt.length === 0) {
+          if (kind !== undefined && kind !== "DATE") {
+            col.add(name, DIM_CANCELLATION, "CONTRADICTED", `the established cancellation schedule is of kind ${kind}, not the intended DATE schedule`);
+            return;
+          }
+          if (effectiveAt === undefined) {
             col.add(name, DIM_CANCELLATION, "UNVERIFIABLE", "the established cancellation schedule carries no effective date; the intended DATE cannot be verified against it");
             return;
           }
-          const intendedMs = Date.parse(intent.at);
-          const scheduledMs = Date.parse(schedule.effectiveAt);
-          const equal =
-            Number.isNaN(intendedMs) || Number.isNaN(scheduledMs)
-              ? schedule.effectiveAt === intent.at
-              : scheduledMs === intendedMs;
-          if (!equal) {
-            col.add(name, DIM_CANCELLATION, "CONTRADICTED", `the established cancellation schedule is effective ${schedule.effectiveAt}, not the intended date ${intent.at}`);
+          const cmp = compareInstants(effectiveAt, authorizedAt);
+          if (cmp === undefined) {
+            col.add(name, DIM_CANCELLATION, "UNVERIFIABLE", `the established cancellation schedule date ${effectiveAt} cannot be aligned with the intended date ${authorizedAt}`);
             return;
           }
-          col.add(name, DIM_CANCELLATION, "VERIFIED", `a cancellation schedule effective ${schedule.effectiveAt} is independently established, matching the intended date, while the subscription remains "${status}"`);
+          if (cmp !== "equal") {
+            col.add(name, DIM_CANCELLATION, "CONTRADICTED", `the established cancellation schedule is effective ${effectiveAt}, not the intended date ${authorizedAt}`);
+            return;
+          }
+          col.add(name, DIM_CANCELLATION, "VERIFIED", `a cancellation schedule effective ${effectiveAt} is independently established, matching the intended date, while the subscription remains "${status}"`);
+          return;
+        }
+        if (intent?.type === "TERM_END") {
+          if (kind !== undefined && kind !== "TERM_END") {
+            col.add(name, DIM_CANCELLATION, "CONTRADICTED", `the established cancellation schedule is of kind ${kind}, not the intended TERM_END schedule`);
+            return;
+          }
+          if (kind === "TERM_END") {
+            // Provider schedule-kind evidence: the provider
+            // attests the schedule IS a term-end schedule. An
+            // established instant, where it contradicts a supplied
+            // authorized boundary, still overrides.
+            const cmpB = compareInstants(effectiveAt, authorizedAt);
+            if (cmpB === "earlier") {
+              col.add(name, DIM_CANCELLATION, "CONTRADICTED", prematureDetail(effectiveAt as string, authorizedAt as string));
+              return;
+            }
+            if (cmpB === "later") {
+              col.add(name, DIM_CANCELLATION, "CONTRADICTED", `the established term-end cancellation is effective ${effectiveAt}, after the authorized term boundary ${authorizedAt} — not the authorized cancellation`);
+              return;
+            }
+            col.add(
+              name,
+              DIM_CANCELLATION,
+              "VERIFIED",
+              `a TERM_END cancellation schedule${effectiveAt ? ` effective ${effectiveAt}` : ""} is independently established by provider schedule-kind evidence while the subscription remains "${status}" — the scheduled cancellation is established`
+            );
+            return;
+          }
+          // No kind evidence: only an established instant equal
+          // to the authorized boundary aligns.
+          const cmp = compareInstants(effectiveAt, authorizedAt);
+          if (cmp === "equal") {
+            col.add(name, DIM_CANCELLATION, "VERIFIED", `a cancellation schedule effective ${effectiveAt} is independently established, equal to the authorized term boundary, while the subscription remains "${status}"`);
+            return;
+          }
+          if (cmp === "earlier") {
+            col.add(name, DIM_CANCELLATION, "CONTRADICTED", prematureDetail(effectiveAt as string, authorizedAt as string));
+            return;
+          }
+          if (cmp === "later") {
+            col.add(name, DIM_CANCELLATION, "CONTRADICTED", `the established cancellation schedule is effective ${effectiveAt}, after the authorized term boundary ${authorizedAt} — not the authorized cancellation`);
+            return;
+          }
+          col.add(
+            name,
+            DIM_CANCELLATION,
+            "UNVERIFIABLE",
+            authorizedAt === undefined
+              ? `a cancellation schedule${effectiveAt ? ` effective ${effectiveAt}` : ""} was established, but no authorized term boundary was supplied with the expectation and the schedule carries no TERM_END kind evidence — the schedule cannot be aligned with the authorized term end`
+              : `the established cancellation schedule${effectiveAt ? ` (effective ${effectiveAt})` : ""} cannot be aligned with the authorized term boundary ${authorizedAt} — its kind and instant do not establish a term-end cancellation`
+          );
           return;
         }
         col.add(
@@ -457,7 +815,7 @@ export function verifyPostCommitState(
       // the per-change item checks; cadence and cancellation are
       // not item dimensions and are always checked per change.
       if (coverage === "FULL_ITEM_SET" && (change?.action === "CHANGE_QUANTITY" || change?.action === "CHANGE_PLAN")) return;
-      checkChange(change, i, proposal, snapshot, observation, col);
+      checkChange(change, i, proposal, expectation, snapshot, observation, col);
     });
     if (expectedItems === undefined && changes.length === 0) {
       col.add("proposal", "state:proposal", "UNVERIFIABLE", "the proposal carries no changes; there is no intended state to verify");
