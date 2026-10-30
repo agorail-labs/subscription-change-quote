@@ -1,0 +1,344 @@
+{
+  "kind": "scq-chargebee-exact-commit-preflight",
+  "generatedAt": "2026-10-30T15:53:58.685Z",
+  "refused": false,
+  "refusalReasons": [],
+  "identity": {
+    "provider": "chargebee",
+    "site": "pilot-test",
+    "siteApprovedForReadOnly": true,
+    "operatorAttestation": null,
+    "tenantModeEstablished": "UNVERIFIED",
+    "subscriptionId": "pilot-sub-001",
+    "syntheticFixtureDesignation": true,
+    "quoteId": "scq_cblive_dc5bcfa6f5d724d9",
+    "quoteStatus": "ACTIVE",
+    "quoteCreatedAt": "2026-10-30T15:53:58.682Z",
+    "quoteExpiresAt": "2026-10-30T15:58:58.682Z",
+    "storedFingerprint": "rv:1700000000000",
+    "currentResourceVersion": 1700000000000,
+    "currentFingerprint": "rv:1700000000000",
+    "action": "CHANGE_QUANTITY",
+    "changes": [
+      {
+        "action": "CHANGE_QUANTITY",
+        "itemId": "pilot-addon-vision",
+        "quantity": 21
+      }
+    ],
+    "targetItems": [
+      {
+        "itemPriceId": "pilot-plan-business",
+        "quantity": 1
+      },
+      {
+        "itemPriceId": "pilot-addon-vision",
+        "quantity": 21
+      }
+    ]
+  },
+  "exactRequest": {
+    "params": {
+      "subscription_items": [
+        {
+          "item_price_id": "pilot-plan-business",
+          "quantity": 1
+        },
+        {
+          "item_price_id": "pilot-addon-vision",
+          "quantity": 21
+        }
+      ],
+      "replace_items_list": true,
+      "prorate": true,
+      "invoice_immediately": false,
+      "change_option": "immediately"
+    },
+    "formEncodedBody": "subscription_items%5Bitem_price_id%5D%5B0%5D=pilot-plan-business&subscription_items%5Bitem_price_id%5D%5B1%5D=pilot-addon-vision&subscription_items%5Bquantity%5D%5B0%5D=1&subscription_items%5Bquantity%5D%5B1%5D=21&replace_items_list=true&prorate=true&invoice_immediately=false&change_option=immediately",
+    "replaceItemsList": true,
+    "prorate": true,
+    "invoiceImmediately": false,
+    "changeOption": "immediately",
+    "idempotencyKey": "scq-scq_cblive_dc5bcfa6f5d724d9",
+    "requestHash": "ae8a7bec519c1f95f61b443e290d02957d9c16a20b126eeada4adfa1821bef81",
+    "storedPreviewInput": {
+      "items": [
+        {
+          "itemPriceId": "pilot-plan-business",
+          "quantity": 1
+        },
+        {
+          "itemPriceId": "pilot-addon-vision",
+          "quantity": 21
+        }
+      ],
+      "idempotencyKey": "scq-scq_cblive_dc5bcfa6f5d724d9"
+    },
+    "matchesStoredPreviewInput": true,
+    "matchesStoredAttempts": null
+  },
+  "providerState": {
+    "subscriptionId": "pilot-sub-001",
+    "subscriptionStatus": "active",
+    "items": [
+      {
+        "itemPriceId": "pilot-plan-business",
+        "quantity": 1,
+        "unitPrice": 59900,
+        "amount": 59900,
+        "complete": true
+      },
+      {
+        "itemPriceId": "pilot-addon-vision",
+        "quantity": 1,
+        "unitPrice": 1000,
+        "amount": 1000,
+        "complete": true
+      }
+    ],
+    "itemSetComplete": true,
+    "pricingModels": {
+      "pilot-plan-business": "flat_fee",
+      "pilot-addon-vision": "per_unit"
+    },
+    "currency": "USD",
+    "scheduledChanges": "false",
+    "scheduledAdvanceInvoices": "false",
+    "unbilledChargeVisibility": "UNKNOWN",
+    "creditVisibility": "UNKNOWN"
+  },
+  "financials": [
+    {
+      "quantity": "incurred_immediate_obligation",
+      "amountMinorUnits": 20000,
+      "currency": "USD",
+      "determinacy": "DETERMINED",
+      "providerSource": "estimate unbilled_charge_estimates (prorated charges landing as unbilled charges)",
+      "evidence": "established from estimate unbilled_charge_estimates (prorated charges landing as unbilled charges) by the fresh preflight estimate",
+      "basis": "estimated"
+    },
+    {
+      "quantity": "post_change_recurring_price",
+      "amountMinorUnits": 80900,
+      "currency": "USD",
+      "determinacy": "DETERMINED",
+      "providerSource": "estimate subscription_items stated amounts / implemented per-item pricing",
+      "evidence": "established from estimate subscription_items stated amounts / implemented per-item pricing by the fresh preflight estimate",
+      "basis": "estimated"
+    },
+    {
+      "quantity": "next_invoice_estimate",
+      "amountMinorUnits": null,
+      "currency": null,
+      "determinacy": "UNKNOWN",
+      "providerSource": "estimate next_invoice_estimate.total",
+      "evidence": "not established: the estimate carries no next_invoice_estimate — the next-invoice total is a distinct quantity and is never back-filled from the recurring figure",
+      "missingData": "the estimate carries no next_invoice_estimate — the next-invoice total is a distinct quantity and is never back-filled from the recurring figure",
+      "basis": "estimated"
+    },
+    {
+      "quantity": "amount_due_after_credits",
+      "amountMinorUnits": null,
+      "currency": null,
+      "determinacy": "UNKNOWN",
+      "providerSource": "estimate next_invoice_estimate.amount_due (net of credits_applied)",
+      "evidence": "not established: no next_invoice_estimate amount_due is established; unbilled-charge/credit visibility through the read-only allowlist is insufficient to derive it",
+      "missingData": "no next_invoice_estimate amount_due is established; unbilled-charge/credit visibility through the read-only allowlist is insufficient to derive it",
+      "basis": "estimated"
+    }
+  ],
+  "sideEffects": [
+    "invoice_immediately=false does not mean there is no financial consequence: the change's charges land as unbilled charges and are invoiced at the next term renewal.",
+    "Proration: the adapter sends prorate=true with change_option=immediately, so mid-term quantity/plan changes accrue prorated charges for the remainder of the current term (the incurred immediate obligation in this report).",
+    "Unbilled charges already outstanding are invoiced at the next cycle alongside this change's charges; the read-only allowlist exposes no unbilled-charge enumeration, so their total is not established here.",
+    "Credits: an amount due net of credits is established only from a provider next_invoice_estimate carrying credits_applied; subscription credit balances are not enumerable through the read-only allowlist.",
+    "Scheduled changes: the adapter sends no cancellation or neutralization of pre-existing scheduled changes; a subscription with scheduled changes is a preflight blocker, not a detail.",
+    "Mandatory addons: the adapter sends NO mandatory_items_to_remove; mandatory addons attached to the target plan survive replace_items_list=true and appear in the post-commit item set — an unlisted item in the current set is a blocker here.",
+    "There is no atomic rollback. If a commit's outcome is wrong, reversal is a NEW, separately authorized transaction (itself subject to proration and provider rules) and may incur further financial consequences; reconciliation reporting a violation does not undo anything."
+  ],
+  "durableReadiness": {
+    "quoteExistsDurably": true,
+    "providerMatch": true,
+    "subscriptionMatch": true,
+    "siteBindingOk": true,
+    "originBinding": "ESTABLISHED",
+    "originSite": "pilot-test",
+    "originSubscriptionId": "pilot-sub-001",
+    "requestCoherence": true,
+    "unresolvedAttempts": [],
+    "recordedReceiptPresent": false,
+    "wouldReplay": false,
+    "recoverySummary": {
+      "attemptsRequiringIntervention": 0,
+      "recordedReceipts": 0
+    }
+  },
+  "checks": [
+    {
+      "id": "live_commit_flag_absent",
+      "status": "pass",
+      "detail": "SCQ_LIVE_COMMIT_ENABLED is not set to true in the preflight environment"
+    },
+    {
+      "id": "site_approved",
+      "status": "pass",
+      "detail": "configured site \"pilot-test\" exactly matches a per-run approved-site entry (configuration validation only — not provider attestation of tenant mode)"
+    },
+    {
+      "id": "operator_attestation",
+      "status": "unknown",
+      "detail": "no operator attestation of actual test-tenant ownership/mode was supplied; a test-looking site name is not proof of tenant safety, so tenant mode stays UNVERIFIED"
+    },
+    {
+      "id": "quote_exists_durably",
+      "status": "pass",
+      "detail": "the quote exists in the authoritative durable store"
+    },
+    {
+      "id": "provider_binding",
+      "status": "pass",
+      "detail": "stored provider binding is chargebee"
+    },
+    {
+      "id": "quote_origin_binding",
+      "status": "pass",
+      "detail": "quote origin is established by its issuance record: issued against site \"pilot-test\" for subscription \"pilot-sub-001\", digest-bound to the stored quote — the same site identity binds this run's request, re-read, and ledger"
+    },
+    {
+      "id": "quote_not_expired",
+      "status": "pass",
+      "detail": "quote expires at 2026-10-30T15:58:58.682Z"
+    },
+    {
+      "id": "synthetic_designation",
+      "status": "pass",
+      "detail": "subscription id \"pilot-sub-001\" carries a synthetic-fixture designation (a designation is a scoping signal, not proof of tenant safety)"
+    },
+    {
+      "id": "no_unresolved_attempts",
+      "status": "pass",
+      "detail": "no unresolved durable attempt exists for this quote or subscription"
+    },
+    {
+      "id": "idempotency_key_coherence",
+      "status": "pass",
+      "detail": "the stored idempotency key is the original adapter-derived key for this quote; it is reported, never regenerated"
+    },
+    {
+      "id": "provider_subscription_identity",
+      "status": "pass",
+      "detail": "the provider re-read returned the bound subscription \"pilot-sub-001\""
+    },
+    {
+      "id": "fingerprint_stable",
+      "status": "pass",
+      "detail": "provider fingerprint is unchanged since quote time (rv:1700000000000)"
+    },
+    {
+      "id": "item_set_complete",
+      "status": "pass",
+      "detail": "the full current item collection was read with id, quantity, and amount for every entry"
+    },
+    {
+      "id": "request_matches_proposal",
+      "status": "pass",
+      "detail": "the stored dispatch target is exactly the full resulting item multiset the recorded proposal authorizes over the independently re-read current item set (every item's id and quantity compared, not just the changed item)"
+    },
+    {
+      "id": "target_covers_current_items",
+      "status": "pass",
+      "detail": "every current item is present in the target set"
+    },
+    {
+      "id": "scheduled_changes",
+      "status": "pass",
+      "detail": "the provider read reports no scheduled changes"
+    },
+    {
+      "id": "scheduled_advance_invoices",
+      "status": "pass",
+      "detail": "the provider read reports no scheduled advance invoices"
+    },
+    {
+      "id": "item_prices_readable",
+      "status": "pass",
+      "detail": "every involved item price was read"
+    },
+    {
+      "id": "pricing_models_supported",
+      "status": "pass",
+      "detail": "all involved pricing models are implemented (flat_fee / per_unit)"
+    },
+    {
+      "id": "envelope_still_satisfied",
+      "status": "pass",
+      "detail": "the fresh estimate sits inside the quote's acceptance envelope"
+    }
+  ],
+  "blockers": [],
+  "transport": {
+    "totalCalls": 4,
+    "mutatingCalls": 0,
+    "estimateCalls": 1,
+    "byOperation": {
+      "retrieve_subscription": 1,
+      "get_item_price": 2,
+      "estimate_update_for_items": 1
+    },
+    "rejectedAttempts": 0,
+    "updateForItemsDispatched": 0
+  },
+  "evidence": {
+    "transportOrigin": "injected",
+    "capabilities": [
+      {
+        "capability": "exact-commit preflight evidence (this run)",
+        "result": "SIMULATED_PASS",
+        "detail": "caller-supplied (injected) transport: this evidence validates procedure and code paths, never live provider behavior — provenance is structural and cannot be upgraded by a caller-supplied label"
+      },
+      {
+        "capability": "zero observed mutations",
+        "result": "established from the observed transport log",
+        "detail": "observed 4 dispatched call(s): 4 read-only/estimate, 0 mutating, 0 rejected pre-dispatch; update_for_items dispatched 0 time(s)"
+      }
+    ]
+  },
+  "conditions": [
+    {
+      "condition": 1,
+      "name": "v0.6.2 Chargebee migration complete AND the v0.6.2 specification/release approved",
+      "status": "UNVERIFIED",
+      "evidence": "no release-approval record supplied",
+      "reason": "specification/release approval is a human act separate from code merges; it cannot be inferred from PRs #17–#19 being merged, and none was supplied"
+    },
+    {
+      "condition": 2,
+      "name": "Durable idempotency storage implemented and recovery-tested",
+      "status": "PASS",
+      "evidence": "mocked rehearsal 14/14 scenarios (runRehearsal() in this process (mocked))",
+      "reason": "durable storage and recovery are implemented (PR #17) and rehearsed end to end over mocked transports — SIMULATED evidence; it does not prove durable exactly-once provider execution"
+    },
+    {
+      "condition": 3,
+      "name": "Executed preflight for the exact commit (this report)",
+      "status": "UNVERIFIED",
+      "evidence": "this report was produced over a caller-supplied (injected) transport",
+      "reason": "Condition 3 is not met — the transport was caller-supplied (injected/simulated evidence): only the preflight's own internally constructed guarded real-network transport produces real-tenant evidence, and no caller-supplied label changes that; operator attestation of actual test-tenant ownership/mode was not supplied (tenant mode UNVERIFIED)"
+    },
+    {
+      "condition": 4,
+      "name": "Named reconciliation owner for unresolved outcomes",
+      "status": "BLOCKED",
+      "evidence": "no reconciliation owner named",
+      "reason": "software cannot name a reconciliation owner; the field stays blank until a human supplies one who has accepted the runbook"
+    },
+    {
+      "condition": 5,
+      "name": "Separate authorization for the controlled test-site commit",
+      "status": "BLOCKED",
+      "evidence": "no commit authorization supplied",
+      "reason": "the controlled test-site commit requires its own separate authorization; none was supplied and none can be inferred from this preflight"
+    }
+  ],
+  "overall": "NO-GO"
+}

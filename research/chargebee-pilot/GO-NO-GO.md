@@ -82,3 +82,48 @@ no network call and classified live retrieve/quote BLOCKED with the
 exact requirement (Full-Access test-site key + synthetic subscription
 id, via env). The Oct 27, 2026 LIVE_PASS evidence stands as historical
 (EVIDENCE-REPORT.md §B) and is not re-claimed.
+
+---
+
+## Addendum (2026-10-29, PR-11) — preflight and rehearsal delivered; Decision 2 unchanged: **NO-GO**
+
+PR-11 adds the machinery conditions 2 and 3 call for, without
+changing any decision above:
+
+- **Condition 2 evidence strengthened (SIMULATED).** The mocked
+  recovery rehearsal (`src/live/pilot/rehearsal.ts`, 14 scenarios)
+  drives the real durable store, coordinator, and adapter over
+  mocked transports: successful dispatch + durable recording, exact
+  receipt replay after restart, lost response, crash after
+  write-ahead intent, crash after dispatch before persistence,
+  wrong resulting item set, unexpected mandatory addon (recorded as
+  reconciliation VIOLATED on the attributable receipt), unknown
+  financial actuals (COMMITTED_UNVERIFIED), established envelope
+  violation, concurrent same-subscription attempts, idempotency-key
+  conflict, corrupted durable records, operator review of an
+  unresolved attempt, and pre-effect rejection
+  (CONFIRMED_NON_EXECUTION). 14/14 pass; the evidence class is
+  SIMULATED_PASS — procedural readiness only. It does not prove
+  durable exactly-once provider execution and does not name or bind
+  an operator.
+- **Condition 3 machinery delivered; condition itself still
+  UNVERIFIED for any real commit.** The read-only exact-commit
+  preflight (`src/live/pilot/preflight.ts`, CLI
+  `npm run preflight:chargebee`) derives the hypothetical mutation
+  with the adapter's own request builder, hashes it with the
+  ledger's canonical request hash, re-reads provider state through
+  the existing guarded allowlist (zero observed mutations, from the
+  transport log), and reports the four financial quantities
+  separately with provenance. A sample mocked run is committed at
+  `runs/preflight-mocked-2026-10-29/` (overall NO-GO). No preflight
+  against a real tenant has been executed — no credentials were
+  present, consistent with Decision 3 — so condition 3 has no
+  real-commit evidence.
+- **Conditions 1, 4, 5 unchanged.** No v0.6.2 release approval has
+  been recorded (merged PRs are not release approval); the operator
+  runbook (`OPERATOR-RECONCILIATION-RUNBOOK.md`) is a blank template
+  — no reconciliation owner is named; no commit authorization has
+  been granted. The preflight's readiness model can return at most
+  READY_FOR_HUMAN_REVIEW and, on current evidence, returns NO-GO.
+
+**Decision 2 stands: NO-GO for any controlled test-site commit.**

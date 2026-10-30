@@ -1,0 +1,697 @@
+# PR-11 — Read-only exact-commit preflight and durable reconciliation rehearsal
+
+Implements the preflight/rehearsal package of the pilot readiness
+program (issues #12, #7): the machinery COMMIT-RECOVERY-SAFETY
+conditions 2 and 3 require before a controlled Chargebee TEST-site
+commit can even be proposed. **Overall readiness remains NO-GO**:
+this PR builds evidence machinery; it grants nothing, names no
+operator, and executes no real-tenant preflight (no credentials were
+present, per GO-NO-GO Decision 3). No real Chargebee mutation was
+performed or attempted; `SCQ_LIVE_COMMIT_ENABLED` was never set;
+every mutation behavior below is exercised over mocked transports
+and temporary databases.
+
+## 1. Audit — what exists, what is simulated, what is still unverified
+
+Read in full before designing: `src/live/chargebee-scq-adapter.ts`,
+`src/live/chargebee-http.ts`, `src/live/pilot/{run-pilot,live-guard,mock-transport}.ts`,
+`src/store/{durable-store,mutation-coordinator}.ts`,
+`research/chargebee-pilot/COMMIT-RECOVERY-SAFETY.md`,
+`research/chargebee-live-v1/RECOVERY-AUDIT.md`, and the pilot / HTTP /
+durable / BC-1 suites (test13, test21–23, test26–28, test35–36).
+
+**Implemented and relied on (not re-implemented):**
+
+- The guarded read-only transport (`createGuardedLiveTransport`):
+  allowlist = GET subscription, GET item_price, POST
+  estimate-update; everything else — `update_for_items` included —
+  is rejected BEFORE dispatch and logged. The preflight wraps the
+  caller's transport in this same guard; it does not define its own.
+- The F1 site model (`isApprovedTestSite`): a configured site is
+  approved only by an exactly-matching per-run approved-site entry.
+  It is configuration validation, not provider attestation; the
+  preflight keeps the two separate (see §2).
+- The durable ledger (`DurableQuoteStore`): write-ahead attempts,
+  same-subscription exclusion inside the ledger transaction,
+  idempotency-key/request-hash binding, recovery of stale
+  DISPATCHING attempts as INDETERMINATE, corruption-refusing
+  adoption with per-record integrity hashes, and the read-only
+  `recoveryReport()` operator surface. PR-11 adds no ledger
+  semantics and clears nothing.
+- The adapter's commit pipeline (PR-7/PR-9/PR-10 state): quote-time
+  fingerprint, stored `provider_preview_input` + original
+  idempotency key, BC-1 fail-closed envelope gates, post-commit
+  state verification, three-outcome reconciliation. The preflight
+  consumes these artifacts; the durable adapter is not rewritten.
+
+**Extracted and shared (zero behavior change):** the exact-commit
+derivation must not re-implement the request the commit would send.
+Three adapter internals are now exported unchanged and used by both
+sides: `buildChargebeeUpdateParams` (the `updateParams` body, moved
+verbatim; the private method delegates), `chargebeeSubscriptionFingerprint`
+(the stored-fingerprint function), and `chargebeeEffectWithDeterminacy`
+(determinacy attachment for the fresh-estimate drift check). The
+`CbSubscription` type is exported alongside. Every pre-existing
+adapter suite passes unmodified, which is the behavioral proof.
+
+**Simulated (honestly classified):** everything the rehearsal and
+the sample preflight produce. Mocked transports, temporary SQLite
+databases, synthetic fixture data. Classifications use the
+repository vocabulary: SIMULATED_PASS at best, never LIVE_PASS.
+
+**Still unverified after this PR:** any real-tenant behavior
+(Decision 3 stands — live read/estimate re-validation is BLOCKED
+without credentials); durable exactly-once provider execution (not
+claimed anywhere: durable storage + idempotency keys bound dispatch
+from this ledger, and Chargebee's native idempotency window is
+time-limited — neither is server-enforced exactly-once); unbilled
+charge and credit enumeration (the read-only allowlist exposes
+none — reported as standing UNKNOWN, see §4).
+
+## 2. Design — the preflight (`src/live/pilot/preflight.ts`)
+
+`runPreflight(input)` takes an identified quote id, the
+AUTHORITATIVE `DurableQuoteStore`, a transport, its origin
+(`mocked` / `injected` / `real`), the configured site, and
+operator-supplied records. It returns a structured report (JSON) and
+`renderPreflightMarkdown` renders the same content for humans.
+
+**Gates before any provider read.** The run is refused — report
+still produced, zero observed transport calls — when:
+`SCQ_LIVE_COMMIT_ENABLED=true` is present in the preflight
+environment; the configured site has no exactly-matching per-run
+approved-site entry (F1 — a `-test` suffix alone is not approval);
+or the stored subscription id carries no synthetic-fixture
+designation (`cbdemo_` / `pilot-` / `synthetic-` / `test-`). A
+designation is a scoping signal, never proof of tenant safety.
+
+**Tenant mode is an attestation, not an inference.** The report
+carries a separate operator-attestation input (test-tenant
+ownership/mode, attested by whom). Absent or false, tenant mode is
+UNVERIFIED — including on test-looking site names.
+
+**Durable readiness (read-only).** Quote exists durably (a
+memory-only quote is a blocker); provider/subscription/site binding;
+expiry; no unresolved attempt (PREPARED / DISPATCHING /
+INDETERMINATE) for the quote OR the subscription — a hard blocker
+the report never clears, reclassifies, or overrides; a recorded
+receipt flips the posture to "would replay, not recommit" and
+blocks readiness for a new commit; a recorded INDETERMINATE commit
+outcome blocks (blind-retry guard). Running the preflight persists
+NO intent: only `get` / `allAttempts` / `recoveryReport` / `all`
+reads are made (test37.13 pins attempt-count invariance).
+
+**Exact request.** The hypothetical mutation is derived from the
+stored `provider_preview_input` items via the shared
+`buildChargebeeUpdateParams`, rendered as the exact form-encoded
+body, and hashed with the ledger's own `requestHashOf`. The report
+shows `replace_items_list=true`, `prorate=true`,
+`invoice_immediately=false`, `change_option=immediately`, the exact
+target item set, and the ORIGINAL stored idempotency key (never
+regenerated; a key that is not the adapter-derived `scq-<quoteId>`
+is a blocker). Coherence checks: target set vs the recorded
+proposal (item ids/quantities/offering), and the derived hash vs
+every recorded attempt's request hash for the quote.
+
+**Independent re-read.** Through the guarded transport: subscription
+status, `resource_version` + fingerprint stability (same shared
+function the commit path uses), the FULL current item collection
+(id/quantity/amount completeness), target-set coverage (an existing
+item the target omits is a blocker — replacement would drop it, or,
+for a mandatory addon, it survives and falsifies the resulting
+set), item prices + pricing models for every involved item
+(supported: `flat_fee`, `per_unit`; anything else blocks), currency
+consistency, amount-unit consistency (non-integer minor units
+block), scheduled changes / scheduled advance invoices (flag true
+blocks; flag ABSENT is UNKNOWN — never an affirmative "none"), and
+a fresh estimate of the exact request, checked against the quote's
+acceptance envelope via the core `checkAcceptanceEnvelope` under
+BC-1 rules (a non-deterministic fresh estimate blocks).
+
+**Sanitization.** Provider payloads are reduced to named fields —
+no raw responses, headers, or PII are emitted. The API key (used
+only to construct the client) and any caller-supplied secret strings
+are scrubbed from every string in the report, and Basic/Bearer
+credential patterns are redacted structurally (test37.27 plants the
+key inside a provider field and an attestation note and asserts its
+absence from JSON and Markdown alike).
+
+## 3. Financial provenance matrix
+
+Four quantities, kept strictly distinct; each carries amount (minor
+units) only when its own source establishes it, plus currency,
+DETERMINED/UNKNOWN, provider source, evidence, missing data, and an
+estimated-vs-observed flag (preflight figures are always estimates).
+
+| Quantity | Source | Fixture result | When UNKNOWN |
+|---|---|---|---|
+| Incurred immediate obligation | estimate `unbilled_charge_estimates` (prorated charges landing as unbilled) | 20000 DETERMINED | estimate establishes no complete unbilled figure (e.g. amount member omitted) |
+| Post-change recurring price | estimate stated item amounts, else implemented per-item pricing | 80900 DETERMINED | stated list incomplete AND an involved model is unimplemented |
+| Next-invoice estimate | estimate `next_invoice_estimate.total` | UNKNOWN in the plain fixture; 80900 DETERMINED when the member is present | member absent — never back-filled from recurring |
+| Amount due after credits | estimate `next_invoice_estimate.amount_due` (net of `credits_applied`) | UNKNOWN in the plain fixture; 80600 DETERMINED (80900 − 300 credits) when present | member absent; unbilled/credit visibility through the allowlist is insufficient to derive it |
+
+Zero is reported only when the source establishes zero. The report
+also states, verbatim in every run: proration terms;
+`invoice_immediately=false` does not mean no financial consequence
+(charges land as unbilled charges invoiced at next renewal);
+unbilled charges are invoiced next cycle and are not enumerable
+here; credits affect amounts due, never incurred obligations or
+prices; scheduled changes are a blocker, not a detail; mandatory
+addons survive replacement (no `mandatory_items_to_remove` is sent);
+and there is NO atomic rollback — reversal is a new, separately
+authorized transaction that may incur further consequences, and
+reconciliation reporting a violation undoes nothing.
+
+## 4. Blocker matrix (all pinned by test37)
+
+| Condition | Check | Evidence class |
+|---|---|---|
+| Production / unapproved site | refused pre-read, 0 calls | test37.5 |
+| `SCQ_LIVE_COMMIT_ENABLED=true` in env | refused pre-read | test37.6 |
+| Undesignated subscription id | refused pre-read | test37.7 |
+| No operator attestation | tenant mode UNVERIFIED (not a refusal; blocks readiness) | test37.8, sample |
+| Quote memory-only / absent durably | blocker | test37.9 |
+| Quote expired | blocker | test37.10 |
+| Wrong provider / subscription / site binding | blocker | test37.11–12 |
+| Stored request diverges from proposal | blocker | test37.14 |
+| Changed stored idempotency key | blocker | test37.15 |
+| Recorded attempt with different request hash | blocker (settled attempts are not "unresolved") | test37.16 |
+| Unresolved attempt (DISPATCHING / INDETERMINATE) | hard blocker | test37.17 |
+| Receipt already recorded | replay posture, blocker for new commit | test37.18 |
+| Fingerprint stale | blocker | test37.19 |
+| Scheduled changes present / flag absent | blocker / UNKNOWN | test37.20 |
+| Current item omitted from target set | blocker | test37.21 |
+| Unsupported pricing model / unreadable item price | blocker | test37.22 |
+| Currency mismatch / non-integer amounts | blocker | test37.23 |
+| Immediate or recurring not established | UNKNOWN quantities, NO-GO | test37.24 |
+| Mutation endpoint via preflight transport | rejected pre-dispatch, inner transport never invoked | test37.26 |
+| Credentials in output | sanitized (planted-key test) | test37.27 |
+
+## 5. Rehearsal (`src/live/pilot/rehearsal.ts`)
+
+`runRehearsal()` runs 14 scenarios against the REAL durable store,
+coordinator, and adapter over mocked transports, each in its own
+temporary database, and returns per-scenario expected vs observed
+outcome classes with evidence strings. Results at delivery: **14/14
+pass, evidence class SIMULATED_PASS** (pinned by test38).
+
+| # | Scenario | Required → observed |
+|---|---|---|
+| rh-01 | Successful dispatch + durable recording | COMMITTED_AND_VERIFIED |
+| rh-02 | Exact original-receipt replay after restart | COMMITTED_AND_VERIFIED, provider mutation count 1 |
+| rh-03 | Lost response after provider-side effect | INDETERMINATE, no receipt (execution never inferred from state) |
+| rh-04 | Crash after write-ahead intent (coordinator hook; writer abandoned unclosed) | attempt recovered INDETERMINATE; dispatch ran 0 times |
+| rh-05 | Crash after dispatch, before receipt persistence | INDETERMINATE; provider-side effect occurred (mock mutation 1), no receipt — a landed effect without a durable record is uncertainty |
+| rh-06 | Success-shaped response, wrong resulting item set | INDETERMINATE, no receipt |
+| rh-07 | Unexpected mandatory addon | COMMITTED_AND_VERIFIED with reconciliation VIOLATED (landing attributable; the violation is reported, not rolled back) |
+| rh-08 | Unknown financial actuals | COMMITTED_UNVERIFIED, reconciliation UNVERIFIED |
+| rh-09 | Established envelope violation (inflated post-commit actuals) | reconciliation VIOLATED on the committed receipt |
+| rh-10 | Concurrent attempts, same subscription | second `beginDispatch` refused (DispatchBlockedError); exactly one unresolved attempt |
+| rh-11 | Idempotency-key conflict (same key, different request) | refused by the ledger |
+| rh-12 | Corrupted durable record (integrity-hash tamper) | adoption refused on open; `inspect()` reports the record corrupt |
+| rh-13 | Operator review of an unresolved attempt | `recoveryReport()` lists it INDETERMINATE with intervention required; reporting resolves nothing |
+| rh-14 | Pre-effect rejection (400 + `param_wrong_value`) | CONFIRMED_NON_EXECUTION; provider state untouched |
+
+## 6. Readiness model
+
+Conditions 1–5 each report PASS / BLOCKED / UNVERIFIED with evidence
+and reasons. Rules enforced by construction (and pinned by
+test37.3/37.4): the aggregate can be at most
+READY_FOR_HUMAN_REVIEW, and only with all five PASS and zero
+blockers; condition 1 is PASS only from an operator-supplied
+release-approval record (merged PRs #17–#19 are explicitly not
+evidence); condition 2 may cite the rehearsal — labeled SIMULATED;
+condition 3 is PASS only for a `real`-origin run with no blockers
+(mocked/injected evidence leaves it UNVERIFIED); conditions 4 and 5
+record operator-supplied inputs — the software grants neither.
+On the evidence that exists today the assessment is **NO-GO**
+(1 UNVERIFIED, 2 PASS-simulated, 3 UNVERIFIED, 4 BLOCKED, 5
+BLOCKED), matching GO-NO-GO Decision 2, which PR-11 does not change
+(see the dated addendum in `research/chargebee-pilot/GO-NO-GO.md`).
+
+## 7. Failing-first evidence
+
+test37 + test38 were written against unmodified main (`963be0b`)
+before any implementation. `npm run build` failed with 33
+TypeScript errors, ALL inside the two new test files (30 in test37,
+3 in test38): TS2307 (the `preflight.js` / `rehearsal.js` modules
+did not exist) plus the cascading implicit-any errors that follow
+from unresolved imports. Zero errors in any pre-existing file; the
+pre-existing suite stood at the parent's verified 529/529 baseline.
+(The count is the measured one, reproduced post-delivery in a clean
+worktree at `963be0b` with the two test files copied in: 33.) After implementation:
+572/572 (529 + 43 new: test37 ×27, test38 ×16). No pre-existing test
+file was modified in this PR. One expectation was corrected during
+development on the code's own evidence, not weakened: the mandatory
+-addon rehearsal scenario — the shipped PR-7/PR-9 doctrine records
+an attributable landing with reconciliation VIOLATED rather than
+INDETERMINATE (probe-verified against the adapter before the
+expectation was changed; rh-07/test38.8 now pin the doctrine).
+
+## 8. Deliverables and verification
+
+- `src/live/pilot/preflight.ts` — the preflight (report + Markdown +
+  readiness model + guarded transport factory).
+- `src/live/pilot/rehearsal.ts` — `runRehearsal()`.
+- `src/live/pilot/run-preflight.ts` + `preflight:chargebee` npm
+  script — CLI consistent with `pilot:chargebee` (same build-then-run
+  shape; mocked by default; `--live` requires env credentials +
+  `--db`/`--quote` and otherwise reports BLOCKED, never fabricates).
+- `research/chargebee-pilot/runs/preflight-mocked-2026-10-29/` —
+  sample sanitized JSON + Markdown from an actual mocked CLI run,
+  labeled SIMULATED in its README.
+- `research/chargebee-pilot/OPERATOR-RECONCILIATION-RUNBOOK.md` —
+  the 10-step reconciliation procedure with BLANK owner/backup/
+  timestamp/evidence/decision/uncertainty/sign-off fields. Nothing
+  is filled in; a rehearsal does not constitute acceptance.
+- `research/chargebee-pilot/GO-NO-GO.md` — dated addendum appended;
+  the 2026-10-28 decisions are unrewritten and stand.
+- Verification at delivery: fresh clean build + full suite 572/572;
+  cold-cache `smoke:pack` OK; demo OK; demo:commit OK; existing
+  pilot harness SIMULATED_PASS with 0 observed mutating calls;
+  neutrality grep clean (core untouched); frozen-surface diff empty
+  (no spec, `types.ts`, or `scq-engine.ts` change — the freeze guard
+  is not expected to trip and no label is needed or applied).
+
+## 9. Remaining human / spec approvals (unchanged by this PR)
+
+1. v0.6.2 specification/release approval (condition 1) — a human
+   act, separate from all merges to date.
+2. An executed preflight against the real test tenant for a
+   specific proposed commit (condition 3) — requires credentials
+   and the F1 per-run site approval at that time.
+3. A named reconciliation owner (+ backup) who accepts the runbook
+   (condition 4).
+4. A separate authorization for the exact controlled test-site
+   commit (condition 5), naming tenant, resource, action, and
+   billable effect.
+
+Until all four exist, the controlled test-site commit remains
+NO-GO, and nothing in this PR performs, schedules, or simulates
+authorization for one.
+
+## 10. PR #20 review corrections — PF1–PF3 (2026-10-30)
+
+The independent review of the delivered PR (`d13767c`) found three
+material gaps in the preflight's evidence and authorization
+checks. All three are corrected on this branch; the readiness
+conclusion is unchanged (NO-GO), and Condition 3 is now HARDER to
+pass, not easier. Where this section contradicts §2 or §6, this
+section governs.
+
+**PF1 (critical) — simulated evidence could be mislabeled as
+live.** `PreflightInput` took a caller-supplied transport AND a
+caller-asserted `transportOrigin: "real"`; `runPreflight` passed
+the string through and set Condition 3 = PASS whenever it read
+`"real"` with no blockers. A mocked transport labeled `"real"`
+produced LIVE_PASS and a real-tenant preflight PASS, and Condition
+3 never required operator attestation. **Correction — provenance
+is structural now.** The origin input is REMOVED. A caller-supplied
+transport is always classified `injected` (simulated evidence,
+capped at SIMULATED_PASS); the only LIVE-eligible source is the
+preflight module's own internally constructed guarded real-network
+transport, obtained from `createRealPreflightTransport()` and
+carrying a module-private brand symbol a caller cannot forge (a
+caller-assembled handle is refused outright). This mirrors the
+pilot harness's internally constructed network path (run-pilot).
+Condition 3 PASS additionally requires: `operatorAttestation.
+testTenantAttested`, an ESTABLISHED quote-origin binding (PF3), a
+completed re-read whose provider subscription identity was
+verified, no refusal, and zero blockers — with every unmet
+requirement named in the condition's reason.
+
+**PF2 (critical) — "exact request" validation checked only the
+changed item.** `request_matches_proposal` asserted the one changed
+item's quantity against the proposal; other items' quantities,
+extras, duplicates, and omissions went unchecked (counterexample:
+stored target keeps addon 21 but moves the flat-fee plan quantity
+1→2 — every pre-correction check, including the fresh estimate,
+passed while the exact request would change a second, unauthorized
+item). **Correction — full resulting-multiset validation.** The
+check now runs AFTER the independent re-read: the authorized
+resulting set is reconstructed by applying the recorded proposal
+to the re-read's CURRENT item set (mirroring the adapter's target
+construction; the baseline is the independent read, NEVER the
+possibly tainted preview input) and compared as a multiset of
+(itemPriceId, quantity) tuples against the stored dispatch target.
+Any divergence — non-target quantity change, extra entry,
+duplicate, omission — blocks, with per-item divergences named.
+Multi-change proposals and actions outside CHANGE_QUANTITY /
+CHANGE_PLAN block as unsupported. Until the validation runs
+(refused runs, failed re-reads, incomplete baselines), coherence is
+reported NOT established — it cannot default to PASS. The shared
+builder / form / `requestHashOf` semantics are unchanged.
+
+**PF3 (high) — original site binding was unproven.**
+`siteBindingOk` / `subscriptionMatch` stayed null unless optional
+`expectedSite` / `expectedSubscriptionId` were supplied (the normal
+CLI supplied neither): zero blockers beside two nulls, and in any
+case agreement between two caller inputs is not evidence the quote
+ORIGINATED on that site. **Correction — issuance-captured origin
+manifest.** New pilot-layer module `quote-origin.ts`: an
+append-only JSONL manifest whose records are written at quote
+issuance (by the issuance path, with the site from that run's
+configuration), keyed by quote id and carrying the ledger-canonical
+digest (`requestHashOf`) of the stored quote's issuance-stable
+fields. The preflight derives `siteBindingOk` /
+`subscriptionMatch` from the record — ESTABLISHED only when record
+site = run site, record subscription = stored subscription, and
+the digest still matches the stored quote. No record (MISSING),
+conflicting records, a corrupt manifest, a digest mismatch, or a
+cross-site replay (MISMATCH) all BLOCK. The re-read's returned
+subscription id is also checked against the bound id
+(`provider_subscription_identity`). `expectedSite` /
+`expectedSubscriptionId` remain as consistency inputs only, with
+their evidentiary weight explicitly removed. The normal CLI
+participates: the mocked fixture path records origin at issuance,
+and `--db/--quote` reads `--origin-manifest` (default
+`<db>.origins.jsonl`) — no more null-by-default. The gated core and
+store surfaces are untouched (the manifest is pilot-layer; the
+store is only read). **Subsequent binding work:** a production
+issuance harness must call the manifest's `record` at its own
+quote-creation step with its configured site; until a real
+issuance path does so, real quotes have no origin record and
+Condition 3 stays BLOCKED/UNVERIFIED for them — which is the
+honest state, and this PR does not claim otherwise.
+
+**Failing-first evidence (this round).** test39 + test40 were
+written against the delivered head `d13767c` before any fix.
+test39 (which uses only pre-correction exports, the PF1 attack
+smuggled through a cast in the reviewer's exact shape) ran
+BEHAVIORALLY: **8 fail / 2 pass** — PF1 forgery (39.1), PF1
+attestation-free "real" (39.2), PF2 plan-quantity counterexample
+(39.4), extra item (39.5), duplicate (39.6), omitted item (39.7 —
+the run was already blocked pre-correction by the ID-coverage
+check; the regression is that the coherence check itself must
+judge the full multiset), PF3 null binding (39.9), PF3 provider-id
+mismatch (39.10). The 2 passes are disclosed controls: 39.3 (a
+plainly mocked run already classified SIMULATED_PASS) and 39.8
+(the canonical target already passed the coherence check).
+test40 — the origin-manifest and structural-provenance mechanics —
+failed to compile pre-correction with **12 TypeScript errors, all
+inside test40** (TS2307: `quote-origin.js` did not exist; TS2305:
+`createRealPreflightTransport` was not exported). After the
+corrections: **fresh clean build 591/591** (572 + test39 ×10 +
+test40 ×9); test27–36 and the pilot/rehearsal suites green
+unmodified; smoke/demo/pilot green (pilot: 0 observed mutating
+calls).
+
+**Disclosed test modifications (this round).** test37's fixture
+builder now records the fixture quote's origin at issuance and its
+`preflightInput` passes the manifest (mirroring the corrected CLI),
+and the three inline `runPreflight` inputs that named the removed
+`transportOrigin` property no longer do; **no test37 assertion was
+changed**. test39's fixture received the same issuance-origin
+wiring after its failing-first run was recorded (the
+pre-correction code has no origin concept, so the recorded
+failures are unaffected); its PF3 test withholds the manifest
+explicitly.
+
+**Final Condition 3 semantics.** PASS iff ALL of: structural
+real-network provenance; operator test-tenant attestation
+supplied; quote-origin binding ESTABLISHED; independent re-read
+completed with provider subscription identity verified; not
+refused; zero blockers. Anything less is UNVERIFIED (no blockers)
+or BLOCKED (blockers stand), with the unmet requirements named.
+On all evidence that exists today Condition 3 remains UNVERIFIED
+and the overall assessment remains **NO-GO**.
+
+**Changed in this round:** `src/live/pilot/quote-origin.ts` (new),
+`src/live/pilot/preflight.ts`, `src/live/pilot/run-preflight.ts`,
+`tests/test37-chargebee-preflight.test.ts` (fixture wiring only),
+`tests/test39-chargebee-preflight-pf-regressions.test.ts` (new),
+`tests/test40-chargebee-preflight-origin.test.ts` (new), the
+regenerated sample run under
+`research/chargebee-pilot/runs/preflight-mocked-2026-10-29/`
+(binding now ESTABLISHED from the issuance record; provenance
+reported `injected`), and this note. Frozen-surface diff remains
+empty: no spec, `types.ts`, `scq-engine.ts`, or store-layer file
+changed in this round or this PR.
+
+## 11. PF3 hardening — manifest substitution protection (2026-10-30, re-review)
+
+The re-review requirement, verbatim: "the quote-origin manifest
+must be created at quote issuance and protected against later
+substitution. It must bind the quote identity, originating site,
+subscription ID, and relevant record digest. A manifest
+reconstructed from caller-supplied preflight inputs would not
+establish independent provenance."
+
+**Audit of the §10 design (head `fce79d3`).** What already held:
+records are created ONLY at issuance (the CLI's mocked-issuance
+path, with the site from that run's configuration; the
+`--db/--quote` path only loads), `runPreflight` never records, and
+consumption already failed closed on missing / conflicting /
+corrupt / digest-mismatched evidence. Three gaps remained:
+
+- **GAP 1 — the record's own fields were not digest-bound.** The
+  v1 `quoteDigest` covers only the stored quote's issuance-stable
+  fields. The record's `site` — the very fact the manifest exists
+  to attest — could be edited in the JSONL line after issuance and
+  every check stayed green: the quote digest still matched, and
+  the site comparison then ran against the tampered value. Attack:
+  quote issued on approved site A; edit the line's site A→B; run
+  the preflight configured for approved site B with a coinciding
+  subscription id → binding ESTABLISHED for the wrong site.
+- **GAP 2 — substitution-by-append was refused only at read.** The
+  writer accepted a second record for the same quote id; only the
+  reader's conflict rule blocked it.
+- **GAP 3 — no file-level integrity.** Lines could be edited,
+  reordered, or the file rewritten wholesale and nothing in the
+  file evidenced it.
+
+**Design (record format v2, pilot layer only —
+`src/live/pilot/quote-origin.ts`).**
+
+1. **Record self-digest.** Every record now carries
+   `recordDigest`: `requestHashOf` over the COMPLETE record
+   content — kind, version, quoteId, provider, site,
+   subscriptionId, quoteDigest, recordedAt, recordedBy, and the
+   chain link — so the quote identity, originating site,
+   subscription id, and quote digest are all bound into the record
+   itself. Any post-issuance edit to any field invalidates it.
+2. **Hash chain.** Every record carries `prevRecordDigest`: the
+   record digest of the preceding record in the manifest, or the
+   fixed genesis constant `scq-quote-origin-chain-genesis-v2` for
+   the first. Loading verifies, in file order, every record's
+   self-digest AND the chain linkage. Any break — edit, reorder,
+   insertion, deletion of a non-final record — marks the manifest
+   CORRUPT, and consumers fail closed exactly as before (blocker;
+   Condition 3 cannot PASS).
+3. **One-time writer.** `record()` throws when any record already
+   exists for the same quote id — issuance is once-only, so
+   substitution-by-append is refused at write time. It also throws
+   when appending to a manifest that failed integrity verification.
+   A conflicting record appended by raw file edit continues to
+   block at read, via both the existing conflict rule and the
+   broken digest/chain.
+4. **Version policy.** Version-1 or unknown-version records
+   predate self-digest/chain binding and are untrustworthy: a
+   manifest containing one is corrupt and fails closed. Nothing
+   external persists v1 records (the manifest is written and read
+   within this pilot layer), so no migration path is offered.
+5. **Consumption unchanged in spirit.** The preflight treats
+   self-digest/chain failure identically to corruption. No path
+   from `runPreflight` or the CLI load mode calls `record()` —
+   issuance paths only (pinned by test41.9: a preflight run leaves
+   the manifest file byte-identical).
+
+**Failing-first (test41, written against `fce79d3` before the
+fix; 6 fail / 4 pass pre-fix, 10/10 post-fix).**
+
+| Test | Pre-fix | Post-fix | Class |
+| --- | --- | --- | --- |
+| 41.1 site substitution A→B, preflight run for B | FAIL — tampered record loaded as trustworthy (not corrupt); the binding comparison ran against the substituted site and established | Blocker; manifest corrupt; binding not ESTABLISHED; NO-GO | merits failure (GAP 1) |
+| 41.2 quoteDigest substitution | pass (blocked by the quote-digest comparison) | Blocker (also self-digest failure) | control |
+| 41.3 subscriptionId substitution | pass (blocked: record does not belong to this quote) | Blocker (also self-digest failure) | control |
+| 41.4 writer second record for same quote | FAIL — `record()` accepted it | Throws; file and memory still hold exactly the original record | merits failure (GAP 2) |
+| 41.5 conflicting record via raw append | pass (blocked by the conflict rule) | Blocker (conflict rule + broken chain/digest) | control |
+| 41.6 non-final line deletion | FAIL — deletion invisible; surviving record still bound | Chain break → corrupt → blocker | merits failure (GAP 3) |
+| 41.7 line reordering | FAIL — order irrelevant pre-fix; record still bound | Chain break → corrupt → blocker | merits failure (GAP 3) |
+| 41.8 v1-format record | FAIL — v1 record trusted and bound | Corrupt → fails closed | merits failure (version policy) |
+| 41.9 preflight leaves manifest byte-identical | pass | pass | control |
+| 41.10 untouched v2 record binds end-to-end | FAIL on the new-format assertions only (no `recordDigest`/`prevRecordDigest` fields exist pre-fix); the binding assertions themselves held pre-fix | pass — ESTABLISHED, simulated classification only, no LIVE_PASS | positive control + new-format checks |
+
+**Disclosed test change outside test41.** test40.5 previously
+introduced its conflicting record through a second `record()` call
+for the same quote; the one-time writer now refuses that by
+design, so the conflict is introduced by raw file append + reload
+instead. Assertions unchanged (blocker + MISMATCH); the change is
+fixture mechanics only, justified here and in the test.
+
+**Honest limits — what this does NOT do.** This is
+tamper-EVIDENCE within the manifest file, not tamper-proofing. A
+privileged writer holding BOTH the manifest and the durable
+database could rewrite the file with a fully recomputed chain (and
+a quote digest recomputed over a substituted stored quote) and
+nothing in the file alone would evidence it. Defeating that
+requires an external trust anchor — an issuance countersignature
+or a WORM/append-only store outside the writer's control — which
+is named subsequent work, not claimed here. Operational control of
+the manifest file remains part of the real-tenant evidence story.
+Condition 3 semantics are unchanged by this hardening: PASS still
+requires structural real provenance, attestation, an ESTABLISHED
+binding from an issuance record, verified provider identity, and
+zero blockers; the overall assessment remains NO-GO.
+
+## 12. PF4 + PF5 — provenance handle opacity and the Condition 3 unknown gate (2026-10-30, re-review)
+
+Two findings remained after §10/§11. PF2 and the §11 manifest
+hardening were accepted by the reviewer; this section governs over
+§2/§6/§10 wording where they describe the transport handle or the
+Condition 3 gate.
+
+### PF4 — live-evidence provenance was still forgeable through the genuine handle
+
+**Audit of the §10 design (head `2899921`).** PF1 made provenance
+structural via a module-private brand on the handle returned by
+`createRealPreflightTransport()` — but the handle carried the
+genuine guarded transport and its observed log as WRITABLE public
+properties, and `runPreflight` trusted those properties as the
+live network path and its evidence log. The reviewer's
+counterexample: call the factory once (no network request needed),
+overwrite `handle.transport` and `handle.log` with a mocked
+guarded transport and its log, and the preflight produced
+LIVE_PASS classification and a Condition 3 PASS from simulated
+responses (with attestation and a v2 origin manifest supplied). A
+private Symbol cannot fix this class: the symbol is readable off
+any genuine handle via `Object.getOwnPropertySymbols`, and a
+copied brand is indistinguishable from a genuine one. Test40.7
+exercised only a wholly caller-assembled object without the
+symbol; it did not cover modification or replay of a genuine
+handle.
+
+**Design (pilot layer only — `src/live/pilot/preflight.ts`).**
+
+1. **Opaque handle.** `createRealPreflightTransport()` now returns
+   a handle exposing NO transport, no log, and no other state. Its
+   only meaning is its object identity.
+2. **Module-private registry.** The factory — which takes NO
+   caller transport — constructs the guarded real-network
+   transport exactly as before and stores `{ transport, log }` in
+   a module-private `WeakMap` keyed by the handle.
+   `runPreflight` resolves real-mode exclusively through this
+   registry and NEVER reads handle properties. A mutated handle, a
+   clone, and a property-copied forgery (own keys including
+   symbols, copied via `Reflect.ownKeys`) are all simply absent
+   from the registry and are refused with the same error as a
+   caller-assembled handle. The PF1 brand check is gone; registry
+   membership is the only authority.
+3. **The authoritative log never leaves the module.** No
+   caller-reachable reference to the registry's log array exists:
+   the handle does not expose it, and reports carry only the
+   transport SUMMARY computed from it inside `runPreflight`. (The
+   handle is deliberately not frozen either: freezing was never
+   the control — a frozen handle with an externally reachable log
+   array would still leak the evidence, which is why the log lives
+   only in the registry.)
+4. **Injected path unchanged.** A caller-supplied transport is
+   still wrapped by `createPreflightTransport` and always
+   classified injected/simulated.
+
+**Test seam, stated plainly.** Tests cannot place real network
+calls, yet the PF5 regressions need a structurally real run whose
+read completes. Test42 therefore stubs the platform `fetch`
+BENEATH the module's own `fetchTransport` (delegating to the
+synthetic pilot mock, restored after each test) while the
+transport itself comes from `createRealPreflightTransport()`.
+Provenance is a property of the module's construction, which the
+stub does not touch — the stub sits exactly where a proxy or DNS
+override would sit in a real deployment. This is a property of
+the test process only; no exported seam exists, and no caller of
+the module can use it to upgrade evidence (a host that replaces
+its own process's `fetch` is outside the module's trust boundary
+by definition, like a host that controls its own network).
+LIVE_PASS classifications inside those synthetic harness runs
+classify the structural path only and are never presented as
+real-tenant evidence.
+
+### PF5 — UNKNOWN scheduled-change status could not stop a Condition 3 PASS
+
+**Audit.** The independent read correctly reports
+`has_scheduled_changes` / `has_scheduled_advance_invoices` as
+UNKNOWN when the provider response omits them (never fabricated
+as "none"). But the Condition 3 aggregation counted only
+BLOCKERS: an unknown check is not a blocker, so a structurally
+real run with attestation, established origin, verified identity,
+and no blockers marked Condition 3 PASS while unable to establish
+whether outstanding scheduled changes or advance invoices would
+be disturbed — the exact interferences issue #12 and
+COMMIT-RECOVERY-SAFETY §2 require checking. Uncertainty was
+silently treated as clearance. The same shape applied to request
+coherence: an unresolved `request_matches_proposal` (no
+independent baseline) also could not stop a PASS on its own.
+
+**Design.** The Condition 3 gate now evaluates safety-critical
+UNKNOWN checks explicitly (`COND3_UNKNOWN_GATES` in
+`runPreflight`): `scheduled_changes`,
+`scheduled_advance_invoices`, and `request_matches_proposal`.
+Each unresolved one appends a named unmet requirement — e.g.
+"scheduled-change status is UNKNOWN — the provider read did not
+establish whether outstanding scheduled changes exist that this
+change would disturb; uncertainty is not clearance". The other
+safety-critical unknowns were already gated by dedicated
+requirements and remain so (operator attestation; provider
+subscription identity via the verified-identity requirement).
+Status mapping is unchanged: unknowns alone yield UNVERIFIED;
+BLOCKED still requires blockers. Both flags provider-reported
+false leave the gate fully permeable (test42.10: Condition 3 PASS
+on the structurally real path), and both flags TRUE still block
+exactly as before (test42.11).
+
+**Failing-first (test42, written against `2899921` before the
+fix; profile verified twice, including a stash re-run of the
+final file against the pre-fix source: 7 fail / 4 pass pre-fix,
+11/11 post-fix).**
+
+| Test | Pre-fix | Post-fix | Class |
+| --- | --- | --- | --- |
+| 42.1 genuine handle, transport + log overwritten with a mock's (reviewer's counterexample) | FAIL — the substituted mock served the read (4 run calls), its log became the evidence: LIVE_PASS + Condition 3 PASS | Substituted mock never invoked by the run; no LIVE_PASS; provider state null; Condition 3 not PASS | merits failure (PF4) |
+| 42.2 forged handle copying all own properties incl. symbols from a genuine handle | FAIL — accepted (brand copied); run resolved instead of refusing | Refused: not in the registry | merits failure (PF4) |
+| 42.3 genuine handle, ONLY log replaced (fabricated log incl. a dispatched update_for_items) | FAIL — the fabricated log was summarized into the report: updateForItemsDispatched 1, mutatingCalls 1 | Report evidence computed from the registry's log only: 0 / 0 | merits failure (PF4) |
+| 42.4 genuine handle, ONLY transport replaced | FAIL — mock responses became provider state; Condition 3 PASS | Mock never invoked by the run; provider state null; Condition 3 not PASS | merits failure (PF4) |
+| 42.5 unmutated genuine handle, no network | pass — provenance "real", read fails closed, NO-GO | pass (identical) | control |
+| 42.6 the genuine handle exposes no transport / no log | FAIL — both properties present and writable | Both absent; authority is the registry | merits failure (PF4) |
+| 42.7 real-path run, provider omits has_scheduled_changes | FAIL — Condition 3 PASS (blockers [] and the unknown counted for nothing) | Condition 3 UNVERIFIED; reason names the UNKNOWN scheduled-change status | merits failure (PF5) |
+| 42.8 real-path run, provider omits has_scheduled_advance_invoices | FAIL — Condition 3 PASS | Condition 3 UNVERIFIED; reason names the UNKNOWN advance-invoice status | merits failure (PF5) |
+| 42.9 injected run, both flags present and false | pass — Condition 3 UNVERIFIED (provenance), no scheduled-change reason | pass (identical) | control |
+| 42.10 real-path run, both flags present and false | pass — Condition 3 PASS | pass — the gate permits when the facts are established | positive control |
+| 42.11 both flags present and TRUE | pass — both checks blocker; Condition 3 BLOCKED | pass (identical) | control |
+
+**Disclosures.**
+
+- *Test42 assertion correction during development:* 42.1/42.4
+  initially asserted the mock's TOTAL call count was zero; the
+  fixture's own issuance also calls the mock, so the assertions
+  are now run-relative (the count must not increase during the
+  preflight run). The correction does not change any outcome:
+  pre-fix the run adds its calls and both tests still fail on the
+  merits — re-verified by running the final file against the
+  pre-fix source (stash), same 7 fail / 4 pass profile.
+- *No pre-existing test file was modified in this round.*
+  Test40.7's forged-handle rejection and test40.8's genuine-path
+  behavior hold unchanged against the registry design (the
+  rejection error text still names the factory); test37.20's
+  UNKNOWN reporting is unchanged — only the Condition 3
+  aggregation learned to count it.
+- *Sample mocked run NOT regenerated:* the CLI's mocked run was
+  re-executed into a scratch directory under the corrected code
+  and compared with the committed sample after normalizing
+  run-volatile fields (timestamps, generated ids/digests). The
+  reports are identical in substance — the sample's path is
+  injected (PF4 does not touch its shape) and its scheduled flags
+  are provider-reported false (the PF5 gate adds nothing) — so the
+  committed sample stands as accurate.
+
+**Verification.** Fresh clean build (`rm -rf node_modules dist &&
+npm ci`, Node 22.14): **612/612** (601 baseline + test42 ×11).
+Demo, demo:commit, smoke:pack, and the pilot harness all pass;
+pilot reports 0 observed mutating calls. Gated-surface diff for
+the round and for the whole PR remains **0 lines** (`spec/*`,
+`reference/src/core/types.ts`, `reference/src/core/scq-engine.ts`,
+and `reference/src/store/*` untouched) — the freeze guard is
+expected to PASS and no label is needed or applied. Condition 3
+semantics are otherwise unchanged, PF2 and the §11 hardening are
+untouched, and the overall assessment remains NO-GO: the
+controlled Chargebee test-site commit still requires the four
+human/spec approvals of §9.
