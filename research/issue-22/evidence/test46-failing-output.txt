@@ -1,0 +1,141 @@
+TAP version 13
+# === TEST46 EVIDENCE 46.1 (observed on unmodified main) ===
+# {
+#   "recordedCandidates": {
+#     "immediate": null,
+#     "recurring": 80900
+#   },
+#   "evidenceEstablishes": {
+#     "immediate": 20000,
+#     "recurring": 80900
+#   },
+#   "verifyRefused": "Verification refused: the evidence's committed figures (immediate.net=20000, recurring.resultingAmount=80900) contradict the figures recorded on the receipt for quote scq_cblive_43d40ffb2dc70900 (imme",
+#   "verifiedViewImmediate": null
+# }
+# === END TEST46 EVIDENCE ===
+# === TEST46 EVIDENCE 46.2 (observed on unmodified main) ===
+# {
+#   "recordedCandidateRecurring": 80900,
+#   "establishedActualRecurring": 83400,
+#   "verifyRefused": "Verification refused: the evidence's committed figures (immediate.net=20000, recurring.resultingAmount=83400) contradict the figures recorded on the receipt for quote scq_cblive_237a92303dc415bb (imme",
+#   "verifiedViewRecurring": null,
+#   "verifiedViewReconciliation": null
+# }
+# === END TEST46 EVIDENCE ===
+# === TEST46 EVIDENCE 46.3 (observed on unmodified main) ===
+# {
+#   "viewOutcome": "COMMITTED_AND_VERIFIED",
+#   "viewReconciliation": "OK",
+#   "viewCommittedDeterminacy": {
+#     "immediateFinancialEffect": "UNKNOWN",
+#     "recurringFinancialEffect": "UNKNOWN"
+#   },
+#   "viewCommittedSource": "unestablished"
+# }
+# === END TEST46 EVIDENCE ===
+# Subtest: Test 46.1 (Issue \#22 F5a): later evidence establishing a dimension the receipt left candidate-less must be recordable, not refused as an identity conflict
+not ok 1 - Test 46.1 (Issue \#22 F5a): later evidence establishing a dimension the receipt left candidate-less must be recordable, not refused as an identity conflict
+  ---
+  duration_ms: 16.200631
+  location: '/home/hatch/workspace/subscription-change-quote/reference/dist/tests/test46-receipt-verification.test.js:79:1'
+  failureType: 'testCodeFailure'
+  error: |-
+    establishing a previously-missing dimension must be recordable as appended evidence, not refused as CONFLICTING_RECEIPT_IDENTITY
+    + actual - expected
+    
+    + SCQError: Verification refused: the evidence's committed figures (immediate.net=20000, recurring.resultingAmount=80900) contradict the figures recorded on the receipt for quote scq_cblive_43d40ffb2dc70900 (immediate.net=null, recurring.resultingAmount=80900); evidence about different figures cannot verify this record.
+    +     at QuoteStore.assertEvidenceValid (file:///home/hatch/workspace/subscription-change-quote/reference/dist/src/store/quote-store.js:348:19)
+    +     at QuoteStore.verifyCommitReceipt (file:///home/hatch/workspace/subscription-change-quote/reference/dist/src/store/quote-store.js:435:14)
+    +     at TestContext.<anonymous> (file:///home/hatch/workspace/subscription-change-quote/reference/dist/tests/test46-receipt-verification.test.js:101:26)
+    +     at async Test.run (node:internal/test_runner/test:980:9)
+    +     at async startSubtestAfterBootstrap (node:internal/test_runner/harness:296:3) {
+    +   code: 'CONFLICTING_RECEIPT_IDENTITY',
+    +   details: {
+    +     quoteId: 'scq_cblive_43d40ffb2dc70900',
+    +     receiptId: undefined
+    +   }
+    + }
+    - undefined
+    
+  code: 'ERR_ASSERTION'
+  name: 'AssertionError'
+  actual:
+  error: "Verification refused: the evidence's committed figures (immediate.net=20000, recurring.resultingAmount=80900) contradict the figures recorded on the receipt for quote scq_cblive_43d40ffb2dc70900 (immediate.net=null, recurring.resultingAmount=80900); evidence about different figures cannot verify this record."
+  stack: |-
+    QuoteStore.assertEvidenceValid (file:///home/hatch/workspace/subscription-change-quote/reference/dist/src/store/quote-store.js:348:19)
+    QuoteStore.verifyCommitReceipt (file:///home/hatch/workspace/subscription-change-quote/reference/dist/src/store/quote-store.js:435:14)
+    TestContext.<anonymous> (file:///home/hatch/workspace/subscription-change-quote/reference/dist/tests/test46-receipt-verification.test.js:101:26)
+    async Test.run (node:internal/test_runner/test:980:9)
+    async startSubtestAfterBootstrap (node:internal/test_runner/harness:296:3)
+  operator: 'strictEqual'
+  stack: |-
+    TestContext.<anonymous> (file:///home/hatch/workspace/subscription-change-quote/reference/dist/tests/test46-receipt-verification.test.js:114:12)
+    async Test.run (node:internal/test_runner/test:980:9)
+    async startSubtestAfterBootstrap (node:internal/test_runner/harness:296:3)
+  ...
+# Subtest: Test 46.2 (Issue \#22 F5b): evidence establishing a DIFFERENT actual than the recorded candidate must be recordable (verified-with-violation), not refused as an identity conflict
+not ok 2 - Test 46.2 (Issue \#22 F5b): evidence establishing a DIFFERENT actual than the recorded candidate must be recordable (verified-with-violation), not refused as an identity conflict
+  ---
+  duration_ms: 3.369124
+  location: '/home/hatch/workspace/subscription-change-quote/reference/dist/tests/test46-receipt-verification.test.js:120:1'
+  failureType: 'testCodeFailure'
+  error: |-
+    a differing established actual must be recordable as appended evidence, not refused as CONFLICTING_RECEIPT_IDENTITY
+    + actual - expected
+    
+    + SCQError: Verification refused: the evidence's committed figures (immediate.net=20000, recurring.resultingAmount=83400) contradict the figures recorded on the receipt for quote scq_cblive_237a92303dc415bb (immediate.net=20000, recurring.resultingAmount=80900); evidence about different figures cannot verify this record.
+    +     at QuoteStore.assertEvidenceValid (file:///home/hatch/workspace/subscription-change-quote/reference/dist/src/store/quote-store.js:348:19)
+    +     at QuoteStore.verifyCommitReceipt (file:///home/hatch/workspace/subscription-change-quote/reference/dist/src/store/quote-store.js:435:14)
+    +     at TestContext.<anonymous> (file:///home/hatch/workspace/subscription-change-quote/reference/dist/tests/test46-receipt-verification.test.js:143:26)
+    +     at async Test.run (node:internal/test_runner/test:980:9)
+    +     at async Test.processPendingSubtests (node:internal/test_runner/test:677:7) {
+    +   code: 'CONFLICTING_RECEIPT_IDENTITY',
+    +   details: {
+    +     quoteId: 'scq_cblive_237a92303dc415bb',
+    +     receiptId: undefined
+    +   }
+    + }
+    - undefined
+    
+  code: 'ERR_ASSERTION'
+  name: 'AssertionError'
+  actual:
+  error: "Verification refused: the evidence's committed figures (immediate.net=20000, recurring.resultingAmount=83400) contradict the figures recorded on the receipt for quote scq_cblive_237a92303dc415bb (immediate.net=20000, recurring.resultingAmount=80900); evidence about different figures cannot verify this record."
+  stack: |-
+    QuoteStore.assertEvidenceValid (file:///home/hatch/workspace/subscription-change-quote/reference/dist/src/store/quote-store.js:348:19)
+    QuoteStore.verifyCommitReceipt (file:///home/hatch/workspace/subscription-change-quote/reference/dist/src/store/quote-store.js:435:14)
+    TestContext.<anonymous> (file:///home/hatch/workspace/subscription-change-quote/reference/dist/tests/test46-receipt-verification.test.js:143:26)
+    async Test.run (node:internal/test_runner/test:980:9)
+    async Test.processPendingSubtests (node:internal/test_runner/test:677:7)
+  operator: 'strictEqual'
+  stack: |-
+    TestContext.<anonymous> (file:///home/hatch/workspace/subscription-change-quote/reference/dist/tests/test46-receipt-verification.test.js:157:12)
+    async Test.run (node:internal/test_runner/test:980:9)
+    async Test.processPendingSubtests (node:internal/test_runner/test:677:7)
+  ...
+# Subtest: Test 46.3 (Issue \#22 F5c): after a confirming verification, the current view must not present VERIFIED/OK over figures still labeled UNKNOWN / "unestablished"
+not ok 3 - Test 46.3 (Issue \#22 F5c): after a confirming verification, the current view must not present VERIFIED/OK over figures still labeled UNKNOWN / "unestablished"
+  ---
+  duration_ms: 3.596214
+  location: '/home/hatch/workspace/subscription-change-quote/reference/dist/tests/test46-receipt-verification.test.js:168:1'
+  failureType: 'testCodeFailure'
+  error: `the verified view presents COMMITTED_AND_VERIFIED/OK while its displayed committed figures remain determinacy UNKNOWN with committedSource "unestablished" — the displayed provenance contradicts the verdict; the derived view must carry the establishing evidence's provenance (or an explicit verified-view marker) rather than the candidate's labels`
+  code: 'ERR_ASSERTION'
+  name: 'AssertionError'
+  expected: true
+  actual: false
+  operator: '=='
+  stack: |-
+    TestContext.<anonymous> (file:///home/hatch/workspace/subscription-change-quote/reference/dist/tests/test46-receipt-verification.test.js:195:12)
+    async Test.run (node:internal/test_runner/test:980:9)
+    async Test.processPendingSubtests (node:internal/test_runner/test:677:7)
+  ...
+1..3
+# tests 3
+# suites 0
+# pass 0
+# fail 3
+# cancelled 0
+# skipped 0
+# todo 0
+# duration_ms 115.452258
