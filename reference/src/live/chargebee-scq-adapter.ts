@@ -183,12 +183,16 @@
 //       recorded in the store and any later commit attempt on the
 //       quote is refused before any read or mutation — no blind
 //       retry), CONFIRMED_NON_EXECUTION (restricted, per the PR-7
-//       review correction L2, to DEMONSTRABLE pre-effect failures —
-//       an explicit provider validation rejection, HTTP 400; a
-//       blanket 4xx rule is unsupported: 408 timeouts, ambiguous
-//       429s, unclassified 4xx, and 422 idempotency conflicts carry
-//       no proof the request was never applied and classify as
-//       INDETERMINATE). HTTP 200 alone never verifies: the
+//       review corrections L2/L3, to DEMONSTRABLE pre-effect
+//       failures — an HTTP 400 carrying a specifically allowlisted
+//       documented validation api_error_code (see
+//       PRE_EFFECT_VALIDATION_ERROR_CODES); status 400 alone is
+//       not proof, since Chargebee also assigns 400 to payment and
+//       operation-stage failures. A blanket 4xx rule is
+//       unsupported: 408 timeouts, ambiguous 429s, unclassified
+//       4xx, non-allowlisted or code-less 400s, and 422 idempotency
+//       conflicts carry no proof the request was never applied and
+//       classify as INDETERMINATE). HTTP 200 alone never verifies: the
 //       intended item set must be established by an independent
 //       post-commit re-read, the financial actuals must be
 //       established (immediate from the mutating call's own
@@ -289,6 +293,55 @@ import { QuoteStore, type StoredQuote } from "../store/quote-store.js";
 import { ChargebeeClient, ChargebeeHttpError } from "./chargebee-http.js";
 
 const QUOTE_TTL_MS = 5 * 60 * 1000;
+
+/**
+ * PR-7 review correction L3: the ONLY Chargebee api_error_codes for
+ * which an HTTP 400 on the mutating call establishes
+ * CONFIRMED_NON_EXECUTION. HTTP status 400 alone is NOT evidence of
+ * pre-effect rejection: Chargebee's official error-handling
+ * documentation (apidocs chargebee.com/docs/api/error-handling)
+ * assigns 400 to payment errors (type `payment`) and other
+ * operation-stage failures as well as to request-validation errors.
+ * A 400 qualifies here only when its api_error_code is one of these
+ * specifically documented REQUEST-VALIDATION codes — both are
+ * grouped by that documentation under "Invalid Request Errors"
+ * (type `invalid_request`, HTTP 400), and the documentation states
+ * that API calls fail at the first error encountered while
+ * VALIDATING them, i.e. before the operation is processed:
+ *
+ *   - `param_required`    — a required parameter is absent; the
+ *                           request cannot enter processing at all.
+ *   - `param_wrong_value` — a parameter value does not meet its
+ *                           required specification; rejected at
+ *                           request validation.
+ *
+ * Both codes describe defects in THIS request's own shape/values,
+ * so neither carries prior-operation ambiguity: an idempotency key
+ * previously consumed by a processed request surfaces as HTTP 422
+ * (`duplicate_request` / `unable_to_process_request`), never as one
+ * of these 400 validation codes.
+ *
+ * Deliberately EXCLUDED (they fail closed to INDETERMINATE):
+ *   - payment-type 400s (`payment_processing_failed`,
+ *     `payment_method_verification_failed`, `payment_intent_invalid`,
+ *     `payment_intent_invalid_amount`, `payment_method_not_present`,
+ *     `payment_gateway_currency_incompatible`): payment/operation
+ *     stage — the provider may already have applied subscription or
+ *     ancillary financial effects;
+ *   - the generic `invalid_request` code: Chargebee documents it as
+ *     a generic code whose handling is recommended only in
+ *     combination with the `param` attribute, so the code alone
+ *     does not specifically establish a validation-stage rejection;
+ *   - state/configuration-dependent 400s (`duplicate_entry`,
+ *     `resource_limit_exhausted`, `resource_limit_exceeded`,
+ *     `configuration_incompatible`): not pure request validation;
+ *   - any unknown or MISSING api_error_code: no documented basis
+ *     exists for placing the failure at the validation stage.
+ */
+const PRE_EFFECT_VALIDATION_ERROR_CODES: ReadonlySet<string> = new Set([
+  "param_required",
+  "param_wrong_value",
+]);
 
 const COVERAGE: GuaranteeCoverage = {
   immediateFinancialEffect: "REVALIDATE",
@@ -1059,21 +1112,26 @@ export class ChargebeeLiveAdapter implements SubscriptionProvider {
       updateJson = res.json;
       idempotencyReplayed = res.idempotencyReplayed;
     } catch (e) {
-      if (e instanceof ChargebeeHttpError && e.httpStatus === 400) {
+      if (e instanceof ChargebeeHttpError && e.httpStatus === 400 && e.apiErrorCode !== undefined && PRE_EFFECT_VALIDATION_ERROR_CODES.has(e.apiErrorCode)) {
         // Demonstrable pre-effect rejection (CORE-5, restricted per
-        // PR-7 review correction L2): an explicit provider validation
-        // rejection (HTTP 400) refuses the request BEFORE anything is
-        // applied, with no prior-operation ambiguity — non-execution
-        // is demonstrable from the provider's own semantics. Record
-        // it distinctly from the indeterminate class; it carries the
-        // opposite retry rule (a fresh attempt may be made; nothing
-        // landed). This is the ONLY status classified here as
-        // CONFIRMED_NON_EXECUTION: a blanket 4xx rule is unsupported
-        // (see the unknown-dispatch branch below).
+        // PR-7 review corrections L2/L3): the provider refused the
+        // request at VALIDATION, before anything was applied, with
+        // no prior-operation ambiguity — non-execution is
+        // demonstrable from the provider's documented semantics for
+        // the SPECIFIC api_error_code (see
+        // PRE_EFFECT_VALIDATION_ERROR_CODES). HTTP 400 ALONE does
+        // not qualify: Chargebee also assigns 400 to payment and
+        // operation-stage failures (e.g. payment_processing_failed),
+        // which may follow partial effects, so a 400 with a
+        // payment-stage, unknown, or MISSING code falls through to
+        // the unknown-dispatch branch below and classifies
+        // INDETERMINATE. Record a qualifying rejection distinctly
+        // from the indeterminate class; it carries the opposite
+        // retry rule (a fresh attempt may be made; nothing landed).
         this.store.recordCommitOutcome(quoteId, {
           outcome: "CONFIRMED_NON_EXECUTION",
           at: this.now().toISOString(),
-          details: { httpStatus: e.httpStatus, apiErrorCode: e.apiErrorCode, reason: "the mutating request was rejected by the provider before effect (explicit validation rejection, HTTP 400)" },
+          details: { httpStatus: e.httpStatus, apiErrorCode: e.apiErrorCode, reason: "the mutating request was rejected by the provider before effect (documented pre-effect validation rejection: HTTP 400 with an allowlisted validation api_error_code)" },
         });
         const mapped = this.toSCQ(e, validated.subscription_id);
         throw new SCQError(mapped.code, mapped.message, { outcome: "CONFIRMED_NON_EXECUTION", httpStatus: e.httpStatus, apiErrorCode: e.apiErrorCode });
@@ -1085,7 +1143,9 @@ export class ChargebeeLiveAdapter implements SubscriptionProvider {
         // 5xx (cached under the idempotency key without establishing
         // application), 409, HTTP 408 (a timeout is not evidence the
         // request was never applied), ambiguous 429 rate-limit
-        // responses, unclassified 4xx, and 422 idempotency conflicts
+        // responses, unclassified 4xx, HTTP 400 WITHOUT an allowlisted
+        // pre-effect validation code (payment-stage, unknown, or
+        // missing api_error_code — review L3), and 422 idempotency conflicts
         // (duplicate_request establishes that THIS attempt was
         // rejected — NOT that the operation that originally consumed
         // the key did not execute; an earlier landing remains
@@ -1105,7 +1165,8 @@ export class ChargebeeLiveAdapter implements SubscriptionProvider {
    * v0.6.2 (PR-7, as corrected by review L1/L2): reconciles a
    * dispatch whose execution cannot be established (lost response,
    * transport failure, 408, ambiguous 429, 409, 5xx, 422 idempotency
-   * conflict, unclassified 4xx) from an independent post-dispatch
+   * conflict, unclassified 4xx, HTTP 400 without an allowlisted
+   * pre-effect validation code) from an independent post-dispatch
    * state re-read, WITHOUT re-issuing the mutation.
    *
    * EVERY outcome on this path is INDETERMINATE. The re-read is
@@ -1163,9 +1224,9 @@ export class ChargebeeLiveAdapter implements SubscriptionProvider {
       throw new SCQError("PROVIDER_ERROR", "Commit outcome is INDETERMINATE: the mutating dispatch's execution could not be established and the post-dispatch provider state could not be re-read. No receipt was recorded and no second mutation was issued. Reconcile manually from provider records before any retry.", { outcome: "INDETERMINATE", indeterminate: true, reconciled: false });
     }
     if (intendedSetObserved && fingerprintMoved) {
-      throw new SCQError("PROVIDER_ERROR", "Commit outcome is INDETERMINATE: the mutating dispatch's execution could not be established. Provider state shows the intended item set in effect, but a matching changed state does not establish that THIS request caused the change — the same observations arise if another actor applied the identical change while this request never landed, and Chargebee provides no operation-bound execution evidence in this adapter's validated surface. No receipt was recorded and no second mutation was issued. Reconcile manually from provider records before any retry.", { outcome: "INDETERMINATE", indeterminate: true, reconciled: false, intendedItemsLanded: true });
+      throw new SCQError("PROVIDER_ERROR", "Commit outcome is INDETERMINATE: the mutating dispatch's execution could not be established. Provider state shows the intended item set in effect, but a matching changed state does not establish that THIS request caused the change — the same observations arise if another actor applied the identical change while this request never landed, and Chargebee provides no operation-bound execution evidence in this adapter's validated surface. No receipt was recorded and no second mutation was issued. Reconcile manually from provider records before any retry.", { outcome: "INDETERMINATE", indeterminate: true, reconciled: false, observedIntendedSetInEffect: true });
     }
-    throw new SCQError("PROVIDER_ERROR", "Commit outcome is INDETERMINATE: the mutating dispatch's execution could not be established and provider state does not show the intended change. No receipt was recorded and no second mutation was issued. Reconcile manually before any retry.", { outcome: "INDETERMINATE", indeterminate: true, reconciled: false, intendedItemsLanded: false });
+    throw new SCQError("PROVIDER_ERROR", "Commit outcome is INDETERMINATE: the mutating dispatch's execution could not be established and provider state does not show the intended change. No receipt was recorded and no second mutation was issued. Reconcile manually before any retry.", { outcome: "INDETERMINATE", indeterminate: true, reconciled: false, observedIntendedSetInEffect: false });
   }
 
   /**

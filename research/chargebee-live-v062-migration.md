@@ -60,8 +60,10 @@ was made.
   recorded INDETERMINATE refuses any later dispatch for that quote
   before reads or mutations — no blind retry), and
   `CONFIRMED_NON_EXECUTION` (restricted to demonstrable pre-effect
-  refusals — an explicit provider validation rejection, HTTP 400 —
-  recorded as outcomes; see the L2 review correction below).
+  refusals — an HTTP 400 carrying a specifically allowlisted
+  documented validation `api_error_code`; status 400 alone is not
+  proof — recorded as outcomes; see the L2/L3 review corrections
+  below).
   Candidates follow the merged PR #10/#11 construction:
   present in the committed effect under UNKNOWN determinacy with
   `committedSource: "unestablished"` provenance, so a later
@@ -120,15 +122,15 @@ transport, proposal `CHANGE_QUANTITY pilot-addon-vision 1 → 21`:
 | Re-read omits items after landing | INDETERMINATE, no receipt | `COMMITTED_UNVERIFIED`; immediate established from response, recurring UNKNOWN — never a verified zero (test13-rec5) |
 | Re-read unavailable after response received | INDETERMINATE, no receipt | `COMMITTED_UNVERIFIED` with candidate figures (UNKNOWN determinacy); §6.10 replay + later identity-bound verification (test26.17) |
 | Intervening write (incl. round-trip restore) | n/a (misclassified or indeterminate) | `COMMITTED_UNVERIFIED`; no recurring figure recorded for this commit (Z3); response immediate survives (test26.14a/b) |
-| Definitive pre-effect rejection (HTTP 400 validation) | Generic provider error | `CONFIRMED_NON_EXECUTION` recorded; does not block a later attempt (test26.16, positive control) |
-| Ambiguous dispatch failure (408 timeout / 429 rate-limit / 422 idempotency conflict / unclassified 4xx) | Generic provider error (as first delivered: blanket 4xx ⇒ CONFIRMED_NON_EXECUTION) | INDETERMINATE, outcome recorded, re-dispatch blocked pending reconciliation (review L2; test26.15b, test26.15e, test26.15f) |
+| Definitive pre-effect rejection (HTTP 400 with an allowlisted validation `api_error_code`) | Generic provider error | `CONFIRMED_NON_EXECUTION` recorded; does not block a later attempt (test26.16, positive control) |
+| Ambiguous dispatch failure (408 timeout / 429 rate-limit / 422 idempotency conflict / unclassified 4xx / 400 without an allowlisted validation code — payment-stage, unknown, or missing `api_error_code`) | Generic provider error (as first delivered: blanket 4xx ⇒ CONFIRMED_NON_EXECUTION; after L2: any 400 ⇒ CONFIRMED_NON_EXECUTION) | INDETERMINATE, outcome recorded, re-dispatch blocked pending reconciliation (reviews L2/L3; test26.15b, test26.15e, test26.15f, test26.16b, test26.16c) |
 | Committed determined zero | Absent | Present, DETERMINED (test26.1a) |
 | Quote / revalidation determinacy | Absent; drift checked without determinacy | Three-state + provenance; UNKNOWN refuses pre-mutation (test26.1b, 26.2, 26.8) |
 
 ## Regression matrix
 
 New file `reference/tests/test26-chargebee-live-v062-migration.test.ts`
-(36 tests) covers all 20 assignment rows through mocked transports
+(38 tests) covers all 20 assignment rows through mocked transports
 with a dispatch audit: rows 1 (26.1a/b), 2 (26.2), 3 (26.3a/b),
 4 (26.4a/b), 5 (26.5), 6 (26.6, incl. the amount_due == incurred
 coincidence), 7 (26.7a/b), 8 (26.8), 9 (26.9), 10 (26.10a/b/c),
@@ -139,9 +141,11 @@ regression, review L1), 13 (26.13), 14 (26.14a/b), 15 (26.15a–f:
 concurrent-dispatch native replay, 422 preexisting-key conflict ⇒
 INDETERMINATE, post-window reprocessing hazard, evidence-free 200,
 408 ⇒ INDETERMINATE, ambiguous 429 ⇒ INDETERMINATE — review L2),
-16 (26.16: genuine HTTP 400 pre-effect rejection ⇒
-CONFIRMED_NON_EXECUTION, later attempt unblocked — positive
-control), 17 (26.17),
+16 (26.16: HTTP 400 with the allowlisted validation code
+`param_wrong_value` ⇒ CONFIRMED_NON_EXECUTION, later attempt
+unblocked — positive control; 26.16b: payment-stage 400
+`payment_processing_failed` ⇒ INDETERMINATE; 26.16c: 400 with a
+missing `api_error_code` ⇒ INDETERMINATE — review L3), 17 (26.17),
 18 (26.18), 19 (26.19a/b/c), 20 (26.20 + the unmodified pilot
 suites), audit (26.21: audited dispatches == mocked-transport
 calls; exactly one mutating dispatch in a quote+commit+replay
@@ -214,10 +218,14 @@ CONFIRMED_NON_EXECUTION.
   dispatch, a 409, a 5xx, and every L2 ambiguity below are
   response-lost / execution-unestablished.
 - **L2 — non-execution classification.** CONFIRMED_NON_EXECUTION
-  is restricted to demonstrable pre-effect failures: an explicit
-  provider validation rejection (HTTP 400), which carries no
-  prior-operation ambiguity (26.16 remains the positive control,
-  and a later attempt is not blocked). HTTP 408, ambiguous 429,
+  is restricted to demonstrable pre-effect failures. (As first
+  corrected, this bullet named an explicit provider validation
+  rejection — HTTP 400 — as the criterion; the L3 correction below
+  narrows that further to the code-based rule now in force: HTTP
+  400 carrying a specifically allowlisted documented validation
+  `api_error_code`, which carries no prior-operation ambiguity.
+  26.16 remains the positive control, and a later attempt is not
+  blocked.) HTTP 408, ambiguous 429,
   unclassified 4xx, and 422 `duplicate_request` classify as
   INDETERMINATE with the no-blind-retry guard: a 422 conflict
   establishes rejection of the CURRENT attempt only — the key may
@@ -225,6 +233,68 @@ CONFIRMED_NON_EXECUTION.
   parameters that DID execute (26.15b) — so re-dispatch for that
   quote is blocked pending reconciliation, in the same spirit as
   the recorded-INDETERMINATE dispatch refusal.
+
+## Review correction L3 (2026-10-29, at head after `c339d91`)
+
+The re-review of the L1/L2 round (`c339d91`) accepted L1 and the
+remaining L2 corrections but blocked merge on one residual: the
+mutation catch branch classified by status alone — every
+HTTP 400 recorded CONFIRMED_NON_EXECUTION — while its own comment
+called the branch an "explicit validation rejection" without the
+code ever inspecting `apiErrorCode`. Chargebee's official
+error-handling documentation assigns HTTP 400 to payment and
+operation-stage failures as well (`payment_processing_failed`,
+`payment_method_verification_failed`, `payment_intent_invalid` —
+type `payment`), and those responses do not, by status code alone,
+establish that no subscription or ancillary financial effect
+occurred.
+
+- **Code-based rule.** CONFIRMED_NON_EXECUTION now requires BOTH
+  HTTP 400 AND an `api_error_code` on the narrow allowlist
+  `PRE_EFFECT_VALIDATION_ERROR_CODES` in the adapter:
+  `param_required` and `param_wrong_value`. Documentary basis
+  (Chargebee error-handling documentation,
+  apidocs.chargebee.com/docs/api/error-handling): both codes are
+  grouped under "Invalid Request Errors" (type `invalid_request`,
+  HTTP 400) — a required parameter absent, and a parameter value
+  not meeting its required specification — and the documentation
+  states that API calls fail at the first error encountered while
+  VALIDATING them, i.e. before the operation is processed. Both
+  codes describe defects in the request's own shape/values, so
+  neither carries prior idempotency-key ambiguity (a consumed key
+  reused with a different payload surfaces as HTTP 422, not as one
+  of these codes).
+- **Fail closed.** A 400 carrying a payment-stage code
+  (`payment_processing_failed`, `payment_method_verification_failed`,
+  `payment_intent_invalid`, and the other payment-type codes), the
+  generic `invalid_request` code (documented as generic; handling
+  recommended only in combination with `param`), a
+  state/configuration-dependent code (`duplicate_entry`,
+  `resource_limit_exhausted`, `resource_limit_exceeded`,
+  `configuration_incompatible`), any unknown code, or NO code at
+  all classifies INDETERMINATE — outcome recorded, no receipt, no
+  blind retry — absent independent proof of no effect.
+- **Regressions.** Failing-first on `c339d91`: the two new tests
+  failed (both recorded the buggy CONFIRMED_NON_EXECUTION) while
+  the reworked positive control passed on both heads, as a control
+  should. New: 26.16b (payment-stage 400 `payment_processing_failed`
+  ⇒ INDETERMINATE, re-dispatch blocked), 26.16c (400 with a missing
+  `api_error_code` ⇒ INDETERMINATE, re-dispatch blocked). Reworked:
+  26.16's mocked error now carries the allowlisted
+  `param_wrong_value` instead of the generic `invalid_request`
+  code (disclosed in-file); its CONFIRMED_NON_EXECUTION and
+  later-attempt-unblocked assertions are unchanged. The L2 tests
+  26.15b (422), 26.15e (408), and 26.15f (429) pass unchanged.
+- **Minor L1 cleanup.** The thrown INDETERMINATE errors from
+  `reconcileAfterUnknownDispatch` carried a detail key
+  `intendedItemsLanded`, while the persisted outcome record
+  correctly names the same observation `observedIntendedSetInEffect`.
+  The thrown-error detail is renamed to
+  `observedIntendedSetInEffect` in both branches, so no consumer
+  can mistake an observed state for a proven landing. A grep over
+  the adapter, HTTP layer, tests, and pilot found no other
+  producer or consumer of the old key; no test assertions
+  referenced it.
 
 ## Outcomes that remain UNVERIFIABLE through the real Chargebee API
 
@@ -280,10 +350,12 @@ From the pilot's NO-GO conditions (issue #12):
 
 ## Verification (this branch)
 
-- Clean build (`rm -rf dist`): **349/349** tests pass (baseline
-  313 + 36 new; includes the L1/L2 review-correction round: +3
+- Clean build (`rm -rf dist`): **351/351** tests pass (baseline
+  313 + 38 new; includes the L1/L2 review-correction round: +3
   tests — 26.12b, 26.15e, 26.15f — and 5 flipped expectations
-  across test26/test21/test13, each disclosed in-file). The 10
+  across test26/test21/test13, each disclosed in-file; and the L3
+  review-correction round: +2 tests — 26.16b, 26.16c — plus the
+  disclosed 26.16 mocked-error-code change). The 10
   pre-migration failures observed mid-work were exactly the 10
   tests carrying disclosed updates.
 - `npm run smoke:pack`: OK. `npm run demo`: OK.

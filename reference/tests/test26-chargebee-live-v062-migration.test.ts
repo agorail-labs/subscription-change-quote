@@ -714,13 +714,33 @@ test("Test 26.15d: a 200 response with NO subscription body and a failing re-rea
 
 // ---------------------------------------------------------------------------
 // 26.16 — Confirmed pre-effect rejection => CONFIRMED_NON_EXECUTION
+// (PR-7 review L3: status 400 alone is NOT evidence — only a 400
+// carrying a specifically allowlisted pre-effect validation
+// api_error_code qualifies; payment-stage and unknown/missing codes
+// fail closed to INDETERMINATE, tests 26.16b/26.16c.)
 // ---------------------------------------------------------------------------
 
-test("Test 26.16: a definitive pre-effect rejection (HTTP 400) records CONFIRMED_NON_EXECUTION and leaves provider state untouched", async () => {
+test("Test 26.16: a 400 carrying an allowlisted pre-effect validation code (param_wrong_value) records CONFIRMED_NON_EXECUTION and leaves provider state untouched", async () => {
+  // DISCLOSED CHANGE (PR-7 review L3): this test previously mocked a
+  // bare HTTP 400 with the generic api_error_code "invalid_request"
+  // and asserted CONFIRMED_NON_EXECUTION — i.e. it encoded the rule
+  // L3 rejects (status code alone as proof of non-execution). The
+  // mocked error now carries `param_wrong_value`, one of the narrow
+  // documented request-validation codes on the adapter's allowlist:
+  // Chargebee's error-handling documentation groups it under
+  // Invalid Request Errors (type invalid_request, HTTP 400) — a
+  // parameter value that does not meet its required specification,
+  // rejected while validating the request, before the operation is
+  // processed. The generic `invalid_request` code is deliberately
+  // NOT allowlisted (Chargebee documents it as a generic code whose
+  // handling is recommended only in combination with `param`), and
+  // a 400 with that code now classifies INDETERMINATE like any
+  // other non-allowlisted code. Scenario and all outcome/retry
+  // assertions are otherwise unchanged.
   const { adapter, mock, store, dispatches } = makeAdapter({}, {
     wrap: (mock) => async (req) => {
       if (req.method === "POST" && req.url.includes("/update_for_items")) {
-        return { status: 400, headers: {}, json: { type: "invalid_request", api_error_code: "invalid_request", message: "bad request", http_status_code: 400 } };
+        return { status: 400, headers: {}, json: { type: "invalid_request", api_error_code: "param_wrong_value", message: "subscription_items[item_price_id][0] : value does not meet the required specification", http_status_code: 400 } };
       }
       return mock.transport(req);
     },
@@ -736,7 +756,7 @@ test("Test 26.16: a definitive pre-effect rejection (HTTP 400) records CONFIRMED
   assert.equal(updateDispatches(dispatches).length, 1);
   const snap = await adapter.getSubscription(SUB);
   assert.equal(snap.items.find((i) => i.id === ADDON)?.quantity, 1, "provider state is untouched");
-  // Positive control for the L2 line: a demonstrable pre-effect
+  // Positive control for the L2/L3 line: a demonstrable pre-effect
   // rejection does NOT block a later attempt — the retry guard is
   // reserved for INDETERMINATE outcomes. A second attempt dispatches
   // again (and is again refused pre-effect by the provider).
@@ -746,6 +766,70 @@ test("Test 26.16: a definitive pre-effect rejection (HTTP 400) records CONFIRMED
   );
   assert.equal(updateDispatches(dispatches).length, 2, "a confirmed non-execution leaves a later attempt unblocked");
   assert.equal(mock.mutationCount, 0);
+});
+
+test("Test 26.16b: a payment-stage HTTP 400 (payment_processing_failed) is INDETERMINATE (PR-7 review L3) — a payment failure does not prove rejection before any subscription or financial effect", async () => {
+  // Chargebee's error-handling documentation assigns HTTP 400 to
+  // payment errors (type `payment`) as well as to validation
+  // errors: payment_processing_failed is returned when payment
+  // collection fails DURING the operation. By then the provider
+  // may already have applied subscription changes or ancillary
+  // financial effects, so status 400 + a payment code establishes
+  // neither pre-effect rejection nor non-execution. The outcome
+  // fails closed: INDETERMINATE, outcome recorded, no receipt, and
+  // the recorded outcome blocks any blind re-dispatch.
+  const { adapter, mock, store, dispatches } = makeAdapter({}, {
+    wrap: (mock) => async (req) => {
+      if (req.method === "POST" && req.url.includes("/update_for_items")) {
+        return { status: 400, headers: {}, json: { type: "payment", api_error_code: "payment_processing_failed", message: "Subscription cannot be updated as the payment collection failed. Gateway Error: Card declined.", http_status_code: 400 } };
+      }
+      return mock.transport(req);
+    },
+  });
+  const quote = await adapter.createChangeQuote(SUB, PROPOSAL(21));
+  await assert.rejects(
+    () => adapter.commitChangeQuote(quote.id),
+    (e: unknown) => e instanceof SCQError && e.code === "PROVIDER_ERROR" && (e.details as any)?.outcome === "INDETERMINATE"
+      && (e.details as any)?.observedIntendedSetInEffect === false,
+  );
+  assert.equal(store.get(quote.id)?.commit_outcome?.outcome, "INDETERMINATE", "NOT confirmed non-execution — a payment-stage 400 may follow partial provider-side effects");
+  assert.equal(store.get(quote.id)?.commit_receipt, undefined);
+  assert.equal(mock.mutationCount, 0);
+  await assert.rejects(
+    () => adapter.commitChangeQuote(quote.id),
+    (e: unknown) => e instanceof SCQError && (e.details as any)?.outcome === "INDETERMINATE",
+  );
+  assert.equal(updateDispatches(dispatches).length, 1, "no blind retry after an ambiguous payment-stage 400");
+});
+
+test("Test 26.16c: an HTTP 400 with a MISSING api_error_code is INDETERMINATE (PR-7 review L3) — an unidentified 400 fails closed", async () => {
+  // Without a specifically recognized api_error_code there is no
+  // documented basis for placing the failure at the validation
+  // stage: the same bare 400 shape is used for payment and
+  // operation-stage failures. Unknown or missing codes therefore
+  // fail closed to INDETERMINATE with the no-blind-retry guard,
+  // exactly like the 408/429 ambiguities of review L2.
+  const { adapter, mock, store, dispatches } = makeAdapter({}, {
+    wrap: (mock) => async (req) => {
+      if (req.method === "POST" && req.url.includes("/update_for_items")) {
+        return { status: 400, headers: {}, json: { message: "bad request", http_status_code: 400 } };
+      }
+      return mock.transport(req);
+    },
+  });
+  const quote = await adapter.createChangeQuote(SUB, PROPOSAL(21));
+  await assert.rejects(
+    () => adapter.commitChangeQuote(quote.id),
+    (e: unknown) => e instanceof SCQError && e.code === "PROVIDER_ERROR" && (e.details as any)?.outcome === "INDETERMINATE",
+  );
+  assert.equal(store.get(quote.id)?.commit_outcome?.outcome, "INDETERMINATE", "NOT confirmed non-execution — a missing api_error_code cannot establish a pre-effect validation rejection");
+  assert.equal(store.get(quote.id)?.commit_receipt, undefined);
+  assert.equal(mock.mutationCount, 0);
+  await assert.rejects(
+    () => adapter.commitChangeQuote(quote.id),
+    (e: unknown) => e instanceof SCQError && (e.details as any)?.outcome === "INDETERMINATE",
+  );
+  assert.equal(updateDispatches(dispatches).length, 1, "no blind retry after an unidentified 400");
 });
 
 // ---------------------------------------------------------------------------
