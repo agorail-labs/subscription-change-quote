@@ -10,6 +10,7 @@
  * an absolute spending cap or authorization grant.
  */
 export * from "./core/types.js";
+export { verifyPostCommitState } from "./core/state-verification.js";
 export { QuoteStore, establishVerification } from "./store/quote-store.js";
 export {
   DurableQuoteStore,
