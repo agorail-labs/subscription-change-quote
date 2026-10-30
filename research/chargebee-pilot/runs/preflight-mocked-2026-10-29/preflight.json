@@ -1,6 +1,6 @@
 {
   "kind": "scq-chargebee-exact-commit-preflight",
-  "generatedAt": "2026-10-30T14:58:51.019Z",
+  "generatedAt": "2026-10-30T15:53:58.685Z",
   "refused": false,
   "refusalReasons": [],
   "identity": {
@@ -11,10 +11,10 @@
     "tenantModeEstablished": "UNVERIFIED",
     "subscriptionId": "pilot-sub-001",
     "syntheticFixtureDesignation": true,
-    "quoteId": "scq_cblive_4cb2bdb77b26ab23",
+    "quoteId": "scq_cblive_dc5bcfa6f5d724d9",
     "quoteStatus": "ACTIVE",
-    "quoteCreatedAt": "2026-10-30T14:58:51.016Z",
-    "quoteExpiresAt": "2026-10-30T15:03:51.016Z",
+    "quoteCreatedAt": "2026-10-30T15:53:58.682Z",
+    "quoteExpiresAt": "2026-10-30T15:58:58.682Z",
     "storedFingerprint": "rv:1700000000000",
     "currentResourceVersion": 1700000000000,
     "currentFingerprint": "rv:1700000000000",
@@ -59,7 +59,7 @@
     "prorate": true,
     "invoiceImmediately": false,
     "changeOption": "immediately",
-    "idempotencyKey": "scq-scq_cblive_4cb2bdb77b26ab23",
+    "idempotencyKey": "scq-scq_cblive_dc5bcfa6f5d724d9",
     "requestHash": "ae8a7bec519c1f95f61b443e290d02957d9c16a20b126eeada4adfa1821bef81",
     "storedPreviewInput": {
       "items": [
@@ -72,7 +72,7 @@
           "quantity": 21
         }
       ],
-      "idempotencyKey": "scq-scq_cblive_4cb2bdb77b26ab23"
+      "idempotencyKey": "scq-scq_cblive_dc5bcfa6f5d724d9"
     },
     "matchesStoredPreviewInput": true,
     "matchesStoredAttempts": null
@@ -207,7 +207,7 @@
     {
       "id": "quote_not_expired",
       "status": "pass",
-      "detail": "quote expires at 2026-10-30T15:03:51.016Z"
+      "detail": "quote expires at 2026-10-30T15:58:58.682Z"
     },
     {
       "id": "synthetic_designation",

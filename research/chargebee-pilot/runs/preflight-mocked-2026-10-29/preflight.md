@@ -1,19 +1,19 @@
-# Chargebee exact-commit preflight — scq_cblive_4cb2bdb77b26ab23
+# Chargebee exact-commit preflight — scq_cblive_dc5bcfa6f5d724d9
 
-Generated: 2026-10-30T14:58:51.019Z · Transport origin: injected · **Overall: NO-GO**
+Generated: 2026-10-30T15:53:58.685Z · Transport origin: injected · **Overall: NO-GO**
 
 ## Identity and binding
 - Provider/site: chargebee / pilot-test (approved for read-only validation: yes — per-run entry, configuration validation only)
 - Tenant mode: UNVERIFIED
 - Subscription: pilot-sub-001 (synthetic-fixture designation: yes)
-- Quote: scq_cblive_4cb2bdb77b26ab23, created 2026-10-30T14:58:51.016Z, expires 2026-10-30T15:03:51.016Z, status ACTIVE
+- Quote: scq_cblive_dc5bcfa6f5d724d9, created 2026-10-30T15:53:58.682Z, expires 2026-10-30T15:58:58.682Z, status ACTIVE
 - Quote-origin binding (issuance record): ESTABLISHED (issued against site pilot-test, subscription pilot-sub-001)
 - Fingerprint: stored rv:1700000000000 · current rv:1700000000000 (resource_version 1700000000000)
 - Action: CHANGE_QUANTITY → target items pilot-plan-business×1, pilot-addon-vision×21
 
 ## Hypothetical mutation (the exact request a future commit would issue)
 - Parameters (derived by the adapter's own request builder): replace_items_list=true, prorate=true, invoice_immediately=false, change_option=immediately
-- Idempotency key (original, stored): scq-scq_cblive_4cb2bdb77b26ab23
+- Idempotency key (original, stored): scq-scq_cblive_dc5bcfa6f5d724d9
 - Canonical request hash: ae8a7bec519c1f95f61b443e290d02957d9c16a20b126eeada4adfa1821bef81
 - Matches the authorized resulting item set (full multiset vs the independent re-read): yes
 
@@ -48,7 +48,7 @@ subscription_items%5Bitem_price_id%5D%5B0%5D=pilot-plan-business&subscription_it
 - [PASS] quote_exists_durably: the quote exists in the authoritative durable store
 - [PASS] provider_binding: stored provider binding is chargebee
 - [PASS] quote_origin_binding: quote origin is established by its issuance record: issued against site "pilot-test" for subscription "pilot-sub-001", digest-bound to the stored quote — the same site identity binds this run's request, re-read, and ledger
-- [PASS] quote_not_expired: quote expires at 2026-10-30T15:03:51.016Z
+- [PASS] quote_not_expired: quote expires at 2026-10-30T15:58:58.682Z
 - [PASS] synthetic_designation: subscription id "pilot-sub-001" carries a synthetic-fixture designation (a designation is a scoping signal, not proof of tenant safety)
 - [PASS] no_unresolved_attempts: no unresolved durable attempt exists for this quote or subscription
 - [PASS] idempotency_key_coherence: the stored idempotency key is the original adapter-derived key for this quote; it is reported, never regenerated

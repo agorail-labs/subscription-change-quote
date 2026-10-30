@@ -427,3 +427,109 @@ regenerated sample run under
 reported `injected`), and this note. Frozen-surface diff remains
 empty: no spec, `types.ts`, `scq-engine.ts`, or store-layer file
 changed in this round or this PR.
+
+## 11. PF3 hardening — manifest substitution protection (2026-10-30, re-review)
+
+The re-review requirement, verbatim: "the quote-origin manifest
+must be created at quote issuance and protected against later
+substitution. It must bind the quote identity, originating site,
+subscription ID, and relevant record digest. A manifest
+reconstructed from caller-supplied preflight inputs would not
+establish independent provenance."
+
+**Audit of the §10 design (head `fce79d3`).** What already held:
+records are created ONLY at issuance (the CLI's mocked-issuance
+path, with the site from that run's configuration; the
+`--db/--quote` path only loads), `runPreflight` never records, and
+consumption already failed closed on missing / conflicting /
+corrupt / digest-mismatched evidence. Three gaps remained:
+
+- **GAP 1 — the record's own fields were not digest-bound.** The
+  v1 `quoteDigest` covers only the stored quote's issuance-stable
+  fields. The record's `site` — the very fact the manifest exists
+  to attest — could be edited in the JSONL line after issuance and
+  every check stayed green: the quote digest still matched, and
+  the site comparison then ran against the tampered value. Attack:
+  quote issued on approved site A; edit the line's site A→B; run
+  the preflight configured for approved site B with a coinciding
+  subscription id → binding ESTABLISHED for the wrong site.
+- **GAP 2 — substitution-by-append was refused only at read.** The
+  writer accepted a second record for the same quote id; only the
+  reader's conflict rule blocked it.
+- **GAP 3 — no file-level integrity.** Lines could be edited,
+  reordered, or the file rewritten wholesale and nothing in the
+  file evidenced it.
+
+**Design (record format v2, pilot layer only —
+`src/live/pilot/quote-origin.ts`).**
+
+1. **Record self-digest.** Every record now carries
+   `recordDigest`: `requestHashOf` over the COMPLETE record
+   content — kind, version, quoteId, provider, site,
+   subscriptionId, quoteDigest, recordedAt, recordedBy, and the
+   chain link — so the quote identity, originating site,
+   subscription id, and quote digest are all bound into the record
+   itself. Any post-issuance edit to any field invalidates it.
+2. **Hash chain.** Every record carries `prevRecordDigest`: the
+   record digest of the preceding record in the manifest, or the
+   fixed genesis constant `scq-quote-origin-chain-genesis-v2` for
+   the first. Loading verifies, in file order, every record's
+   self-digest AND the chain linkage. Any break — edit, reorder,
+   insertion, deletion of a non-final record — marks the manifest
+   CORRUPT, and consumers fail closed exactly as before (blocker;
+   Condition 3 cannot PASS).
+3. **One-time writer.** `record()` throws when any record already
+   exists for the same quote id — issuance is once-only, so
+   substitution-by-append is refused at write time. It also throws
+   when appending to a manifest that failed integrity verification.
+   A conflicting record appended by raw file edit continues to
+   block at read, via both the existing conflict rule and the
+   broken digest/chain.
+4. **Version policy.** Version-1 or unknown-version records
+   predate self-digest/chain binding and are untrustworthy: a
+   manifest containing one is corrupt and fails closed. Nothing
+   external persists v1 records (the manifest is written and read
+   within this pilot layer), so no migration path is offered.
+5. **Consumption unchanged in spirit.** The preflight treats
+   self-digest/chain failure identically to corruption. No path
+   from `runPreflight` or the CLI load mode calls `record()` —
+   issuance paths only (pinned by test41.9: a preflight run leaves
+   the manifest file byte-identical).
+
+**Failing-first (test41, written against `fce79d3` before the
+fix; 6 fail / 4 pass pre-fix, 10/10 post-fix).**
+
+| Test | Pre-fix | Post-fix | Class |
+| --- | --- | --- | --- |
+| 41.1 site substitution A→B, preflight run for B | FAIL — tampered record loaded as trustworthy (not corrupt); the binding comparison ran against the substituted site and established | Blocker; manifest corrupt; binding not ESTABLISHED; NO-GO | merits failure (GAP 1) |
+| 41.2 quoteDigest substitution | pass (blocked by the quote-digest comparison) | Blocker (also self-digest failure) | control |
+| 41.3 subscriptionId substitution | pass (blocked: record does not belong to this quote) | Blocker (also self-digest failure) | control |
+| 41.4 writer second record for same quote | FAIL — `record()` accepted it | Throws; file and memory still hold exactly the original record | merits failure (GAP 2) |
+| 41.5 conflicting record via raw append | pass (blocked by the conflict rule) | Blocker (conflict rule + broken chain/digest) | control |
+| 41.6 non-final line deletion | FAIL — deletion invisible; surviving record still bound | Chain break → corrupt → blocker | merits failure (GAP 3) |
+| 41.7 line reordering | FAIL — order irrelevant pre-fix; record still bound | Chain break → corrupt → blocker | merits failure (GAP 3) |
+| 41.8 v1-format record | FAIL — v1 record trusted and bound | Corrupt → fails closed | merits failure (version policy) |
+| 41.9 preflight leaves manifest byte-identical | pass | pass | control |
+| 41.10 untouched v2 record binds end-to-end | FAIL on the new-format assertions only (no `recordDigest`/`prevRecordDigest` fields exist pre-fix); the binding assertions themselves held pre-fix | pass — ESTABLISHED, simulated classification only, no LIVE_PASS | positive control + new-format checks |
+
+**Disclosed test change outside test41.** test40.5 previously
+introduced its conflicting record through a second `record()` call
+for the same quote; the one-time writer now refuses that by
+design, so the conflict is introduced by raw file append + reload
+instead. Assertions unchanged (blocker + MISMATCH); the change is
+fixture mechanics only, justified here and in the test.
+
+**Honest limits — what this does NOT do.** This is
+tamper-EVIDENCE within the manifest file, not tamper-proofing. A
+privileged writer holding BOTH the manifest and the durable
+database could rewrite the file with a fully recomputed chain (and
+a quote digest recomputed over a substituted stored quote) and
+nothing in the file alone would evidence it. Defeating that
+requires an external trust anchor — an issuance countersignature
+or a WORM/append-only store outside the writer's control — which
+is named subsequent work, not claimed here. Operational control of
+the manifest file remains part of the real-tenant evidence story.
+Condition 3 semantics are unchanged by this hardening: PASS still
+requires structural real provenance, attestation, an ESTABLISHED
+binding from an issuance record, verified provider identity, and
+zero blockers; the overall assessment remains NO-GO.

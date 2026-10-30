@@ -32,3 +32,10 @@ mocked recovery rehearsal (14/14 scenarios, SIMULATED_PASS).
   0 mutating; `update_for_items` dispatched 0 times.
 - Nothing in this directory is live evidence, and no real Chargebee
   tenant was contacted.
+- Regenerated again under the PF3 substitution hardening (record
+  format v2): the fixture's origin record now carries a self-digest
+  over its complete content and a hash-chain link, and the report is
+  unchanged in substance — binding ESTABLISHED from the issuance
+  record, provenance `injected`, overall NO-GO. (Only run-volatile
+  fields — timestamps and generated ids — differ between
+  regenerations; the report never embeds manifest internals.)

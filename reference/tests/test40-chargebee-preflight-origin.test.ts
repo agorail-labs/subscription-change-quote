@@ -1,6 +1,6 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { mkdtempSync, readFileSync, writeFileSync, existsSync } from "node:fs";
+import { appendFileSync, mkdtempSync, readFileSync, writeFileSync, existsSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { ChargebeeClient, type HttpTransport } from "../src/live/chargebee-http.js";
@@ -163,8 +163,16 @@ test("Test 40.4 (PF3): an origin record whose digest no longer matches the store
 test("Test 40.5 (PF3): two conflicting origin records for one quote are ambiguous and block", async () => {
   const fx = await buildBoundFixture();
   const store = openStore(fx.path);
-  fx.manifest.record({ stored: store.get(fx.quoteId)!, site: "other-test", recordedBy: "test40 conflicting record" });
-  const report = await runPreflight(baseInput(fx, store));
+  // Fixture-mechanics change (PF3 hardening, note §11): the writer
+  // is now once-only per quote and REFUSES a second record() for the
+  // same quote id, so the conflicting record is introduced by raw
+  // file append — the read path must still block on it (conflict
+  // rule + digest/chain verification). Assertions unchanged.
+  const lines = readFileSync(fx.manifest.filePath!, "utf8").trim().split("\n");
+  const conflict = { ...(JSON.parse(lines[0]) as Record<string, unknown>), site: "other-test" };
+  appendFileSync(fx.manifest.filePath!, JSON.stringify(conflict) + "\n");
+  const conflicted = QuoteOriginManifest.load(fx.manifest.filePath!);
+  const report = await runPreflight(baseInput(fx, store, { originManifest: conflicted }));
   store.close();
   assert.equal(checkStatus(report, "quote_origin_binding"), "blocker");
   assert.equal(report.durableReadiness.originBinding, "MISMATCH");

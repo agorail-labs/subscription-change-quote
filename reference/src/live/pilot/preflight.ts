@@ -627,7 +627,7 @@ export async function runPreflight(input: PreflightInput): Promise<PreflightRepo
       report.durableReadiness.originBinding = "MISMATCH";
       report.durableReadiness.siteBindingOk = false;
       report.durableReadiness.subscriptionMatch = false;
-      check("quote_origin_binding", "blocker", "the quote-origin manifest is corrupt or partially unreadable — origin evidence is untrustworthy, so site/subscription binding cannot be established");
+      check("quote_origin_binding", "blocker", "the quote-origin manifest is corrupt, partially unreadable, or fails record-digest / hash-chain integrity verification — origin evidence is untrustworthy, so site/subscription binding cannot be established");
     } else {
       const origins = manifest?.recordsFor(stored.quote_id) ?? [];
       if (origins.length === 0) {
