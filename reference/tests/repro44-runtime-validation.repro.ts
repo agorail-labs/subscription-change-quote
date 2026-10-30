@@ -32,6 +32,11 @@ import { freshStripeFixture } from "./fixtures.js";
 // refusal of malformed mode/bounds, before any provider
 // read/preview) and are EXPECTED TO FAIL on unmodified main. Do
 // not weaken them; the fix belongs in a separate implementation PR.
+//
+// RESEARCH SUITE (PR #23 REVIEW-1): this file is NOT part of the
+// default `npm test` discovery (`dist/tests/*.test.js`). Build,
+// then invoke the research suite explicitly:
+// `node --test dist/tests/*.repro.js`.
 // Everything runs against the in-memory Stripe simulator
 // (SIMULATED evidence only).
 

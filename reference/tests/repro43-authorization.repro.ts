@@ -18,11 +18,24 @@ import { ChargebeeLiveAdapter } from "../src/live/chargebee-scq-adapter.js";
 // pass and bound the defect precisely. Do not weaken 43.1 to make
 // it pass — a fix belongs in a separate, gated implementation PR.
 //
+// RESEARCH SUITE (PR #23 REVIEW-1): this file is NOT part of the
+// default `npm test` discovery (`dist/tests/*.test.js`). Build
+// (`npm run build` / `npx tsc -p tsconfig.json`), then invoke the
+// research suite explicitly: `node --test dist/tests/*.repro.js`.
+//
 // Scenario (43.1): the subscription holds plan + pilot-addon-vision
 // qty 1. The authorized proposal is pilot-addon-vision 1 -> 21 ONLY.
 // After the adapter's final pre-commit read + fingerprint validation
-// (the commit-phase GET), a third party adds pilot-addon-mandatory
-// to the subscription. The adapter then dispatches the full-list
+// (the commit-phase GET), a third party adds pilot-addon-concurrent
+// to the subscription. That item is an ORDINARY unrelated addon in
+// this fixture — despite the historical "mandatory" naming this file
+// originally carried, nothing provider-enforced-mandatory is
+// simulated, and this reproduction does NOT establish whether a
+// genuinely provider-enforced mandatory addon could be deleted on
+// real Chargebee (the documentation is unsettled for the
+// plan-inclusive case; see the capability assessment §1.5). The
+// proven race is the GENERIC full-list overwrite of an ordinary
+// concurrently added item. The adapter then dispatches the full-list
 // replacement built from the quote-time snapshot
 // (replace_items_list=true, items = [plan, vision x21]): the
 // concurrently added, never-authorized item is deleted by the
@@ -42,12 +55,12 @@ import { ChargebeeLiveAdapter } from "../src/live/chargebee-scq-adapter.js";
 const SUB = "pilot-sub-001";
 const PLAN = "pilot-plan-business";
 const ADDON = "pilot-addon-vision";
-const MANDATORY = "pilot-addon-mandatory";
+const CONCURRENT = "pilot-addon-concurrent";
 
 const CATALOG: Record<string, { price: number; pricing_model: string; item_type: string }> = {
   [PLAN]: { price: 59900, pricing_model: "flat_fee", item_type: "plan" },
   [ADDON]: { price: 10000, pricing_model: "per_unit", item_type: "addon" },
-  [MANDATORY]: { price: 2500, pricing_model: "flat_fee", item_type: "addon" },
+  [CONCURRENT]: { price: 2500, pricing_model: "flat_fee", item_type: "addon" },
 };
 
 type MockItem = { item_price_id: string; item_type: string; quantity: number; unit_price: number; amount: number; free_quantity?: number };
@@ -77,11 +90,11 @@ export class ConcurrentAddMockChargebee {
   armConcurrentAddOnNextEstimate(): void { this.armed = true; }
 
   /** Applies the third-party write immediately (used by control 43.3, pre-read window). */
-  applyConcurrentAddNow(): void { this.addMandatory(); }
+  applyConcurrentAddNow(): void { this.addConcurrent(); }
 
-  private addMandatory(): void {
-    if (!this.items.some((i) => i.item_price_id === MANDATORY)) {
-      this.items.push({ item_price_id: MANDATORY, item_type: "addon", quantity: 1, unit_price: 2500, amount: 2500 });
+  private addConcurrent(): void {
+    if (!this.items.some((i) => i.item_price_id === CONCURRENT)) {
+      this.items.push({ item_price_id: CONCURRENT, item_type: "addon", quantity: 1, unit_price: 2500, amount: 2500 });
     }
     this.resourceVersion += 1000;
     this.concurrentAddAt = {
@@ -185,7 +198,7 @@ export class ConcurrentAddMockChargebee {
         // The third-party write lands NOW: after the adapter's final
         // pre-commit read/validation, before any dispatch.
         this.armed = false;
-        this.addMandatory();
+        this.addConcurrent();
       }
       return json(200, this.buildEstimate(this.parseItems(req.body ?? "")));
     }
@@ -248,7 +261,7 @@ test("Test 43.1 (Issue #22 F1): a concurrent unauthorized addition deleted by th
     mock.concurrentAddAt!.afterCallSeq > subGetSeqs[1],
     "the add landed AFTER the commit-phase (final pre-commit) subscription read — inside the validate->dispatch window",
   );
-  assert.deepEqual(mock.concurrentAddAt!.stateAfterAdd, [`${PLAN} x1`, `${ADDON} x1`, `${MANDATORY} x1`], "before dispatch, the subscription held the concurrent item");
+  assert.deepEqual(mock.concurrentAddAt!.stateAfterAdd, [`${PLAN} x1`, `${ADDON} x1`, `${CONCURRENT} x1`], "before dispatch, the subscription held the concurrent item");
   assert.deepEqual(mock.itemIds(), [PLAN, ADDON], "after the commit, the concurrently added item is GONE from the subscription");
 
   // ---- Verbatim evidence (printed before the failing assertion so
@@ -256,7 +269,7 @@ test("Test 43.1 (Issue #22 F1): a concurrent unauthorized addition deleted by th
   console.log("=== TEST43.1 EVIDENCE (observed on unmodified main) ===");
   console.log(JSON.stringify({
     authorizedChange: "CHANGE_QUANTITY pilot-addon-vision 1 -> 21 (only)",
-    concurrentMutation: "third party adds pilot-addon-mandatory x1 after the adapter's final pre-commit read/validation, before dispatch",
+    concurrentMutation: "third party adds pilot-addon-concurrent x1 (an ordinary unrelated addon) after the adapter's final pre-commit read/validation, before dispatch",
     dispatchedRequest: {
       operation: "POST /subscriptions/{subscriptionId}/update_for_items",
       replace_items_list: dispatch.params["replace_items_list"],
@@ -267,7 +280,7 @@ test("Test 43.1 (Issue #22 F1): a concurrent unauthorized addition deleted by th
       rawBody: dispatch.rawBody,
     },
     subscriptionStateAfterCommit: mock.itemIds(),
-    unauthorizedItemDeleted: !mock.itemIds().includes(MANDATORY),
+    unauthorizedItemDeleted: !mock.itemIds().includes(CONCURRENT),
     receipt: {
       status: receipt.status,
       outcome: receipt.outcome,
@@ -289,7 +302,7 @@ test("Test 43.1 (Issue #22 F1): a concurrent unauthorized addition deleted by th
   assert.ok(
     !(receipt.outcome === "COMMITTED_AND_VERIFIED" && receipt.reconciliation.status === "OK"),
     `authorization-preservation violation reported as success: outcome=${receipt.outcome}, reconciliation=${receipt.reconciliation.status} ` +
-      `although the dispatch deleted ${MANDATORY}, which was never part of the authorized change`,
+      `although the dispatch deleted ${CONCURRENT}, which was never part of the authorized change`,
   );
 });
 
@@ -324,5 +337,5 @@ test("Test 43.3 (Issue #22 F1 control): a concurrent addition landing BEFORE the
     (e: unknown) => e instanceof SCQError && e.code === "QUOTE_STALE",
   );
   assert.equal(mock.updateDispatches.length, 0, "no mutating dispatch occurred");
-  assert.deepEqual(mock.itemIds(), [PLAN, ADDON, MANDATORY], "the concurrent item survives — the refusal protected it");
+  assert.deepEqual(mock.itemIds(), [PLAN, ADDON, CONCURRENT], "the concurrent item survives — the refusal protected it");
 });

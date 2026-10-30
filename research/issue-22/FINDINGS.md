@@ -15,11 +15,25 @@ SAFE behavior. Defect tests are **expected to fail on unmodified main**; the
 failure is the reproduction. Controls in the same files pass and bound each
 defect. Nothing in the implementation was changed.
 
-**Suite accounting.** Baseline 612/612. With the four new test files:
-**630 tests, 617 pass, 13 fail** — the 13 failures are exactly the
-defect-demonstrating tests listed below; every pre-existing test still passes,
-and every new control passes. (CI build jobs will therefore fail on this
-branch by design; the failing output is preserved under `evidence/`.)
+**Suite accounting (after the PR #23 review corrections, REVIEW-1).** The
+four reproduction files are a separately invoked RESEARCH suite
+(`reference/tests/repro43–46-*.repro.ts`), deliberately outside the default
+test discovery. The **default suite is 612/612 GREEN** (`npm test`, which
+discovers only `dist/tests/*.test.js`). The research suite is run explicitly
+after a build:
+
+```
+node --test dist/tests/*.repro.js
+```
+
+and reports **18 tests: 13 fail, 5 pass** — the 13 failures are exactly the
+defect-demonstrating tests listed below; every control passes, and every
+pre-existing test still passes in the default suite. (As first delivered,
+the repro files were named `*.test.ts` and ran inside the default suite —
+630 tests, 617 pass, 13 fail. REVIEW-1 isolated them so ordinary CI is
+green while the failing-first evidence remains one explicit command away;
+no assertion was changed by the isolation. Verbatim research-suite output
+is preserved under `evidence/`.)
 
 | # | Finding | Verdict | Defect tests (fail on main) | Controls (pass) |
 |---|---|---|---|---|
@@ -36,29 +50,32 @@ branch by design; the failing output is preserved under `evidence/`.)
 ## Finding 1 (P0) — Target-state verification does not imply authorization-preserving execution — **CONFIRMED**
 
 **Fabio's claim.** Quote `pilot-addon-vision` 1→21 against a mocked Chargebee;
-a third party adds `pilot-addon-mandatory` after the final pre-commit read; SCQ
+a third party adds an unrelated addon after the final pre-commit read; SCQ
 dispatches a full `replace_items_list=true` update built against the stale
 list; the unrelated addon disappears; the post-commit state matches the old
 intended full item list, so the receipt reports `COMMITTED_AND_VERIFIED` /
-reconciliation `OK`.
+reconciliation `OK`. (The local fixture names the added item
+`pilot-addon-concurrent` — renamed from `pilot-addon-mandatory` in the
+PR #23 review corrections, REVIEW-3; see the naming note at the end of
+this finding.)
 
-**Reproduction.** `reference/tests/test43-p0-authorization-preservation.test.ts`,
+**Reproduction.** `reference/tests/repro43-authorization.repro.ts`,
 test 43.1: the Chargebee-live adapter over a self-contained scripted mocked
 transport (modeled on the pilot fixture's wire shapes). The scripted
 third-party write lands on the commit-phase revalidation estimate — i.e.
 strictly **after** the adapter's final pre-commit subscription GET and
 fingerprint validation, **before** dispatch (wire-log ordering asserted in the
-test). Full output: `evidence/test43-failing-output.txt`.
+test). Full output: `evidence/repro43-failing-output.txt`.
 
 **Captured evidence (verbatim from the failing run).**
 
 (a) *Authorized change set* — the only authorized change:
 `CHANGE_QUANTITY pilot-addon-vision 1 -> 21`.
 
-(b) *Concurrent mutation* — third party adds `pilot-addon-mandatory x1`
+(b) *Concurrent mutation* — third party adds `pilot-addon-concurrent x1`
 (flat_fee, 2500) after the final pre-commit read/validation, before dispatch.
 State after the add, before dispatch:
-`[pilot-plan-business x1, pilot-addon-vision x1, pilot-addon-mandatory x1]`.
+`[pilot-plan-business x1, pilot-addon-vision x1, pilot-addon-concurrent x1]`.
 
 (c) *Exact dispatched Chargebee request* —
 `POST /subscriptions/{subscriptionId}/update_for_items` with
@@ -71,7 +88,7 @@ subscription_items%5Bitem_price_id%5D%5B0%5D=pilot-plan-business&subscription_it
 ```
 
 (d) *Resulting subscription state* — `[pilot-plan-business, pilot-addon-vision]`.
-**`pilot-addon-mandatory` is gone**: deleted by the replacement although it was
+**`pilot-addon-concurrent` is gone**: deleted by the replacement although it was
 never part of the authorized change.
 
 (e) *Receipt* — `status: COMMITTED`, `outcome: COMMITTED_AND_VERIFIED`,
@@ -125,15 +142,26 @@ unchanged) — or a provider conditional write. Neither exists today; see
 `AUTHORIZATION-PRESERVATION-CONTRACT.md` for the proposed contract and
 refusal conditions, and `CHARGEBEE-CAPABILITY-ASSESSMENT.md` for what
 Chargebee documents. Note the mock models documented replacement semantics.
-Chargebee's docs state a preservation exception for *mandatory*
-(catalog-flagged) addons — they survive replacement unless named in
-`mandatory_items_to_remove` (the adapter sends none) — but state it
-explicitly for the addons-only replacement case; its application inside a
-plan-included replacement is not separately documented in the sources
-checked (see the capability assessment, §1.5 and "What remains
-UNVERIFIED"). An ordinary concurrently added item has no such protection
-on any reading, and `pilot-addon-mandatory` here is an ordinary item
-price id in the fixture, not a catalog mandatory addon.
+
+**Naming / scope note (REVIEW-3).** The concurrently added item is an
+ORDINARY unrelated addon in this fixture (`pilot-addon-concurrent`, a
+plain flat_fee item price). Nothing provider-enforced-mandatory is
+simulated: the item carries no catalog mandatory flag, and the mock
+implements none of Chargebee's mandatory-addon preservation mechanics.
+What this reproduction proves is the GENERIC full-list overwrite race —
+an ordinary item added inside the validate→dispatch window is deleted
+by the replacement and the loss is invisible to the receipt. It does
+NOT establish that a genuinely provider-enforced mandatory addon could
+be deleted on real Chargebee: Chargebee's docs state a preservation
+exception for *mandatory* (catalog-flagged) addons — they survive
+replacement unless named in `mandatory_items_to_remove` (the adapter
+sends none) — but state it explicitly for the addons-only replacement
+case; whether the exception also applies inside a plan-included
+replacement is NOT documented in the sources checked (see the
+capability assessment, §1.5 and "What remains UNVERIFIED"), so
+deletability of a real mandatory addon remains UNVERIFIED. An ordinary
+concurrently added item has no such documented protection on any
+reading, which is all this finding claims.
 
 ---
 
@@ -143,9 +171,9 @@ price id in the fixture, not a catalog mandatory addon.
 is accepted on Stripe-sim and the receipt is `OK`; malformed / nonfinite /
 negative envelope bounds are not rejected.
 
-**Reproduction.** `reference/tests/test44-runtime-validation.test.ts`
+**Reproduction.** `reference/tests/repro44-runtime-validation.repro.ts`
 (Stripe simulator + engine-level). Full output:
-`evidence/test44-failing-output.txt`. Observed on main:
+`evidence/repro44-failing-output.txt`. Observed on main:
 
 - **44.1** — `guaranteeMode: "REVALDIATE"`, no envelope: quote created with
   the typo preserved verbatim as the quote's effective mode
@@ -183,11 +211,11 @@ subscriptionRef remains `pilot-sub-001` while the snapshot names another
 subscription. PR #20's preflight identity check does not cover the mutating
 commit/verification path.
 
-**Reproduction.** `reference/tests/test45-identity-currency.test.ts`, test
+**Reproduction.** `reference/tests/repro45-identity-currency.repro.ts`, test
 45.1: Chargebee-live adapter over the pilot mock, wrapped so that every GET
 after the mutating dispatch returns the same payload with
 `subscription.id = "pilot-sub-999"`. Full output:
-`evidence/test45-failing-output.txt`. Observed receipt:
+`evidence/repro45-failing-output.txt`. Observed receipt:
 `subscriptionRef: "pilot-sub-001"`, `resultingSnapshot.id: "pilot-sub-999"`,
 `outcome: COMMITTED_AND_VERIFIED`, `reconciliation: OK`.
 
@@ -211,7 +239,7 @@ read-only preflight only. The mutating path has no equivalent.
 numeric value reconcile OK; `compareDeterminedDimensions` compares numbers
 without currency; `CommercialEffect.immediate` has no currency field.
 
-**Reproduction.** `reference/tests/test45-identity-currency.test.ts`, tests
+**Reproduction.** `reference/tests/repro45-identity-currency.repro.ts`, tests
 45.3–45.5 (engine level). Observed on main: USD→EUR at identical numbers
 reconciles **OK** (45.3); the pre-mutation envelope gate also passes the
 cross-currency pair silently (45.4); MONTHLY→ANNUAL cadence at the same
@@ -241,23 +269,65 @@ candidate is independently confirmed with an equal amount, the receipt flips
 to VERIFIED/OK while `committedEffect.determinacy` remains UNKNOWN and
 `committedSource` remains `"unestablished"`.
 
-**Reproduction.** `reference/tests/test46-receipt-verification.test.ts`,
+**Reproduction.** `reference/tests/repro46-receipt-verification.repro.ts`,
 built on the merged candidate construction (mutation response received,
 independent re-read down → COMMITTED_UNVERIFIED with recorded candidates;
-the test26.17 shape). Full output: `evidence/test46-failing-output.txt`.
+the test26.17 shape). Full output: `evidence/repro46-failing-output.txt`.
+
+**Evidence provenance (PR #23 review correction, REVIEW-2).** As first
+delivered, 46.1/46.2 built the verification observation from literal
+figures chosen by the test file, and in 46.2 the mock's GET record still
+showed 80900 — so the pair demonstrated the store's strict-equality
+upgrade restriction against a *caller-constructed* observation, not
+against independently established provider actuals. The harness now
+persists the divergence provider-side and derives the observation from
+the read:
+
+- In **46.2**, the harness's provider record carries the plan item at a
+  corrected unit price (62400) from the moment the update lands. The
+  mutation response still states the plan at 59900, so the receipt
+  records candidate recurring **80900** from the response — while the
+  independent post-commit GET of the provider record shows stated item
+  amounts 62400 + 21000, and the observation's recurring (**83400**) is
+  derived from that read (the adapter's own snapshot derivation sums
+  the record's stated amounts). The observation's immediate (20000) is
+  read from the provider's operation-bound record of this very update —
+  the persisted update response's `unbilled_charges` — so both figures
+  are bound to provider records (the subscription record for recurring;
+  the operation's own charge record for immediate), not picked by the
+  test. The store refuses this genuinely provider-established,
+  differing actual with the same identity error.
+- In **46.1**, the observation's recurring is likewise derived from the
+  independent read (80900; it agrees with the candidate — nothing about
+  it is contested). Its immediate figure remains a *stated* observation
+  figure, disclosed as such in the test: the incomplete-response fault
+  models a provider operation record whose response carries no charge
+  figure and the fixture has no post-commit charge-read endpoint. The
+  missing-dimension restriction 46.1 demonstrates does not depend on
+  that figure's provenance — any established immediate contradicts the
+  receipt's absent immediate identity field.
+- **46.3** is unchanged in substance.
+
+A distinction the corrected evidence makes precise: *recording*
+contradictory evidence for investigation (append it, bound to the
+receipt's identity, marked as establishing a VIOLATED actual) is not
+the same as *marking it verified*. The safe behavior asserted is only
+the former; the store today permits neither — differing evidence is
+refused at the door, so the contradiction cannot even be recorded.
 
 - **46.1 (a) CONFIRMED.** Receipt recorded with a recurring candidate
   (80900) but **no** immediate candidate (the update response carried no
   financials). Later evidence establishing immediate = 20000 (and recurring
-  = the recorded 80900) is refused:
+  = the recorded 80900, read-derived as above) is refused:
   *"Verification refused: the evidence's committed figures
   (immediate.net=20000, recurring.resultingAmount=80900) contradict the
   figures recorded on the receipt…"* (`CONFLICTING_RECEIPT_IDENTITY`).
 - **46.2 (b) CONFIRMED.** Receipt recorded with candidate recurring 80900.
-  Independent evidence establishing the actual recurring as **83400** is
-  refused with the same identity error. There is no path by which a wrong
-  candidate can be corrected: the record can only ever be confirmed
-  verbatim or stay unverified forever.
+  Independent evidence establishing the actual recurring as **83400** —
+  persisted in and read back from the provider record, per the
+  provenance note above — is refused with the same identity error. There
+  is no path by which a wrong candidate can be corrected: the record can
+  only ever be confirmed verbatim or stay unverified forever.
 - **46.3 (c) CONFIRMED.** With confirming evidence (20000 / 80900), the
   transition succeeds: current view `outcome: COMMITTED_AND_VERIFIED`,
   `reconciliation: OK` — while the same view's `committedEffect.determinacy`
@@ -362,14 +432,18 @@ in `AUTHORIZATION-PRESERVATION-CONTRACT.md`.
 
 | Artifact | Contents |
 |---|---|
-| `reference/tests/test43-p0-authorization-preservation.test.ts` | F1 repro + 2 controls; prints the full (a)–(e) capture |
-| `reference/tests/test44-runtime-validation.test.ts` | F2 repro (5 defect tests) + control |
-| `reference/tests/test45-identity-currency.test.ts` | F3 repro + control; F4 repro (3) + control |
-| `reference/tests/test46-receipt-verification.test.ts` | F5 repro (3 sub-cases) + immutability controls |
-| `evidence/test43-failing-output.txt` | Verbatim failing run, test43 (incl. the EVIDENCE block) |
-| `evidence/test44-failing-output.txt` | Verbatim failing run, test44 |
-| `evidence/test45-failing-output.txt` | Verbatim failing run, test45 |
-| `evidence/test46-failing-output.txt` | Verbatim failing run, test46 |
+| `reference/tests/repro43-authorization.repro.ts` | F1 repro + 2 controls; prints the full (a)–(e) capture |
+| `reference/tests/repro44-runtime-validation.repro.ts` | F2 repro (5 defect tests) + control |
+| `reference/tests/repro45-identity-currency.repro.ts` | F3 repro + control; F4 repro (3) + control |
+| `reference/tests/repro46-receipt-verification.repro.ts` | F5 repro (3 sub-cases) + immutability controls |
+| `evidence/repro43-failing-output.txt` | Verbatim failing run, repro43 (incl. the EVIDENCE block) |
+| `evidence/repro44-failing-output.txt` | Verbatim failing run, repro44 |
+| `evidence/repro45-failing-output.txt` | Verbatim failing run, repro45 |
+| `evidence/repro46-failing-output.txt` | Verbatim failing run, repro46 |
+
+The four repro files are the research suite (REVIEW-1): after a build,
+run `node --test dist/tests/*.repro.js` from `reference/`. They are not
+part of the default `npm test` discovery.
 | `CHARGEBEE-CAPABILITY-ASSESSMENT.md` | Provider capability research (Phase 2) |
 | `AUTHORIZATION-PRESERVATION-CONTRACT.md` | MSE comparison, minimal contract, refusal conditions, recommended v0.6.2 corrections (Phase 3) |
 

@@ -14,6 +14,11 @@ import type { CommercialEffect, SubscriptionChangeProposal } from "../src/core/t
 // controls pass. Simulated evidence only (mocked transports /
 // in-memory engine calls) — never LIVE.
 //
+// RESEARCH SUITE (PR #23 REVIEW-1): this file is NOT part of the
+// default `npm test` discovery (`dist/tests/*.test.js`). Build,
+// then invoke the research suite explicitly:
+// `node --test dist/tests/*.repro.js`.
+//
 // Finding 3: the Chargebee-live adapter never checks that the
 // post-commit re-read names the SAME subscription the quote was
 // for. establishLiveCommit consumes the re-read's items and

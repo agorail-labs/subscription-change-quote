@@ -31,9 +31,12 @@ deterministically on current main (`FINDINGS.md` Finding 1, test 43.1).
 A note on names, to prevent a real confusion: Chargebee's "mandatory
 addon" (a catalog flag with a documented preservation exception) and
 MSE's `REQUIRES_COINCLUSION` admission relation are unrelated concepts
-that happen to share vocabulary. The fixture item `pilot-addon-mandatory`
-is an ordinary item price id. Nothing below relies on either concept
-standing in for the other.
+that happen to share vocabulary. The fixture item
+`pilot-addon-concurrent` (renamed from `pilot-addon-mandatory` in the
+PR #23 review corrections, REVIEW-3) is an ordinary item price id —
+nothing provider-enforced-mandatory is simulated, and the Finding 1
+reproduction establishes the generic full-list overwrite race only.
+Nothing below relies on either concept standing in for the other.
 
 ---
 
