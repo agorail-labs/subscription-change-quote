@@ -249,7 +249,7 @@ function ownEnvelopeBound(record: Record<string, unknown>, field: (typeof ENVELO
 }
 
 /**
- * PR-15 correction (P15-2): the SANITIZED envelope — a fresh plain
+ * PR-15 correction (P15-2): the SANITIZED envelope — a fresh
  * object carrying ONLY the envelope's own, supported bounds. For a
  * shape-valid envelope every own bound is already known valid
  * (assertEnvelopeShapeValid / envelopeShapeProblem ran first), so
@@ -259,10 +259,21 @@ function ownEnvelopeBound(record: Record<string, unknown>, field: (typeof ENVELO
  * shared comparison entry (compareDeterminedDimensions), so the
  * quote-time gate, post-commit reconciliation, and the fireable
  * projection path all compare the same sanitized form.
+ *
+ * FINAL correction (P15-2 completion): the copy is a
+ * NULL-PROTOTYPE object (Object.create(null)), not an ordinary
+ * `{}`. An ordinary object inherits from Object.prototype, so if
+ * that prototype is polluted (Object.prototype.maxRecurring-
+ * Increase set), an ABSENT bound on the sanitized copy would
+ * still read as the polluted value at any ordinary property read.
+ * The null prototype removes the last chain: an absent bound is
+ * absent, full stop. Defense in depth: compareDeterminedDimensions
+ * additionally reads bounds own-properties-only (ownEnvelopeBound)
+ * rather than trusting construction alone.
  */
 function sanitizedEnvelope(envelope: AcceptanceEnvelope): AcceptanceEnvelope {
   const record = envelope as Record<string, unknown>;
-  const out: AcceptanceEnvelope = {};
+  const out = Object.create(null) as AcceptanceEnvelope;
   for (const field of ENVELOPE_FIELD_NAMES) {
     const value = ownEnvelopeBound(record, field);
     if (value !== undefined) out[field] = value as number;
@@ -710,13 +721,20 @@ function compareDeterminedDimensions(
   // prototype chain can never enlarge the permitted drift here,
   // whatever object the caller passed in.
   const bounds = sanitizedEnvelope(envelope);
+  // FINAL correction (P15-2 completion): bounds are READ through
+  // ownEnvelopeBound as well. The sanitized copy is null-prototype
+  // (see sanitizedEnvelope), but the reads do not rely on that
+  // construction alone: an own-property read states the rule at
+  // the point of use and stays correct for any envelope-shaped
+  // object this function may ever be handed.
+  const boundsRecord = bounds as unknown as Record<string, unknown>;
   if (comparable.has("immediateFinancialEffect")) {
     const quotedNet = quoted.immediate!.net!;
     const revalidatedNet = compared.immediate!.net!;
     const netIncrease = revalidatedNet - quotedNet;
 
     if (netIncrease > 0) {
-      const allowed = bounds.maxImmediateNetIncrease ?? 0;
+      const allowed = (ownEnvelopeBound(boundsRecord, "maxImmediateNetIncrease") as number | undefined) ?? 0;
       if (netIncrease > allowed) {
         return `immediate.net increased by ${netIncrease} (quoted ${quotedNet} -> revalidated ${revalidatedNet}), exceeding maxImmediateNetIncrease=${allowed}`;
       }
@@ -726,7 +744,7 @@ function compareDeterminedDimensions(
       // reasonably want a tighter or looser tolerance on "I got charged less
       // than expected" than on being charged more.
       const creditDecrease = -netIncrease;
-      const allowed = bounds.maxImmediateCreditDecrease ?? 0;
+      const allowed = (ownEnvelopeBound(boundsRecord, "maxImmediateCreditDecrease") as number | undefined) ?? 0;
       if (creditDecrease > allowed) {
         return `immediate.net moved in the caller's favor by ${creditDecrease} (quoted ${quotedNet} -> revalidated ${revalidatedNet}), exceeding maxImmediateCreditDecrease=${allowed}`;
       }
@@ -738,7 +756,7 @@ function compareDeterminedDimensions(
     const revalidatedRecurring = compared.recurring!.resultingAmount!;
     const recurringIncrease = revalidatedRecurring - quotedRecurring;
     if (recurringIncrease > 0) {
-      const allowed = bounds.maxRecurringIncrease ?? 0;
+      const allowed = (ownEnvelopeBound(boundsRecord, "maxRecurringIncrease") as number | undefined) ?? 0;
       if (recurringIncrease > allowed) {
         return `recurring.resultingAmount increased by ${recurringIncrease} (quoted ${quotedRecurring} -> revalidated ${revalidatedRecurring}), exceeding maxRecurringIncrease=${allowed}`;
       }
@@ -763,11 +781,20 @@ function compareDeterminedDimensions(
  */
 function fireableEnvelopeProjection(envelope: unknown): AcceptanceEnvelope {
   const NEVER = Number.POSITIVE_INFINITY;
+  // FINAL correction (P15-2 completion): the projection is
+  // NULL-PROTOTYPE, like the sanitized envelope — it is an
+  // envelope-shaped object whose absent fields must stay absent
+  // under any Object.prototype pollution when it is later read
+  // for bounds (via compareDeterminedDimensions).
   if (typeof envelope !== "object" || envelope === null || Array.isArray(envelope)) {
-    return { maxImmediateNetIncrease: NEVER, maxImmediateCreditDecrease: NEVER, maxRecurringIncrease: NEVER };
+    const none = Object.create(null) as AcceptanceEnvelope;
+    none.maxImmediateNetIncrease = NEVER;
+    none.maxImmediateCreditDecrease = NEVER;
+    none.maxRecurringIncrease = NEVER;
+    return none;
   }
   const record = envelope as Record<string, unknown>;
-  const out: AcceptanceEnvelope = {};
+  const out = Object.create(null) as AcceptanceEnvelope;
   for (const field of ENVELOPE_FIELD_NAMES) {
     // Own properties only (P15-2): an inherited bound is not part
     // of the recorded envelope, so it neither fires nor is

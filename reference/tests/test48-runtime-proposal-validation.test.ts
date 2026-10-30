@@ -962,3 +962,130 @@ test("Test 48.21 (P15-2): inherited envelope bounds never influence validation o
   assert.equal(checkAcceptanceEnvelope(quoted, drifted, { maxRecurringIncrease: 10000 }, QTY_PROPOSAL), null, "an own bound of 10000 still tolerates a +5000 drift at quote time");
   assert.equal(reconcileCommittedEffect(quoted, committedDrift, { maxRecurringIncrease: 10000 }, QTY_PROPOSAL).status, "OK", "an own bound of 10000 still reconciles a +5000 drift OK");
 });
+
+// ---------------------------------------------------------------------------
+// 48.22 — PR-15 FINAL envelope-integrity correction (P15-2
+// completion): PROTOTYPE POLLUTION through the sanitized envelope.
+// Test 48.21 severed the CALLER's prototype chain: validation and
+// comparison read the caller's envelope own-properties-only. But
+// the objects the ENGINE constructs — sanitizedEnvelope's copy and
+// the fireable projection — were ordinary `{}` objects, which
+// inherit from Object.prototype. If that prototype is polluted
+// (Object.prototype.maxRecurringIncrease = 1_000_000), a caller
+// envelope with NO own bound for a dimension sanitizes to an
+// object with no own bound for it either — and an ordinary read of
+// the absent field then returns the POLLUTED inherited value, so
+// the comparison treats the drift as tolerated. The caller's
+// chain was never the only chain in the room.
+//
+// The correction is two-layered: every envelope-shaped object the
+// engine constructs is NULL-PROTOTYPE (Object.create(null)), and
+// every bound read in the comparison path is own-property-only —
+// construction alone is not trusted to cover future read sites.
+//
+// This test pollutes Object.prototype TEMPORARILY and restores it
+// in a finally block (deleting exactly the two properties it set),
+// then asserts restoration. Test 48.23 below is the leak guard: it
+// fails if any pollution survives into the rest of the suite.
+// ---------------------------------------------------------------------------
+
+test("Test 48.22 (P15-2 completion): a polluted Object.prototype cannot enlarge envelope tolerance through engine-constructed envelopes", async () => {
+  const quoted = detEffect(20000, 80900, false);
+  const driftedRecurring = detEffect(20000, 85900, false); // recurring +5000
+  const driftedImmediate = detEffect(25000, 80900, false); // immediate +5000
+  const committedDriftRecurring = detEffect(20000, 85900, true);
+  const committedDriftImmediate = detEffect(25000, 80900, true);
+  const committedWithin = detEffect(20000, 80900, true);
+  const proto = Object.prototype as Record<string, unknown>;
+  const HUGE = 1_000_000;
+
+  try {
+    proto.maxRecurringIncrease = HUGE;
+    proto.maxImmediateNetIncrease = HUGE;
+    assert.equal(({} as Record<string, unknown>).maxRecurringIncrease, HUGE, "fixture check: the pollution is live for ordinary objects");
+
+    // (a) Quote-time gate, caller envelope {} (no own bounds):
+    // zero tolerance must apply — the polluted million must not
+    // be observed through the sanitized envelope.
+    const vRec = checkAcceptanceEnvelope(quoted, driftedRecurring, {}, QTY_PROPOSAL);
+    assert.ok(vRec !== null && /maxRecurringIncrease=0/.test(vRec), `(a) polluted prototype must not pass a +5000 recurring drift at quote time, got: ${vRec}`);
+    const vImm = checkAcceptanceEnvelope(quoted, driftedImmediate, {}, QTY_PROPOSAL);
+    assert.ok(vImm !== null && /maxImmediateNetIncrease=0/.test(vImm), `(a) polluted prototype must not pass a +5000 immediate drift at quote time, got: ${vImm}`);
+
+    // (b) Post-commit reconcile, same empty envelope: an
+    // established out-of-tolerance commit must report VIOLATED,
+    // never OK.
+    const rRec = reconcileCommittedEffect(quoted, committedDriftRecurring, {}, QTY_PROPOSAL);
+    assert.equal(rRec.status, "VIOLATED", `(b) polluted prototype must not reconcile a +5000 recurring drift OK, got ${rRec.status}`);
+    const rImm = reconcileCommittedEffect(quoted, committedDriftImmediate, {}, QTY_PROPOSAL);
+    assert.equal(rImm.status, "VIOLATED", `(b) polluted prototype must not reconcile a +5000 immediate drift OK, got ${rImm.status}`);
+
+    // (d) Post-commit PROJECTION path under pollution: a
+    // malformed envelope carrying only an unknown field has NO
+    // interpretable bound, so its projection states zero
+    // tolerance — the established +5000 drift must fire through
+    // it (VIOLATED), not be absorbed by the polluted prototype.
+    const rProj = reconcileCommittedEffect(quoted, committedDriftRecurring, { unknownField: 1 } as any, QTY_PROPOSAL);
+    assert.equal(rProj.status, "VIOLATED", `(d) projection must not be pollution-sensitive: a +5000 drift through a bound-less malformed envelope must report VIOLATED, got ${rProj.status}`);
+    // Stability: the 48.20 falsy-envelope family classifies
+    // exactly as before under pollution (UNVERIFIED, never OK).
+    const rFalsy = reconcileCommittedEffect(quoted, committedWithin, null as any, QTY_PROPOSAL);
+    assert.equal(rFalsy.status, "UNVERIFIED", `(d) a supplied null envelope still classifies UNVERIFIED under pollution, got ${rFalsy.status}`);
+
+    // (c) End-to-end (Stripe simulator): quote with an envelope
+    // carrying huge OWN immediate tolerances and NO recurring
+    // bound; a concurrent price change lands inside the mutation
+    // (the test17.9 wrapping pattern) so the COMMITTED recurring
+    // exceeds the quoted by +1200 while the landed item set is
+    // exactly the intended one. The receipt must not read OK —
+    // this adapter records a COMMITTED receipt whose
+    // reconciliation reports the envelope VIOLATED.
+    const { sim, sub } = freshStripeFixture();
+    const adapter = new StripeAdapter(sim, new QuoteStore());
+    const quote = await adapter.createChangeQuote(sub.id, {
+      changes: [{ action: "CHANGE_QUANTITY", itemId: "si_1", quantity: 120 }],
+      effectiveIntent: { type: "IMMEDIATE" },
+      guaranteeMode: "REVALIDATE",
+      acceptanceEnvelope: { maxImmediateNetIncrease: 1_000_000_000, maxImmediateCreditDecrease: 1_000_000_000 },
+    } as any);
+    const realUpdate = sim.update.bind(sim);
+    sim.update = ((...args: Parameters<typeof realUpdate>) => {
+      const result = realUpdate(...args);
+      sim._debugMutateDirectly(sub.id, (s) => {
+        s.items[0].price = { ...s.items[0].price, unitAmount: 1010 };
+      });
+      return result;
+    }) as typeof realUpdate;
+    const receipt = await adapter.commitChangeQuote(quote.id);
+    assert.equal(receipt.committedEffect.recurring?.resultingAmount, 121200, "(c) fixture check: the committed recurring is the drifted read-back (120 x 1010)");
+    assert.equal(receipt.reconciliation.status, "VIOLATED", `(c) polluted prototype must not let an end-to-end commit reconcile OK past a zero-tolerance recurring bound, got ${receipt.reconciliation.status}`);
+    if (receipt.reconciliation.status === "VIOLATED") {
+      assert.match(receipt.reconciliation.reason, /maxRecurringIncrease=0/, "(c) the violation must be the envelope's (maxRecurringIncrease=0)");
+    }
+  } finally {
+    // Restoration is unconditional — even when an assertion above
+    // throws (the pre-fix failing-first runs), the suite must not
+    // leak pollution into later tests.
+    delete proto.maxRecurringIncrease;
+    delete proto.maxImmediateNetIncrease;
+  }
+
+  // (e) Control after restoration: the prototype carries neither
+  // property, and the same comparisons behave exactly as the
+  // unpolluted suite expects.
+  assert.equal(Object.prototype.hasOwnProperty.call(Object.prototype, "maxRecurringIncrease"), false, "(e) Object.prototype must be restored (no own maxRecurringIncrease)");
+  assert.equal(Object.prototype.hasOwnProperty.call(Object.prototype, "maxImmediateNetIncrease"), false, "(e) Object.prototype must be restored (no own maxImmediateNetIncrease)");
+  const vControl = checkAcceptanceEnvelope(quoted, driftedRecurring, {}, QTY_PROPOSAL);
+  assert.ok(vControl !== null && /maxRecurringIncrease=0/.test(vControl), `(e) after restoration the empty envelope still enforces zero tolerance, got: ${vControl}`);
+  assert.equal(reconcileCommittedEffect(quoted, committedDriftRecurring, {}, QTY_PROPOSAL).status, "VIOLATED", "(e) after restoration the drift still reconciles VIOLATED");
+});
+
+test("Test 48.23 (P15-2 completion): prototype-cleanliness guard — no pollution leaks out of test48.22", () => {
+  for (const field of ["maxImmediateNetIncrease", "maxImmediateCreditDecrease", "maxRecurringIncrease"]) {
+    assert.equal(
+      Object.prototype.hasOwnProperty.call(Object.prototype, field),
+      false,
+      `Object.prototype must not carry an own ${field} — test48.22's restoration failed or another test polluted the suite`
+    );
+  }
+});

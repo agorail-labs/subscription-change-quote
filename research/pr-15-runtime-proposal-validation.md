@@ -339,3 +339,93 @@ protocol), with the reference implementation following the spec.
   `reference/src/core/scq-engine.ts` (`types.ts` and both specs
   untouched), so `check-frozen-surface` fails by design until the
   `protocol-change-approved` label is applied by a maintainer.
+
+## Final correction (P15-2 completion): prototype pollution through engine-constructed envelopes
+
+The maintainer's re-review of `326c51a` confirmed P15-1 fixed and
+P15-2 *partially* fixed. One residual bypass remained: P15-2 made
+validation and comparison read the CALLER's envelope
+own-properties-only, but `sanitizedEnvelope()` built its copy as
+an ordinary `{}` — an object that inherits from
+`Object.prototype`. If that prototype is polluted
+(`Object.prototype.maxRecurringIncrease = 1_000_000`), a caller
+envelope with no own bound for a dimension sanitizes to a copy
+with no own bound either, and the comparison's ordinary read of
+the absent field returned the polluted inherited value: the
+drift was treated as tolerated. The caller's prototype chain was
+never the only chain in the room — the engine's own constructed
+objects carried one too. The fireable projection
+(`fireableEnvelopeProjection`) had the same construction.
+
+**Failing-first profile** (regression appended as test48.22,
+run against the unmodified `326c51a`; a probe exercised each
+assertion individually because the test stops at the first
+failure). Under temporary `Object.prototype` pollution
+(`maxRecurringIncrease` and `maxImmediateNetIncrease` set to
+1,000,000), with a caller envelope of `{}`:
+
+- (a) `checkAcceptanceEnvelope` returned `null` for a +5000
+  recurring drift and for a +5000 immediate drift — zero
+  tolerance silently enlarged to the polluted million.
+- (b) `reconcileCommittedEffect` returned **OK** for both
+  drifts with established committed figures.
+- (c) End-to-end (Stripe simulator): a quote with huge own
+  immediate tolerances and no recurring bound, plus a concurrent
+  price change landing inside the mutation (committed recurring
+  121200 vs quoted 120000), produced a COMMITTED receipt whose
+  reconciliation read **OK**.
+- (d) The projection path: a malformed envelope carrying only an
+  unknown field classified the +5000 drift UNVERIFIED (its
+  bound-less projection absorbed the drift through the polluted
+  read) instead of VIOLATED. The 48.20 falsy-envelope family was
+  NOT pollution-sensitive (UNVERIFIED before and after).
+
+**Fix (two layers, both applied).** (1) Construction: every
+envelope-shaped object the engine constructs is now a
+NULL-PROTOTYPE object (`Object.create(null)`) — the sanitized
+envelope and both fireable-projection constructions (the
+per-field projection and the non-object all-NEVER fallback).
+(2) Reads: `compareDeterminedDimensions` reads bounds through
+`ownEnvelopeBound` (own-properties-only) instead of ordinary
+property access, so the rule holds at the point of use even for
+a future envelope-shaped object that is not null-prototype.
+Semantics are otherwise identical: same three fields, zero is
+valid, omitted means zero tolerance, projection sentinel behavior
+unchanged, reconcile never throws, P15-1's undefined-only
+omission unchanged. `sanitizedEnvelope` is internal (not
+exported), so the regression pins the behavior through the
+exported gates rather than the construction directly.
+
+**Audit (complete).** Envelope-shaped constructions in
+`src/core/scq-engine.ts`: `sanitizedEnvelope` (hardened),
+`fireableEnvelopeProjection` main + fallback (hardened). No
+envelope spreads (`{...env}`) exist anywhere in `src/`. Bound
+read sites: `compareDeterminedDimensions` — the only ordinary
+reads, now own-only; `envelopeShapeProblem`,
+`sanitizedEnvelope`, and `fireableEnvelopeProjection` already
+read their source own-only (P15-2); `assertEnvelopeEnforceable`
+takes no envelope; `checkAcceptanceEnvelope` and
+`enforceGuaranteeRequest` read no bound fields (shape/presence
+via the own-only helpers). Adapters: a full-tree grep finds NO
+reads of individual envelope fields outside the engine — all
+five adapters (and the live preflight) pass
+`proposal.acceptanceEnvelope` wholesale into the engine entry
+points; the field is embedded in some error `details` objects,
+which is not a comparison read and is outside this defect path.
+
+**Regression.** test48.22 pollutes `Object.prototype` inside a
+try/finally that ALWAYS deletes exactly the two properties it
+set, then asserts restoration; test48.23 is a standing
+prototype-cleanliness guard for the rest of the file. On the
+failing-first run, test48.22 failed at assertion (a) and
+test48.23 still passed — the restoration held even on the
+throwing path.
+
+**Verification after the fix** (Node 22.14 local; CI covers
+Node 20 + 22): default suite **656/656** (654 + 2 new);
+research suite unchanged at 8 pass / 10 fail with repro44 still
+6/6; provider neutrality OK; package smoke and demo OK. Gated
+surface unchanged in kind: this correction modifies only
+`reference/src/core/scq-engine.ts` among gated files (`types.ts`
+and both specs untouched), so the freeze guard continues to fail
+by design until a maintainer applies `protocol-change-approved`.
