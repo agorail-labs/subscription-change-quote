@@ -78,6 +78,17 @@ dedicated methods (`recordAttemptReceipt` / `recordAttemptOutcome`) that
 commit the quote row, the receipt record, and the attempt's terminal state
 in **one** SQLite transaction.
 
+Because write-through mutates memory before it persists, a persistence
+failure leaves the instance holding state that may not be on disk. Two
+rules make that fail closed (PR-17 review correction D1, §9): **every**
+step of the persistence path (fault hooks, encoding, transaction) is
+inside the poison-on-failure coverage, and **every** read/replay
+egress (`get`, `all`, `recordedReceipt`, `receiptsWithReconciliation`,
+`serializeReceiptRecords`, `recoveryReport`) is poison-guarded — after
+any persistence failure the instance serves nothing, and the only
+recovery is a restart from the database file, whose contents are
+exactly what actually committed.
+
 On open, persisted data is adopted only after, in order: schema-version
 check → per-record SHA-256 integrity check → the parent's
 `restoreReceiptRecords` coherence validation (digest re-computation,
@@ -224,6 +235,11 @@ whose store refused to open, without adopting anything.
 | Database unavailable (bad path) | Construction throws; no fallback | 27.22a |
 | Corrupt / unsupported schema version | Open refused; `inspect` reports version 999 | 27.23 |
 | One corrupted record in a set | Whole set refused — no partial adoption; `inspect` names the record | 27.24 |
+| Receipt persistence fails AFTER the in-memory record (pre-persist hook or mid-transaction) | Store poisoned AND reads poison-guarded: no volatile receipt via `recordedReceipt` / `get` / adapter replay while the failed instance is alive; reopen has no receipt (D1) | 29.1, 29.2, 29.3, 29.6, 29.7 |
+| Outcome / verification-transition persistence fails after the in-memory mutation | Same fail-closed rule on the `recordCommitOutcome` / `verifyCommitReceipt` write-through paths (D1 audit) | 29.4, 29.5 |
+| Retry of a CONFIRMED_NON_EXECUTION attempt while another attempt on the subscription is unresolved | Blocked under the same transaction before re-arming; zero additional dispatches (D2) | 29.8; legitimate retry after resolution: 29.9 |
+| Idempotency key presented under a different quote/subscription/site | Refused as a collision in any attempt state; the bound attempt is never re-associated (D2) | 29.10 |
+| Adapter configured with a durable store but no coordinator | Commit refused before any mutating call; zero mutations (D4) | 29.13 |
 
 ## 4. Concurrency evidence
 
@@ -259,8 +275,9 @@ the first commit's, with the mock's mutation count still 1).
 ## 6. Verification (this branch)
 
 - Clean build via a fresh `npm ci` (lockfile-complete, native prebuild
-  installed from the lockfile) then `npm test`: **381/381** (baseline 351 +
-  30 new: test27 ×26, test28 ×4). New suites re-run 3× for stability.
+  installed from the lockfile) then `npm test`: **394/394** (baseline 351 +
+  43 new: test27 ×26, test28 ×4, test29 ×13 — the PR-17 review-correction
+  regressions, §9). New suites re-run for stability.
 - `npm run smoke:pack`: OK. `npm run demo`: OK. `npm run demo:commit`: OK
   (COMMITTED / BEST_EFFORT / reconciliation OK).
 - Provider-neutrality: OK (core untouched). Freeze guard: `git diff` vs
@@ -272,8 +289,8 @@ the first commit's, with the mock's mutation count still 1).
 - Zero-real-mutation audit: every dispatch in the new suites is accounted
   for by injected mocked transports or the coordinator's dispatch counters;
   no network transport is constructed anywhere in test27/test28.
-- Disclosed pre-existing test changes: **none**. 351/351 pre-existing tests
-  pass unmodified.
+- Disclosed pre-existing test changes: **none** (including the §9
+  corrections round). 351/351 pre-existing tests pass unmodified.
 
 ## 7. Known limitations
 
@@ -302,10 +319,144 @@ the first commit's, with the mock's mutation count still 1).
 1. v0.6.2 Chargebee migration — **done** (simulator PR #15, live adapter
    PR #16, both merged).
 2. Durable store implemented + restart-tested — **satisfied by this PR,
-   subject to review** (this note, test27/test28).
+   subject to review** (this note, test27/test28/test29).
 3. Executed preflight for the exact commit — **open**.
 4. Named reconciliation owner — **open**.
 5. Separate authorization for any live mutation — **open**; none was given
    or used here.
 
 **Overall: the controlled Chargebee test-site commit remains NO-GO.**
+
+## 9. PR-17 review corrections (D1–D4)
+
+The owner's independent review of this PR at `55c8af2` found four paths
+that undermined the guarantees above. Each was reproduced first by a
+new regression in `test29-durable-review-corrections.test.ts` (all 13
+failed against `55c8af2` behavior), then fixed on this branch. No
+pre-existing test was modified.
+
+### D1 — A failed receipt persistence could be replayed from volatile memory
+
+**Defect.** `recordCommitReceipt` ran the parent's in-memory mutation
+first and persisted second. `persistQuote` invoked the
+`beforePersist` fault hook (and the persistence encoding) OUTSIDE the
+try/catch that poisons on failure, so a hook failure did not even
+poison the store; and the inherited reads (`recordedReceipt`, `get`)
+had no poison guard at all, so even a properly poisoned write failure
+left the volatile receipt readable. `checkIdempotentReplay` in the
+adapter could then serve that receipt on a second commit call as a
+§6.10 replay although it was never persisted — a restart lost it.
+
+**Fix (uniform across every parent-mutating write-through path —
+`recordCommitReceipt`, `recordCommitOutcome`, `verifyCommitReceipt`,
+`recordAttemptReceipt`/`recordAttemptOutcome`, and the rest).**
+(1) Complete exception coverage: hooks, encoding, and the
+transaction all sit inside the fail-closed region of `persistQuote`
+and `persistQuoteInTx`; any failure poisons. (2) Poison-guarded
+reads: `get`, `all`, `recordedReceipt`,
+`receiptsWithReconciliation`, and `serializeReceiptRecords` are
+overridden to refuse on a poisoned store, and `recoveryReport`
+asserts health at entry. After any persistence failure the instance
+serves nothing through any read, replay, enumeration, or
+dispatch-authorizing API; the only recovery is a restart from the
+database, whose contents are exactly what committed.
+
+**Why poison + guards rather than snapshot/rollback of memory.**
+Rolling back the parent's in-memory state would require reproducing
+the parent's transition semantics (identity-keyed record/replay,
+verification-trail append, status changes) inside the durable layer
+— a second implementation of the very validation surface this PR is
+required not to weaken, with its own divergence risk if the two ever
+disagree. Poison-and-restart keeps the parent's semantics single and
+authoritative, makes the failure boundary explicit (a failed
+instance is unusable, not quietly approximate), and loses nothing:
+every state the instance could legitimately serve after a failure
+is, by construction, already on disk and re-adopted through the
+coherence-validated open path.
+
+**Regressions.** 29.1/29.2 (both fault points on
+`recordCommitReceipt`: reads throw while the failed store is alive;
+reopen has no receipt), 29.3 (the adapter replay path end-to-end:
+second `commitChangeQuote` is refused, not served the volatile
+receipt; after restart the recovered INDETERMINATE attempt blocks
+any further mutation — mock mutation count stays 1), 29.4/29.5 (the
+same audit on `recordCommitOutcome` and `verifyCommitReceipt`, both
+fault points), 29.6/29.7 (`recordAttemptReceipt` at both fault
+points, complementing 27.15's rollback-only coverage).
+
+### D2 — CONFIRMED_NON_EXECUTION re-dispatch bypassed same-subscription exclusion
+
+**Defect.** In `beginDispatch`, the by-key branch for an existing
+CONFIRMED_NON_EXECUTION attempt reset the row to DISPATCHING and
+returned BEFORE — and instead of — the `findBlockingAttempt`
+exclusion query. Sequence: Q1 on subscription S terminates
+CONFIRMED_NON_EXECUTION; Q2 on S goes DISPATCHING; Q1 retries with
+its original key + request → a concurrent mutation of S was
+authorized.
+
+**Fix.** Inside the same `BEGIN IMMEDIATE` transaction, the CNE
+re-arm now re-runs the exclusion query (excluding only that specific
+terminal row) and refuses if any other attempt for the quote or the
+subscription is DISPATCHING or unresolved-INDETERMINATE. The same
+branch now also verifies the key's binding — quote, subscription,
+provider, AND site, not merely the request hash — in every state of
+the bound attempt: a key collision under a different quote or site
+is refused as a collision and never re-associates the attempt.
+
+**Regressions.** 29.8 (the review's exact sequence: blocked, zero
+additional dispatches, the CNE row is not re-armed), 29.9 (the
+legitimate retry succeeds after Q2 resolves — one dispatch, the
+original row re-armed), 29.10 (key collision under a different
+quote, under a different site, and against a committed attempt).
+
+### D3 — The operator report claimed attribution by outcome class
+
+**Defect.** `recoveryReport()` set
+`stateAttributableToThisMutation: true` for EVERY
+COMMITTED_UNVERIFIED attempt and unverified receipt. But PR #16
+returns COMMITTED_UNVERIFIED precisely for broken-bracket commits
+(Z3) whose observed recurring state is explicitly UNATTRIBUTED — no
+recurring figure is recorded as that commit's.
+
+**Fix.** Attribution is now derived from the recorded evidence by
+`attributionFromReceipt(receipt)`, and the report's representation
+is honest about the third case: the field is
+`boolean | "unknown"`. Derivation: a completed verification
+transition (verified outcome + OK reconciliation) ⇒ true; bound
+provider actuals (`provider_actual` / `defined_equal_exact`) ⇒
+true; quote-side provenance (`revalidated_preview` /
+`pre_mutation_estimate`) ⇒ false; `unestablished` source ⇒ the
+recurring evidence decides — a DETERMINED recurring figure
+established from a bracket-closed re-read (PR #16 test 26.10a
+shape) ⇒ true, NO recurring figure recorded (the Z3 broken-bracket
+shape, tests 26.14a/b) ⇒ false, candidates under UNKNOWN
+determinacy with no independent observation (test 26.17 shape) ⇒
+"unknown"; no provenance at all ⇒ "unknown". The sibling fields
+were audited for the same shortcut: execution-established now
+requires the recorded receipt's existence (response-received side,
+L1), and financial-established a verified recorded outcome.
+
+**Regressions.** 29.11 (a faithful broken-bracket receipt reports
+`stateAttributableToThisMutation: false` while execution stays
+established and financial stays unestablished), 29.12 (controls:
+bound provider actuals report true; a receipt with no provenance
+reports `"unknown"`, never a defaulted true).
+
+### D4 — A durable store without its coordinator could still dispatch
+
+**Defect.** The adapter gated write-ahead only through
+`opts.durableCoordinator` when provided. A `DurableQuoteStore` +
+`liveCommitEnabled: true` with the coordinator omitted reached
+`update_for_items` with NO write-ahead attempt.
+
+**Fix.** `beginDurableAttempt` now refuses explicitly when the
+adapter's store is a `DurableQuoteStore` (instanceof check, which
+also covers subclasses) but no coordinator was supplied: an
+`SCQError` naming the missing coordinator, thrown after the
+live-commit gate and before any mutating call. The default
+configuration (in-memory `QuoteStore`, no coordinator) and the
+existing live-commit gate are unchanged.
+
+**Regression.** 29.13 (mocked transport: the misconfigured commit is
+refused with the coordinator named in the error; the mock's mutation
+count stays 0).
