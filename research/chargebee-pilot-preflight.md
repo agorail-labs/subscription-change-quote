@@ -232,12 +232,14 @@ BLOCKED), matching GO-NO-GO Decision 2, which PR-11 does not change
 ## 7. Failing-first evidence
 
 test37 + test38 were written against unmodified main (`963be0b`)
-before any implementation. `npm run build` failed with 174
-TypeScript errors, ALL inside the two new test files: TS2307 (the
-`preflight.js` / `rehearsal.js` modules did not exist) plus the
-cascading implicit-any errors that follow from unresolved imports.
-Zero errors in any pre-existing file; the pre-existing suite stood
-at the parent's verified 529/529 baseline. After implementation:
+before any implementation. `npm run build` failed with 33
+TypeScript errors, ALL inside the two new test files (30 in test37,
+3 in test38): TS2307 (the `preflight.js` / `rehearsal.js` modules
+did not exist) plus the cascading implicit-any errors that follow
+from unresolved imports. Zero errors in any pre-existing file; the
+pre-existing suite stood at the parent's verified 529/529 baseline.
+(The count is the measured one, reproduced post-delivery in a clean
+worktree at `963be0b` with the two test files copied in: 33.) After implementation:
 572/572 (529 + 43 new: test37 ×27, test38 ×16). No pre-existing test
 file was modified in this PR. One expectation was corrected during
 development on the code's own evidence, not weakened: the mandatory
