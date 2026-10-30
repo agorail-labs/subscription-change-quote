@@ -55,6 +55,18 @@
  *     contradictions are NOT established (an unreturned item is
  *     not a missing item); the item-set dimension is then at best
  *     UNVERIFIABLE.
+ *   - At ACTION_LEVEL (SV5), the per-change item checks apply
+ *     the same discipline to the targeted item: the target's
+ *     absence is a contradiction only from a complete collection
+ *     with no unidentifiable entries (in a partial return the
+ *     target may be unreturned; beside an unidentifiable entry
+ *     it may BE that entry); every identified entry for the
+ *     target must agree with the intended quantity/offering — a
+ *     disagreeing duplicate is a contradiction a first-match
+ *     lookup would miss — and an unidentifiable entry anywhere
+ *     in the collection blocks a VERIFIED for the targeted item,
+ *     because a contradictory duplicate of it cannot be ruled
+ *     out.
  *   - Precedence: any established contradiction => MISMATCH (a
  *     determined negative verification never collapses into
  *     UNVERIFIABLE); else any unverifiable required check =>
@@ -76,15 +88,20 @@
  *     a schedule whose kind and instant cannot be aligned is
  *     UNVERIFIABLE, and an established instant contradicting the
  *     authorized boundary/date is MISMATCH. For a terminal DATE /
- *     TERM_END state, the established cancellation instant is
- *     compared the same way: earlier than authorized is a
- *     premature termination (MISMATCH, the Paddle P3 precedent);
- *     no established instant at all is UNVERIFIABLE — a bare
- *     terminal status cannot distinguish premature from compliant
- *     (the one exception: a DATE intent read back BEFORE its
- *     authorized date with the subscription already terminal
- *     establishes prematurity from the read time itself). A
- *     schedule is never invented.
+ *     TERM_END state, the READ TIME is tested first (SV4): a
+ *     subscription already terminal when read before the
+ *     authorized instant is a premature termination (MISMATCH)
+ *     whatever the schedule claims — kind evidence establishes
+ *     nothing about when the termination took effect, and a
+ *     schedule claiming a future effective time cannot explain
+ *     an already-terminal subscription. The established
+ *     cancellation instant is then compared the same way:
+ *     earlier than authorized is a premature termination
+ *     (MISMATCH, the Paddle P3 precedent). With neither a
+ *     readable read time nor an established instant, a bare
+ *     terminal status cannot distinguish premature from
+ *     compliant and is UNVERIFIABLE. A schedule is never
+ *     invented.
  */
 import type {
   PostCommitObservedSnapshot,
@@ -471,6 +488,52 @@ function compareItemSets(
   }
 }
 
+/**
+ * Facts about one targeted item at ACTION_LEVEL coverage (SV5):
+ * the identified entries carrying the target's identifier, how
+ * many collection entries carry no usable identifier at all, and
+ * whether the target's ABSENCE is established — which it is only
+ * from a complete collection (not a partial return) containing
+ * no unidentifiable entries. In a partial return the target may
+ * merely be unreturned; beside an unidentifiable entry the
+ * target may BE that entry. Neither absence is a contradiction.
+ */
+function targetFacts(
+  items: NonNullable<PostCommitObservedSnapshot["items"]>,
+  observation: PostCommitStateObservation,
+  itemId: string
+): {
+  targets: NonNullable<PostCommitObservedSnapshot["items"]>;
+  unidentifiable: number;
+  absenceEstablished: boolean;
+} {
+  const targets = items.filter((candidate) => entryId(candidate) === itemId);
+  const unidentifiable = items.reduce((n, candidate) => (entryId(candidate) === undefined ? n + 1 : n), 0);
+  return { targets, unidentifiable, absenceEstablished: observation.itemsComplete !== false && unidentifiable === 0 };
+}
+
+/** Why a targeted item's absence is NOT established (SV5): at least one of the two reasons always holds when called. */
+function absenceNotEstablishedDetail(itemId: string, observation: PostCommitStateObservation, unidentifiable: number): string {
+  const reasons: string[] = [];
+  if (observation.itemsComplete === false) {
+    reasons.push("the collection is a partial return (itemsComplete: false), so the item may be unreturned rather than missing");
+  }
+  if (unidentifiable > 0) {
+    reasons.push(
+      `the collection contains ${unidentifiable} entr${unidentifiable === 1 ? "y" : "ies"} with no identifier, one of which could be item ${itemId}`
+    );
+  }
+  return `item ${itemId} is absent from the observed item collection, but ${reasons.join(" and ")} — its absence is not established`;
+}
+
+/** Why a present, agreeing target still cannot be VERIFIED (SV5): an unidentifiable entry could be a contradictory duplicate of it. */
+function unidentifiableDuplicateDetail(itemId: string, unidentifiable: number): string {
+  return (
+    `the observed entries for item ${itemId} agree with the intended state, but the collection contains ${unidentifiable} ` +
+    `entr${unidentifiable === 1 ? "y" : "ies"} with no identifier — a contradictory duplicate entry for the item cannot be ruled out`
+  );
+}
+
 /** One per-change check, with the §6.12 action-level semantics (see the module header for the CANCEL schedule extension). */
 function checkChange(
   change: PostCommitStateExpectation["proposal"]["changes"][number],
@@ -489,17 +552,31 @@ function checkChange(
         col.add(name, dimension, "UNVERIFIABLE", `the observation omits the item collection; the resulting quantity of item ${change.itemId} cannot be verified`);
         return;
       }
-      const item = snapshot.items.find((candidate) => entryId(candidate) === change.itemId);
-      if (!item) {
-        col.add(name, dimension, "CONTRADICTED", `item ${change.itemId} is absent from the observed post-commit state (intended quantity ${change.quantity})`);
+      // SV5: absence and duplicates are judged over ALL entries
+      // for the target, not the first match. Absence contradicts
+      // only when established (complete collection, no
+      // unidentifiable entries); every identified entry for the
+      // target must agree with the intended quantity.
+      const { targets, unidentifiable, absenceEstablished } = targetFacts(snapshot.items, observation, change.itemId);
+      if (targets.length === 0) {
+        if (absenceEstablished) {
+          col.add(name, dimension, "CONTRADICTED", `item ${change.itemId} is absent from the observed post-commit state (intended quantity ${change.quantity})`);
+        } else {
+          col.add(name, dimension, "UNVERIFIABLE", absenceNotEstablishedDetail(change.itemId, observation, unidentifiable));
+        }
         return;
       }
-      if (typeof item.quantity !== "number") {
-        col.add(name, dimension, "UNVERIFIABLE", `the observed entry for item ${change.itemId} carries no quantity; its resulting quantity cannot be verified`);
+      const disagreeing = targets.find((candidate) => typeof candidate.quantity === "number" && candidate.quantity !== change.quantity);
+      if (disagreeing) {
+        col.add(name, dimension, "CONTRADICTED", `quantity mismatch for item ${change.itemId}: intended ${change.quantity}, actual ${disagreeing.quantity}`);
         return;
       }
-      if (item.quantity !== change.quantity) {
-        col.add(name, dimension, "CONTRADICTED", `quantity mismatch for item ${change.itemId}: intended ${change.quantity}, actual ${item.quantity}`);
+      if (targets.some((candidate) => typeof candidate.quantity !== "number")) {
+        col.add(name, dimension, "UNVERIFIABLE", `an observed entry for item ${change.itemId} carries no quantity; not every entry for the item can be verified`);
+        return;
+      }
+      if (unidentifiable > 0) {
+        col.add(name, dimension, "UNVERIFIABLE", unidentifiableDuplicateDetail(change.itemId, unidentifiable));
         return;
       }
       col.add(name, dimension, "VERIFIED", `item ${change.itemId} is present at the intended quantity ${change.quantity}`);
@@ -511,13 +588,26 @@ function checkChange(
         col.add(name, dimension, "UNVERIFIABLE", `the observation omits the item collection; the resulting offering of item ${change.itemId} cannot be verified`);
         return;
       }
-      const item = snapshot.items.find((candidate) => entryId(candidate) === change.itemId);
-      if (!item) {
-        col.add(name, dimension, "CONTRADICTED", `item ${change.itemId} is absent from the observed post-commit state (intended offering ${change.offeringRef})`);
+      // SV5: the CHANGE_QUANTITY discipline, over offerings —
+      // absence contradicts only when established, and every
+      // identified entry for the target must carry the intended
+      // offering.
+      const { targets, unidentifiable, absenceEstablished } = targetFacts(snapshot.items, observation, change.itemId);
+      if (targets.length === 0) {
+        if (absenceEstablished) {
+          col.add(name, dimension, "CONTRADICTED", `item ${change.itemId} is absent from the observed post-commit state (intended offering ${change.offeringRef})`);
+        } else {
+          col.add(name, dimension, "UNVERIFIABLE", absenceNotEstablishedDetail(change.itemId, observation, unidentifiable));
+        }
         return;
       }
-      if (item.offeringRef !== change.offeringRef) {
-        col.add(name, dimension, "CONTRADICTED", `offering mismatch for item ${change.itemId}: intended ${change.offeringRef}, actual ${item.offeringRef}`);
+      const disagreeing = targets.find((candidate) => candidate.offeringRef !== change.offeringRef);
+      if (disagreeing) {
+        col.add(name, dimension, "CONTRADICTED", `offering mismatch for item ${change.itemId}: intended ${change.offeringRef}, actual ${disagreeing.offeringRef}`);
+        return;
+      }
+      if (unidentifiable > 0) {
+        col.add(name, dimension, "UNVERIFIABLE", unidentifiableDuplicateDetail(change.itemId, unidentifiable));
         return;
       }
       col.add(name, dimension, "VERIFIED", `item ${change.itemId} carries the intended offering ${change.offeringRef}`);
@@ -577,13 +667,44 @@ function checkChange(
           col.add(name, DIM_CANCELLATION, "VERIFIED", `the subscription is in the terminal state "${status}"`);
           return;
         }
-        // Scheduled intent, already terminal (SV2): an
-        // established cancellation instant decides first — it
+        // Scheduled intent, already terminal. SV4: the
+        // read-time prematurity test decides FIRST, before
+        // schedule kind and any stated schedule instant: a
+        // subscription already in a terminal state when read
+        // BEFORE the authorized instant was terminated early — a
+        // schedule claiming that future instant (or carrying the
+        // matching kind, which establishes nothing about when
+        // the termination took effect) cannot explain an
+        // already-terminal subscription. This is the read-time
+        // rule the SV2 round applied to DATE intents only when
+        // no schedule evidence existed, generalized to take
+        // precedence over the schedule claims themselves. It is
+        // an internal consistency check over the observation as
+        // supplied — the caller's timestamps are not thereby
+        // authenticated as provider evidence (see the contract's
+        // provenance limits). When the read time or the
+        // authorized instant is absent or unparseable, no
+        // prematurity is invented and the evidence rules below
+        // decide.
+        const observedMs = Date.parse(observation.observedAt ?? "");
+        const authorizedMs = authorizedAt !== undefined ? Date.parse(authorizedAt) : Number.NaN;
+        if (!Number.isNaN(observedMs) && !Number.isNaN(authorizedMs) && observedMs < authorizedMs) {
+          col.add(
+            name,
+            DIM_CANCELLATION,
+            "CONTRADICTED",
+            intent.type === "TERM_END"
+              ? `the subscription is already in the terminal state "${status}" when read at ${observation.observedAt}, before the authorized term boundary ${authorizedAt} — a premature termination, not the authorized term-end cancellation; a schedule claiming a future effective time cannot explain an already-terminal subscription`
+              : `the subscription is already in the terminal state "${status}" when read at ${observation.observedAt}, before the intended date ${authorizedAt} — a premature termination, not the authorized cancellation; a schedule claiming a future effective time cannot explain an already-terminal subscription`
+          );
+          return;
+        }
+        // Next (SV2): an established cancellation instant
         // overrides kind evidence, exactly as on the
-        // not-yet-effective path. Provider schedule-kind evidence
-        // matching the intent kind is the provider's own
-        // attestation that the termination is the scheduled one,
-        // and verifies only when no established instant
+        // not-yet-effective path. Provider schedule-kind
+        // evidence matching the intent kind is the provider's
+        // own attestation that the termination is the scheduled
+        // one, and verifies only when no established instant
         // contradicts it.
         const cmp = compareInstants(effectiveAt, authorizedAt);
         if (cmp === "equal") {
@@ -619,24 +740,10 @@ function checkChange(
           );
           return;
         }
-        if (intent.type === "DATE") {
-          // No established cancellation instant. For a DATE intent
-          // the read time itself can still establish prematurity:
-          // already terminal BEFORE the authorized date means the
-          // cancellation took effect early. Read at/after the
-          // date, premature-vs-compliant is indistinguishable.
-          const observedMs = Date.parse(observation.observedAt ?? "");
-          const intendedMs = Date.parse(authorizedAt as string);
-          if (!Number.isNaN(observedMs) && !Number.isNaN(intendedMs) && observedMs < intendedMs) {
-            col.add(
-              name,
-              DIM_CANCELLATION,
-              "CONTRADICTED",
-              `the subscription is already in the terminal state "${status}" when read at ${observation.observedAt}, before the intended date ${authorizedAt} — a premature termination, not the authorized cancellation`
-            );
-            return;
-          }
-        }
+        // No aligned instant and no kind evidence (and, per the
+        // SV4 test above, no readable read time before the
+        // authorized instant): premature-vs-compliant is
+        // indistinguishable from a bare terminal status.
         col.add(
           name,
           DIM_CANCELLATION,

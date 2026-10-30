@@ -377,14 +377,14 @@ detected at this coverage.
 
 | Action | Verified when | MISMATCH when | UNVERIFIABLE when |
 |---|---|---|---|
-| CHANGE_QUANTITY (action-level) | targeted item present at the intended quantity | item absent; quantity differs | items omitted; quantity member absent |
+| CHANGE_QUANTITY (action-level) | every identified entry for the targeted item present at the intended quantity, and no unidentifiable entries in the collection | item absent from a complete, fully identified collection; any identified entry at a different quantity (including a disagreeing duplicate entry for the target) | items omitted; target absent from a partial collection or one containing unidentifiable entries (absence not established, SV5); an entry for the target carrying no quantity; unidentifiable entries beside an agreeing target (a contradictory duplicate cannot be ruled out) |
 | CHANGE_QUANTITY (full-set) | the complete resulting multiset equals the expected set (incl. the target at its intended quantity) | any multiset contradiction (missing / extra / duplicate / wrong quantity) | collection omitted or partial-without-contradiction; an entry unidentifiable |
-| CHANGE_PLAN (action-level) | targeted item present carrying the intended offering | item absent; offering differs | items omitted |
+| CHANGE_PLAN (action-level) | every identified entry for the targeted item carrying the intended offering, and no unidentifiable entries in the collection | item absent from a complete, fully identified collection; any identified entry carrying a different offering (including a disagreeing duplicate) | items omitted; target absent from a partial collection or one containing unidentifiable entries (absence not established, SV5); unidentifiable entries beside an agreeing target |
 | CHANGE_PLAN (full-set) | resulting multiset matches incl. the expected offering for the item | offering differs; any multiset contradiction | as above |
 | CHANGE_CADENCE | observed `billing.cadence` equals the intended cadence | cadence present and differs | cadence absent/empty |
 | CANCEL, IMMEDIATE intent | status terminal (cancelled/canceled/terminated) | status non-terminal — **including** an active subscription carrying a TERM_END schedule: a scheduled cancellation is not an immediate termination | status absent |
-| CANCEL, TERM_END intent | status non-terminal with independently established schedule evidence that **aligns**: provider schedule-kind evidence (`cancellationSchedule.kind: "TERM_END"`), or an established instant equal to the authorized term boundary carried on the expectation (`termBoundaryAt`); status terminal with kind evidence, or with an established cancellation instant equal to the boundary | an established instant (or a terminal state's established instant) **before** the authorized boundary — a premature termination; an established schedule of a different kind; an established instant after the boundary | a schedule whose kind and instant cannot be aligned (no kind evidence, no supplied boundary, or an unalignable instant); a terminal state with no established instant and no kind evidence — premature-vs-compliant is indistinguishable |
-| CANCEL, DATE intent | status non-terminal with an established schedule whose instant equals the intended date; status terminal with an established cancellation instant equal to the intended date, or DATE kind evidence with no contradicting instant | an established instant different from the intended date; a terminal state read **before** the intended date (premature — established by the read time itself); an established schedule of a different kind | a terminal state at/after the intended date with no established cancellation instant — premature-vs-compliant is indistinguishable; a schedule with no/unalignable date; no schedule evidence at all |
+| CANCEL, TERM_END intent | status non-terminal with independently established schedule evidence that **aligns**: provider schedule-kind evidence (`cancellationSchedule.kind: "TERM_END"`), or an established instant equal to the authorized term boundary carried on the expectation (`termBoundaryAt`); status terminal with kind evidence, or with an established cancellation instant equal to the boundary — and not read before the boundary | a terminal state read **before** the authorized boundary — premature by the read time itself, taking precedence over schedule-kind evidence and any stated schedule instant (SV4); an established instant (or a terminal state's established instant) **before** the authorized boundary — a premature termination; an established schedule of a different kind; an established instant after the boundary | a schedule whose kind and instant cannot be aligned (no kind evidence, no supplied boundary, or an unalignable instant); a terminal state with no established instant and no kind evidence — premature-vs-compliant is indistinguishable |
+| CANCEL, DATE intent | status non-terminal with an established schedule whose instant equals the intended date; status terminal with an established cancellation instant equal to the intended date, or DATE kind evidence with no contradicting instant and not read before the intended date | an established instant different from the intended date; a terminal state read **before** the intended date (premature — established by the read time itself), including when the schedule claims that very date or carries DATE kind evidence (SV4); an established schedule of a different kind | a terminal state at/after the intended date with no established cancellation instant — premature-vs-compliant is indistinguishable; a schedule with no/unalignable date; no schedule evidence at all |
 
 Notes on the CANCEL rows (**revised by the SV2 review
 correction**): "terminal now" is not "cancelled at the authorized
@@ -407,6 +407,22 @@ took effect before the read. Where no instant can be established
 or aligned, the verdict is UNVERIFIABLE — never an invented
 match. Paddle's own adapter-level establishment (§1.3) is
 unchanged and does not route through these rows.
+
+Notes on the action-level item rows (**revised by the SV5
+re-review correction**): the original rows judged the targeted
+item by first match and treated its absence as a contradiction
+unconditionally. Both overclaim on incomplete observations: in
+a partial return an absent target may merely be unreturned, and
+beside an entry with no identifier the absent target may *be*
+that entry — so absence contradicts only from a complete,
+fully identified collection. Symmetrically, a first-match
+VERIFIED ignored further entries for the same target: every
+identified entry for the target must now agree, and an
+unidentifiable entry anywhere in the collection blocks a
+VERIFIED for the targeted item, because a contradictory
+duplicate of it cannot be ruled out. This is the full-item-set
+discipline (§4) applied to the targeted item; §11 records the
+correction and the audit of the remaining action-level checks.
 
 ## 6. Integrations performed in PR-9
 
@@ -721,5 +737,133 @@ Chargebee calls; `SCQ_LIVE_COMMIT_ENABLED` never set.
 deletions across PR-9 + this round; the round adds two optional
 fields and expands two doc comments). The freeze guard still
 fails by design: `types.ts` is in its pathspec and the
+`protocol-change-approved` label remains withheld by the owner
+pending this review.
+
+## 11. Re-review corrections SV4–SV5 (PR #18 re-review round)
+
+The owner's re-review of PR #18 at head `1dd215b` accepted SV1
+and the full-item-set half of SV3, and found two remaining
+cases where the verifier claimed stronger evidence than the
+observation supports — a focused follow-up to SV2/SV3, in the
+same file (`reference/src/core/state-verification.ts`).
+Corrections were worked failing-first: new suite
+`reference/tests/test33-state-verification-re-review-corrections.test.ts`
+(20 tests) was written against the unmodified `1dd215b` code
+and run before any fix: **12 failed, 8 passed**. The failures
+are exactly the two findings (the SV4 counterexamples returned
+VERIFIED; the SV5 cases returned MISMATCH or a first-match
+VERIFIED); the 8 passes are the controls (aligned post-date
+terminal reads, established absences, agreeing duplicates,
+present-entry contradictions). After the fixes: **20/20**,
+full suite **469/469**, and **no pre-existing test was
+modified** — test31/test32 pass unmodified, because the
+tightened rules change outcomes only on inputs no earlier test
+exercised (early terminal reads carrying schedule claims;
+partial or unidentifiable action-level collections;
+contradictory duplicate target entries).
+
+**SV4 — a premature cancellation could still verify through a
+schedule claim (SV2 follow-up, blocker).** In the terminal
+scheduled-CANCEL path, the established schedule instant and the
+schedule kind were consulted *before* the read-time prematurity
+test, which sat in a later fallback reached only when no
+schedule evidence existed. So a subscription already terminal
+when read on Oct 29 verified as a Nov 15 scheduled
+cancellation whenever the schedule claimed Nov 15
+(`{kind: "DATE", effectiveAt: <the authorized date>}`), or
+carried the matching kind with no instant at all
+(`{kind: "DATE"}` — kind evidence establishes nothing about
+when the termination took effect), or, for TERM_END with an
+authorized boundary supplied, carried `{kind: "TERM_END"}`.
+**Fix (§5, revised rows):** the read-time test now runs first
+in the terminal scheduled path: when the authorized instant is
+valid and the observation's `observedAt` is earlier, the
+terminal observation is a demonstrated contradiction
+(MISMATCH — premature termination) and takes precedence over
+schedule kind and any matching stated `effectiveAt`: a future
+schedule cannot explain an already-terminal subscription.
+When `observedAt` is absent or unparseable, no prematurity is
+invented and the previous evidence rules decide (an
+established-instant equality still verifies; a bare terminal
+state still computes UNVERIFIABLE). Legitimate VERIFIED is
+retained only with noncontradictory independently established
+effective-time evidence. This check is an internal consistency
+check over the observation as supplied: consistent with the
+contract's provenance limits (§3), caller-supplied timestamps
+are not thereby authenticated as provider evidence — binding
+the observation to a real provider read remains the caller's
+duty, and `establishVerification`'s branding boundary is
+unchanged. The previous DATE-only read-time fallback is
+subsumed by the generalized test and removed. Regressions:
+33.1–33.4 (the three counterexamples plus the TERM_END
+stated-instant variant ⇒ MISMATCH), 33.5–33.6 (aligned
+post-date/post-boundary terminal reads ⇒ VERIFIED for both
+DATE and TERM_END), 33.7 (absent/unparseable `observedAt` ⇒ no
+invented prematurity; bare terminal with no read time ⇒
+UNVERIFIABLE).
+
+**SV5 — action-level absence was still a fabricated MISMATCH
+(SV3 follow-up, blocker).** The full-item-set path learned the
+SV3 discipline, but the ACTION_LEVEL `CHANGE_QUANTITY` /
+`CHANGE_PLAN` checks still used a first-match lookup and
+returned CONTRADICTED whenever the target was not found — even
+for a partial return (`itemsComplete: false`), where the
+target may merely be unreturned, and even beside unidentifiable
+entries (`items: [null]` on a nominally complete collection),
+one of which could *be* the target. The same first-match
+lookup also let a contradictory duplicate entry for the target
+pass unnoticed behind a matching first entry. **Fix (§5,
+revised rows):** both checks now judge all entries for the
+target under one rule set — absence is a MISMATCH only when
+the collection is established complete AND contains no
+unidentified entries, otherwise UNVERIFIABLE; every identified
+entry for the target must agree with the intended
+quantity/offering, so a disagreeing duplicate is a
+contradiction (MISMATCH, with the established phrasing) and
+identical duplicates are consistent; an entry carrying no
+quantity leaves the check UNVERIFIABLE rather than verified;
+and an unidentifiable entry anywhere in the collection blocks
+a VERIFIED for the targeted item (UNVERIFIABLE), because a
+contradictory duplicate of it cannot be ruled out — the same
+treatment the full-item-set path gives unidentifiable entries
+(§4). Established contradictions from present, identified
+entries are preserved exactly, including in partial returns.
+Regressions: 33.8/33.16 (partial return, target absent ⇒
+UNVERIFIABLE), 33.9/33.17 (`[null]`, target absent ⇒
+UNVERIFIABLE, no throw), 33.10/33.18 (complete fully
+identified collection, target absent ⇒ MISMATCH, controls),
+33.11/33.19 (duplicate target entries, one matching and one
+contradicting ⇒ MISMATCH), 33.12/33.20 (duplicate entries both
+matching ⇒ VERIFIED, controls), 33.13 (agreeing target beside
+an unidentifiable entry ⇒ UNVERIFIABLE), 33.14 (duplicate
+entries, one carrying no quantity ⇒ UNVERIFIABLE), 33.15
+(present entry at the wrong quantity in a partial return ⇒
+MISMATCH, control).
+
+**Audit of the remaining action-level checks.** The same
+absence-overclaim pattern was checked in the other two
+action-level branches. `CHANGE_CADENCE` reads a scalar
+(`billing.cadence`), not a collection: an absent or empty
+cadence already computes UNVERIFIABLE, and a present cadence
+that differs is a positive observation of a different value,
+not an inference from absence — there is no partial-return or
+unidentifiable-entry structure to overclaim from, so no change
+was needed. `CANCEL` likewise reads a scalar (`status`):
+absent status already computes UNVERIFIABLE; a non-terminal
+status contradicting an IMMEDIATE intent is established by the
+observed status itself; and the absence of schedule evidence
+on the scheduled paths already computes UNVERIFIABLE. The one
+absence/timing overclaim in CANCEL was the terminal scheduled
+path, corrected as SV4 above. No other action-level branch
+derives a contradiction from the absence of collection data.
+
+**Scope held:** no spec changes, no BC-1 activation, no
+durable-coordinator changes, no billing-math changes, no real
+Chargebee calls; `SCQ_LIVE_COMMIT_ENABLED` never set.
+`types.ts` is untouched in this round (vs main it remains
+purely additive: 191 insertions, 0 deletions across PR-9 and
+both correction rounds). The freeze guard still fails by
+design: `types.ts` is in its pathspec and the
 `protocol-change-approved` label remains withheld by the owner
 pending this review.
