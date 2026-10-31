@@ -244,8 +244,52 @@ the durable store with the same poison-on-failure semantics.
   establishes, and both remain readable.
 - **Evidence acceptance vs promotion:** recording is not verifying.
   Admissible-but-partial, admissible-but-state-unverifiable, and
-  admissi
-...[truncated]
+  admissible-but-conflicted evidence is recorded without
+  promoting: the trail grows, the view updates only where the
+  evidence establishes, and the outcome changes only when the
+  promotion rule (§3) is satisfied over the whole trail.
+- **Partial evidence:** establishment is per-dimension, so a
+  partial trail is represented exactly. A dimension an accepted
+  entry establishes shows its established actual in the view;
+  a dimension no entry has established stays UNKNOWN in the
+  view — it is never filled in from the recorded candidate as
+  though established (the candidate remains in the recorded
+  layer, and in the composed effect for display only, §4).
+  Entries compose across dimensions, so later admissible
+  evidence completes the missing dimensions without disturbing
+  the ones already established.
+- **Later contradictory evidence:** an entry that contradicts
+  an already-accepted actual is appended and flagged
+  (`entry.conflicts`); the accepted actual is never silently
+  replaced — first-established stands. While any conflict
+  stands unresolved, the derived view reads
+  `COMMITTED_UNVERIFIED` with an UNVERIFIED reconciliation
+  naming the conflict, so contradictory evidence never rides
+  an unqualified OK. Resolution is an
+  operator/investigation act outside this PR (§4).
+- **Receipt-view / evidence API surface:** no new versioned
+  API was introduced. The model is exposed on the existing
+  store surface: `recordReceiptEvidence` appends admissible
+  evidence and returns the derived view; `verifyCommitReceipt`
+  remains the single-shot promotion transition; the three
+  layers stay separately readable on the quote record
+  (recorded receipt, evidence trail, derived view); and the
+  evidence-entry and disposition types are exported with the
+  store. Recommendation for the specification (§9): name the
+  three layers and the evidence-recording operation
+  normatively in the candidate rather than versioning a new
+  API. This is a recommendation, recorded here — not a
+  decision taken by this PR.
+- **Legacy records and trails:** receipts recorded before
+  PR-17 restore unchanged at layer 1 — the recorded identity
+  did not change. A legacy one-transition trail (an entry in
+  the historical shape, without the PR-17 derived fields) is
+  accepted under the narrow legacy exception of §6: its
+  derived fields are recomputed from its contents and filled
+  in on adoption, and its current view is re-derived — never
+  trusted — so a legacy record whose historical view carried
+  the F5c defect restores truthfully instead of refusing or
+  persisting the defect.
 
 ## 8. Independent-review correction: cross-observation coherence
 
@@ -335,9 +379,196 @@ research suite unchanged (11 pass / 7 fail; repro46 still 0/3
 at the PR-14 gate, unaffected).
 
 **Documentation note on this file.** As committed at `4cad3c4`
-this note ended mid-sentence in §7 (the file literally ended
-with a truncation marker) and the paste-ready PR #21 amendment
-list summarized in the PR body was not present in the file.
-This section is appended after that point; the missing §7
-completion and amendment texts remain to be restored by the
-PR author — they are NOT reconstructed here.
+this note ended mid-sentence in §7, at a literal truncation
+marker, and the paste-ready PR #21 amendment list was absent
+from the file; the §7 completion above and the §9 amendment
+list below were restored by a documentation-only commit on
+this branch.
+
+## 9. Proposed PR #21 amendments (paste-ready)
+
+The texts below are drafted for direct insertion into the
+v0.6.2 specification candidate (PR #21). They state the model
+as implemented and pinned by PR-17; adopting them is the
+reconciliation's decision, not this PR's.
+
+**A-17-1 — Replace §6.15's actuals-equal-candidates
+requirement.** Delete the requirement that verification
+evidence's figures equal the receipt's recorded committed
+figures, and substitute:
+
+> §6.15 Later establishment of committed figures.
+> Verification evidence presented for a recorded receipt MUST
+> establish the committed figures independently of the
+> recorded receipt. The figures recorded on a receipt at
+> commit time are CANDIDATES: figures recorded before
+> independent establishment. A candidate is a claim to be
+> judged, not an identity element to be matched. Evidence
+> whose independently established actuals differ from the
+> recorded candidates MUST NOT be refused on that ground,
+> and MUST NOT be reported as a receipt-identity conflict.
+> Receipt identity is the recorded tuple — receiptId,
+> quoteId, subscriptionId, recorded outcome, recorded
+> reconciliation status, and the recorded candidate figures
+> themselves — bound by the recorded identity digest. That
+> identity is fixed when the receipt is recorded and is
+> never revised by later evidence. A receipt-identity
+> conflict (CONFLICTING_RECEIPT_IDENTITY) arises only when
+> presented material names a different recorded identity: a
+> different receipt, a different quote or subscription
+> binding, or a record whose identity digest does not match
+> its recorded contents.
+
+**A-17-2 — Append-only, receipt-identity-bound evidence.**
+Add a definition of the evidence record:
+
+> For each recorded receipt, an implementation MUST
+> maintain an append-only evidence record. Each entry MUST
+> carry: (a) the recorded identity digest of the receipt it
+> appends to; (b) an evidence identity derived from the
+> entry's contents and that digest, such that resubmitting
+> identical evidence is an idempotent no-op and an entry
+> whose stated identity does not match its contents is
+> invalid; (c) the establishing evidence itself — the
+> post-commit state-verification result, the observed
+> committed effect with per-dimension determinacy,
+> provenance, currency and cadence, and the reconciliation
+> computed from it; (d) a per-dimension disposition toward
+> the recorded candidates (ESTABLISHES / CONFIRMS /
+> CONTRADICTS_CANDIDATE / UNRESOLVED); and (e) conflict
+> flags recording, per dimension, contradiction with an
+> actual accepted from an earlier entry. Entries are
+> immutable once appended and MUST be defensively copied on
+> ingress and on read, so later mutation of a presented
+> token cannot rewrite recorded history. Three
+> determinations MUST be kept distinct: ADMISSIBILITY —
+> whether an entry may be recorded at all (minted
+> establishing evidence, bound to the receipt's quote and
+> subscription, unaltered since minting, of establishing
+> provenance); ESTABLISHMENT — which dimensions an entry
+> independently establishes (exactly those carrying a
+> DETERMINED figure, or NOT_APPLICABLE); and PROMOTION —
+> whether the derived view may read verified (A-17-5).
+> Evidence that is admissible but partial, admissible but
+> state-unverifiable, or admissible but conflicted MUST be
+> recordable without promoting.
+
+**A-17-3 — Actual-vs-candidate precedence for the current
+view:**
+
+> The current view of a commit is DERIVED from the recorded
+> receipt and its evidence record; it is never authored
+> independently, and verification MUST NOT rewrite the
+> recorded receipt. For each financial dimension, the view
+> MUST display the accepted established actual where one
+> exists, with the establishing evidence's determinacy and
+> provenance. A dimension no accepted evidence establishes
+> MUST be shown as recorded — the candidate, for display
+> only — and MUST NOT be presented as established.
+> Reconciliation for a verified view MUST be computed
+> against the original quoted effect and the proposal's
+> acceptance envelope, never against the recorded candidate
+> as the financial baseline, so an established actual
+> outside the envelope reads VIOLATED, never OK.
+
+**A-17-4 — Per-dimension determinacy and provenance after
+establishment:**
+
+> The composed committed effect of a derived view takes,
+> per dimension, the accepted established figure,
+> determinacy and provenance of the entry that established
+> it. The composed effect's committed-source claim MUST
+> name an establishing source (provider actuals, or
+> defined-equal under the EXACT guarantee) only when every
+> participating dimension of the effect is established;
+> while any participating dimension remains unestablished,
+> the composed source MUST read "unestablished" and the
+> view MUST NOT be promoted. A view MUST NOT display
+> COMMITTED_AND_VERIFIED — with an OK or a VIOLATED
+> reconciliation — over financial fields still labeled
+> UNKNOWN or sourced "unestablished".
+
+**A-17-5 — Reconciliation and conflicting-evidence
+handling, including cross-observation coherence:**
+
+> Promotion of a derived view to COMMITTED_AND_VERIFIED
+> requires, conjunctively: a non-empty evidence record; no
+> unresolved conflict; a reconciliation over the composed
+> established effect that is determined — OK
+> (verified-with-compliance) or VIOLATED
+> (verified-with-violation), which MUST remain
+> distinguishable outcomes; a VERIFIED post-commit state
+> result within the promotion basis; and cross-observation
+> coherence of that basis. The promotion basis is the set
+> of entries the verified claim rests on: the accepted
+> establisher of each established dimension, together with
+> the entry carrying the VERIFIED state result when no
+> establisher carries it. An entry established against an
+> observed post-commit state carries that state's identity:
+> the observed snapshot's subscription id and state-revision
+> version. The basis is coherent if and only if it consists
+> of a single entry, or every entry in it carries the SAME
+> observed-state identity. An entry carrying no
+> observed-state identity MUST NOT take part in a promotion
+> basis of more than one entry. Composition for display is
+> unrestricted — actuals established against different
+> revisions are still recorded and shown — but an
+> incoherent basis MUST leave the view COMMITTED_UNVERIFIED
+> with an UNVERIFIED reconciliation whose reason names the
+> incoherence. Conflicting evidence: where a later
+> admissible entry establishes a different actual for an
+> already-established dimension, the entry MUST be appended
+> and flagged, the previously accepted actual MUST NOT be
+> replaced, and while the conflict stands the view MUST
+> read COMMITTED_UNVERIFIED with an UNVERIFIED
+> reconciliation naming the conflict. Conflict resolution
+> is an operator act outside the protocol's automatic
+> rules.
+
+**A-17-6 — Migration, recovery coherence, and conformance
+mappings:**
+
+> Migration: receipt records written before this evidence
+> model remain valid. A legacy verification trail of one
+> transition, in the historical entry shape, MUST be
+> accepted at recovery and normalized: the entry's derived
+> fields (evidence identity, dispositions, conflicts, and
+> observed-state identity where derivable) are recomputed
+> from its contents, and the current view is re-derived
+> under these rules — so a legacy view that displayed a
+> verified label over unestablished figures restores
+> truthfully rather than being refused or preserved.
+> Recovery coherence: recovery MUST re-validate every
+> evidence entry (digest binding,
+> admissibility-equivalent content validation, entry-level
+> reconciliation agreement, derived fields recomputed and
+> compared, evidence-identity uniqueness) and MUST NOT
+> trust a persisted current view: a persisted view is
+> adopted only if it equals the derived view, and the
+> derived view is what is installed. An incoherent restore
+> set MUST be rejected atomically; no record of the set is
+> adopted. Conformance: the conformance suite pins these
+> rules as follows (reference implementation test50) —
+> missing-candidate establishment and incorrect-candidate
+> correction (50.1, 50.2); truthful verified provenance
+> (50.3); replay byte-equivalence after verification
+> (50.4); evidence binding, tamper and source refusals
+> (50.5–50.12); composition, partial evidence and conflict
+> handling (50.13–50.16); verified-with-violation
+> distinguishability (50.17); recovery coherence, atomic
+> rejection, legacy normalization and interrupted-append
+> behavior (50.19–50.27); and cross-observation coherence
+> (50.28–50.31).
+
+### Carried forward undecided: the F3/F4 schema decisions (A-16-1…A-16-4)
+
+The PR #21 reconciliation also carries the F3/F4 schema
+decisions recorded by PR-16: A-16-1, the identity-binding
+rule as normative text; A-16-2, unit comparability as a
+comparison precondition, as normative text; A-16-3, the
+immediate-currency schema extension (an optional `currency`
+on `CommercialEffect.immediate`, adapter-populated, with
+stored-record compatibility); and A-16-4, the Chargebee-live
+committed-effect currency-defaulting question. PR-17 does
+not decide any of them: its evidence model is compatible
+with each outcome and prejudges none.
