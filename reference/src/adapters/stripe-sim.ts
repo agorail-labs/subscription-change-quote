@@ -152,6 +152,32 @@ export class StripeSim {
   /** When true, the next `update()` fully applies the mutation and persists its invoice, then throws an `api_connection_error` — a response lost AFTER the mutation landed. One-shot: the flag clears itself. */
   _debugLoseNextUpdateResponse = false;
 
+  // Issue #44 (G-21 item 1) misexecution faults — modelled on the
+  // Chargebee simulator's wrong-state hooks. Each is opt-in and
+  // ONE-SHOT. The shared shape: the mutation's RESPONSE still
+  // reports the requested state (the returned subscription is the
+  // artifact as requested), while the PERSISTED record diverges —
+  // a provider that applied the wrong change but answered as if it
+  // had applied the right one. The fault alters persisted state
+  // only; it never touches the adapter, never injects a verdict,
+  // and the generated invoice keeps the figures computed for the
+  // dispatched request (what the provider charged for the call it
+  // received — the state, not the billing, is what diverged).
+  /** Next `update()` persists THIS quantity for its id-matched mutated item(s) instead of the requested quantity. */
+  _debugWrongQuantityOnNextUpdate: number | undefined = undefined;
+  /** Next `update()` persists THIS price id for its id-matched mutated item(s) instead of the requested price. */
+  _debugWrongPriceOnNextUpdate: string | undefined = undefined;
+  /** Next TERM_END `cancel()` lands as an IMMEDIATE cancellation instead (persisted status canceled, no schedule), while the returned subscription reports the requested schedule. One-shot. */
+  _debugCancelImmediatelyOnNextCancel = false;
+  /** Next `cancel()` returns success reporting the requested cancellation but persists NO cancellation at all (status stays active, no schedule). One-shot. */
+  _debugSkipCancelOnNextCancel = false;
+  /** Next `cancel()` persists `current_period_end` shifted by this many seconds — a TERM_END schedule whose effective date is not the authorized term boundary. One-shot. */
+  _debugShiftPeriodEndOnNextCancel: number | undefined = undefined;
+  /** Next mutation (`update()` or `cancel()`) lands and returns its artifact, then the persisted subscription record is REMOVED — post-mutation state is missing to any later read. One-shot. */
+  _debugDropSubscriptionOnNextMutation = false;
+  /** When true, the next `cancel()` fully applies the cancellation, then throws an `api_connection_error` — a response lost AFTER the cancellation landed. One-shot: the flag clears itself. */
+  _debugLoseNextCancelResponse = false;
+
   constructor(nowUnixSeconds = Math.floor(Date.now() / 1000)) {
     this.now = nowUnixSeconds;
   }
@@ -278,6 +304,30 @@ export class StripeSim {
     this.invoices.set(invoiceId, structuredClone(generated));
     sub.latest_invoice = invoiceId;
 
+    // Issue #44 misexecution faults: the returned artifact is the
+    // subscription AS REQUESTED (captured before the fault is
+    // applied); the persisted record then diverges. With no fault
+    // armed this is exactly the historical return value.
+    const artifact = structuredClone(sub);
+    if (this._debugWrongQuantityOnNextUpdate !== undefined || this._debugWrongPriceOnNextUpdate !== undefined) {
+      for (const proposed of proposedItems) {
+        if (!proposed.id) continue;
+        const persisted = sub.items.find((i) => i.id === proposed.id);
+        if (!persisted) continue;
+        if (this._debugWrongQuantityOnNextUpdate !== undefined) persisted.quantity = this._debugWrongQuantityOnNextUpdate;
+        if (this._debugWrongPriceOnNextUpdate !== undefined) {
+          const wrongPrice = PRICE_CATALOG[this._debugWrongPriceOnNextUpdate];
+          if (wrongPrice) persisted.price = wrongPrice;
+        }
+      }
+      this._debugWrongQuantityOnNextUpdate = undefined;
+      this._debugWrongPriceOnNextUpdate = undefined;
+    }
+    if (this._debugDropSubscriptionOnNextMutation) {
+      this._debugDropSubscriptionOnNextMutation = false;
+      this.subs.delete(subscriptionId);
+    }
+
     if (this._debugLoseNextUpdateResponse) {
       // Fault injection: everything above HAS landed (items applied,
       // invoice persisted) — only the response is lost. The caller
@@ -290,19 +340,56 @@ export class StripeSim {
       );
     }
 
-    return { subscription: structuredClone(sub), invoice: generated };
+    return { subscription: artifact, invoice: generated };
   }
 
   cancel(subscriptionId: string, atPeriodEnd: boolean): StripeSubscription {
     const sub = this.subs.get(subscriptionId);
     if (!sub) throw new StripeSimError("resource_missing", `No such subscription: ${subscriptionId}`);
+    const preCancel = { status: sub.status, cancel_at_period_end: sub.cancel_at_period_end, canceled_at: sub.canceled_at };
     if (atPeriodEnd) {
       sub.cancel_at_period_end = true;
     } else {
       sub.status = "canceled";
       sub.canceled_at = this.now;
     }
-    return structuredClone(sub);
+    // Issue #44 misexecution faults: as in update(), the returned
+    // artifact reports the requested cancellation; the persisted
+    // record diverges per the armed fault.
+    const artifact = structuredClone(sub);
+    if (this._debugCancelImmediatelyOnNextCancel) {
+      this._debugCancelImmediatelyOnNextCancel = false;
+      if (atPeriodEnd) {
+        sub.status = "canceled";
+        sub.canceled_at = this.now;
+        sub.cancel_at_period_end = false;
+      }
+    }
+    if (this._debugSkipCancelOnNextCancel) {
+      this._debugSkipCancelOnNextCancel = false;
+      sub.status = preCancel.status;
+      sub.cancel_at_period_end = preCancel.cancel_at_period_end;
+      sub.canceled_at = preCancel.canceled_at;
+    }
+    if (this._debugShiftPeriodEndOnNextCancel !== undefined) {
+      sub.current_period_end += this._debugShiftPeriodEndOnNextCancel;
+      this._debugShiftPeriodEndOnNextCancel = undefined;
+    }
+    if (this._debugDropSubscriptionOnNextMutation) {
+      this._debugDropSubscriptionOnNextMutation = false;
+      this.subs.delete(subscriptionId);
+    }
+    if (this._debugLoseNextCancelResponse) {
+      // Fault injection: the cancellation HAS landed (or diverged,
+      // if a misexecution fault above was also armed) — only the
+      // response is lost.
+      this._debugLoseNextCancelResponse = false;
+      throw new StripeSimError(
+        "api_connection_error",
+        "Simulated lost response: the cancellation was applied but its response never reached the caller (fault injection)"
+      );
+    }
+    return artifact;
   }
 
   /**
