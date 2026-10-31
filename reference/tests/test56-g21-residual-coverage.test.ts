@@ -59,6 +59,13 @@ import { makeStoredQuote } from "./helpers/durable-fixtures.js";
 //       with provider finality), and a resolved INDETERMINATE
 //       attempt's own quote stays blocked for any key —
 //       re-authorization proceeds as a new quote (§6.15).
+//       Correction round 3 (second-round review R2'/R4') closed the
+//       remaining trust gap: the establishment procedure is no
+//       longer a public export — tokens are minted only by a
+//       verifier (createProviderEvidenceVerifier) whose source
+//       RETRIEVES the record, and the store accepts only its own
+//       configured verifier's tokens (the public-API counterexample
+//       and the asserted-claim path are pinned in test59).
 //       The CONFIRMED_NON_EXECUTION same-key re-arm itself is
 //       already pinned at the coordinator level by test29.8/29.9,
 //       and key non-reassociation (incl. across sites) by
@@ -184,53 +191,58 @@ test("Test 56.2 (G-21(3), boundary): once the blocking attempt reaches a termina
 // and the post-resolution dispatch semantics.
 // ---------------------------------------------------------------------------
 
-function indeterminateStore(): { store: DurableQuoteStore; attemptId: string; clockNow: () => Date } {
+const createProviderEvidenceVerifier56: any = (durableModule as any).createProviderEvidenceVerifier;
+
+function indeterminateStore() {
   // Manual clock: dispatch, settlement (attempt.updatedAt), and the
   // provider observation must be strictly ordered for the finality
   // rules (PR #50 review R3) to be exercisable deterministically.
   let nowMs = Date.parse("2026-10-31T12:00:00.000Z");
-  const store = new DurableQuoteStore(tmpDb(), { recoveryGraceMs: 0, now: () => new Date(nowMs) });
+  // Round 3: the store's evidence capability is a verifier over an
+  // in-memory record source playing the provider.
+  const operationRecords = new Map<string, unknown>();
+  const source = { fetchOperationRecord: (q: any) => operationRecords.get(q.idempotencyKey as string) };
+  const verifier = typeof createProviderEvidenceVerifier56 === "function" ? createProviderEvidenceVerifier56(source) : undefined;
+  const storeOpts: any = { recoveryGraceMs: 0, now: () => new Date(nowMs) };
+  if (verifier) storeOpts.evidenceVerifier = verifier;
+  const store = new DurableQuoteStore(tmpDb(), storeOpts);
   store.put(makeStoredQuote("q1", "sub_1"));
   const att = store.beginDispatch(INTENT("q1", "sub_1", "site-a", "key-1"));
   nowMs += 60_000;
   store.recordAttemptOutcome(att.attemptId, "INDETERMINATE");
   nowMs += 60_000;
-  return { store, attemptId: att.attemptId, clockNow: () => new Date(nowMs) };
+  return { store, attemptId: att.attemptId, clockNow: () => new Date(nowMs), operationRecords, verifier };
 }
 
-const establishResolutionEvidence56: any = (durableModule as any).establishResolutionEvidence;
-
 /**
- * The legitimate resolution path after the PR #50 correction round:
- * a simulated provider record is validated by the establishment
- * procedure (binding, operation-bound kind, provider finality) and
- * minted into a branded token; resolveAttempt accepts only that
- * token. See test58 for the full matrix.
+ * The legitimate resolution path after PR #50 correction round 3:
+ * the simulated provider record is staged at the store's record
+ * source; the store's configured verifier FETCHES and validates it
+ * (binding, operation-bound kind, provider finality) and mints a
+ * branded token; resolveAttempt accepts only that verifier's
+ * tokens. See test58/test59 for the full matrix.
  */
-function establishedNonExecutionInput(store: DurableQuoteStore, attemptId: string, clockNow: () => Date) {
+function establishedNonExecutionInput(rig: ReturnType<typeof indeterminateStore>) {
+  const { store, attemptId, clockNow } = rig;
   const attempt = store.getAttempt(attemptId)!;
   const now = clockNow();
-  const token = establishResolutionEvidence56(
-    attempt,
-    {
-      source: "PROVIDER_OPERATION_LOG",
-      kind: "OPERATION_LOG_NO_RECORD_FOR_KEY",
-      reference: "oplog-ref-56",
-      provider: attempt.provider,
-      site: attempt.site ?? undefined,
-      subscriptionId: attempt.subscriptionId,
-      quoteId: attempt.quoteId,
-      idempotencyKey: attempt.idempotencyKey,
-      requestHash: attempt.requestHash,
-      operationFound: false,
-      observedState: { lookupResult: "NO_RECORD_FOR_KEY", idempotencyKey: attempt.idempotencyKey },
-      observedAt: now.toISOString(),
-      logFinal: true,
-      completeThrough: now.toISOString(),
-    },
-    "CONFIRMED_NON_EXECUTION",
-    now,
-  );
+  rig.operationRecords.set(attempt.idempotencyKey, {
+    source: "PROVIDER_OPERATION_LOG",
+    kind: "OPERATION_LOG_NO_RECORD_FOR_KEY",
+    reference: "oplog-ref-56",
+    provider: attempt.provider,
+    site: attempt.site ?? undefined,
+    subscriptionId: attempt.subscriptionId,
+    quoteId: attempt.quoteId,
+    idempotencyKey: attempt.idempotencyKey,
+    requestHash: attempt.requestHash,
+    operationFound: false,
+    observedState: { lookupResult: "NO_RECORD_FOR_KEY", idempotencyKey: attempt.idempotencyKey },
+    observedAt: now.toISOString(),
+    logFinal: true,
+    completeThrough: now.toISOString(),
+  });
+  const token = rig.verifier.establish(attempt, "CONFIRMED_NON_EXECUTION", now);
   return {
     evidence: token,
     operatorId: "operator-1",
@@ -260,7 +272,8 @@ test("Test 56.3 (G-21(2)): an unresolved INDETERMINATE attempt refuses both same
 });
 
 test("Test 56.4 (G-21(2), FIXED by P0 #43): resolution requires established evidence — a free-text note refuses, and a branded-token resolution produces a bound, readable resolution record", () => {
-  const { store, attemptId, clockNow } = indeterminateStore();
+  const rig = indeterminateStore();
+  const { store, attemptId } = rig;
   const NOTE = "reconciled against the provider console, 2026-10-30";
 
   // The pre-fix call shape: a free-text note alone. It now refuses
@@ -275,7 +288,7 @@ test("Test 56.4 (G-21(2), FIXED by P0 #43): resolution requires established evid
 
   const resolved = (store as unknown as { resolveAttempt: (id: string, ev: unknown) => ReturnType<DurableQuoteStore["getAttempt"]> }).resolveAttempt(
     attemptId,
-    establishedNonExecutionInput(store, attemptId, clockNow),
+    establishedNonExecutionInput(rig),
   )!;
   assert.equal(resolved.operatorReviewState, "RESOLVED");
   assert.equal(resolved.state, "INDETERMINATE", "resolution changes no outcome — the attempt's landing remains unestablished");
@@ -296,6 +309,7 @@ test("Test 56.4 (G-21(2), FIXED by P0 #43): resolution requires established evid
   assert.equal(record.classification, "CONFIRMED_NON_EXECUTION");
   assert.equal(record.evidenceSource, "PROVIDER_OPERATION_LOG");
   assert.equal(record.evidenceReference, "oplog-ref-56");
+  assert.equal((record as any).trustTier, "VERIFIED", "the record persists at the VERIFIED trust tier (round 3)");
   assert.match(record.evidenceHash, /^[0-9a-f]{64}$/);
   assert.equal(store.resolutionsForAttempt(attemptId).length, 1);
 
@@ -312,11 +326,12 @@ test("Test 56.4 (G-21(2), FIXED by P0 #43): resolution requires established evid
 });
 
 test("Test 56.5 (G-21(2)): after an established-evidence resolution, the same key returns the standing INDETERMINATE attempt un-re-armed, the SAME quote stays blocked for a new key (R1 / §6.15 new-quote rule), and a new quote may dispatch", () => {
-  const { store, attemptId, clockNow } = indeterminateStore();
+  const rig = indeterminateStore();
+  const { store, attemptId } = rig;
   store.put(makeStoredQuote("q2", "sub_1"));
   (store as unknown as { resolveAttempt: (id: string, ev: unknown) => unknown }).resolveAttempt(
     attemptId,
-    establishedNonExecutionInput(store, attemptId, clockNow),
+    establishedNonExecutionInput(rig),
   );
 
   const standing = store.beginDispatch(INTENT("q1", "sub_1", "site-a", "key-1"));

@@ -46,19 +46,32 @@ import { makeStoredQuote } from "./helpers/durable-fixtures.js";
 // subscription on a label with no reconciliation barrier or
 // stale-quote check (R4).
 //
-// The store's round-2 API is reached through `any` casts in this file
-// so the SAME test file compiles and runs against both the round-1
-// head (failing-first) and the corrected implementation: on the old
-// head the casts let the old call shapes execute and fail the
-// assertions; on the fixed code they exercise the real contract.
+// FAILING-FIRST provenance, round 3 (PR #50 second-round review,
+// findings R2'/R4'): the round-2 establishment procedure was a PUBLIC
+// export that minted branded tokens from caller-supplied objects —
+// the brand proved processing, not provider origin — and the landing
+// barrier accepted caller digests. This file was migrated to the
+// round-3 contract and run against head 2010e73 first: there, the
+// rig's verifier factory does not exist and every case fails. The
+// round-3 contract: tokens are minted ONLY by a verifier
+// (`createProviderEvidenceVerifier`) whose injected source RETRIEVES
+// the record — the caller never supplies one in the lifting path —
+// and the store accepts only tokens minted by ITS configured
+// verifier instance; the landing barrier is satisfied through the
+// same boundary with digests computed from the fetched
+// reconciliation record. The reviewer counterexamples themselves
+// (public-API fabrication; arbitrary financial hash) are pinned in
+// test59.
 //
-// Every provider record below is SIMULATED. No live provider is
-// touched, and no test equates a recorded evidence record with the
-// provider behaviour it describes: the store's job is to require
-// evidence that passed the establishment procedure, bind it, preserve
-// it, and gate on it. The brand proves passage through the
-// establishment computation — NOT that a record truly came from a
-// provider (the stated limit, mirrored from PR #8 R3).
+// The store's API is reached through `any` casts in this file so the
+// SAME test file compiles and runs against earlier heads
+// (failing-first) and the corrected implementation.
+//
+// Every provider record below is SIMULATED, served by an in-memory
+// source playing the provider. No live provider is touched. Whoever
+// configures a store's record source makes the deployment trust
+// decision; the library ships no source, so out of the box nothing
+// can lift a block.
 
 const require = createRequire(import.meta.url);
 function rawDb(path: string): any {
@@ -102,17 +115,49 @@ const INTENT = (quoteId: string, subscriptionId: string, key: string, site = "si
 // finality rules are about exactly those orderings.
 // ---------------------------------------------------------------------------
 const T0 = Date.parse("2026-10-31T12:00:00.000Z");
+
+// ---------------------------------------------------------------------------
+// Round-3 evidence machinery for the rigs: an in-memory provider
+// record source (playing the provider) and the verifier created over
+// it. Records are staged INTO the source, keyed by idempotency key;
+// establishment FETCHES them through the verifier — tests never hand
+// a record to the store or to a minting function directly.
+// ---------------------------------------------------------------------------
+type TestSource = {
+  operationRecords: Map<string, unknown>;
+  reconciliationRecords: Map<string, unknown>;
+  api: any;
+};
+function makeTestSource(): TestSource {
+  const src: TestSource = { operationRecords: new Map(), reconciliationRecords: new Map(), api: null };
+  src.api = {
+    fetchOperationRecord: (query: Record<string, unknown>) => src.operationRecords.get(query.idempotencyKey as string),
+    fetchFinancialReconciliation: (query: Record<string, unknown>) => src.reconciliationRecords.get(query.idempotencyKey as string),
+  };
+  return src;
+}
+const createProviderEvidenceVerifier: any = (durableModule as any).createProviderEvidenceVerifier;
+
 type Rig = {
   store: DurableQuoteStore;
+  source: TestSource;
+  verifier: any;
   tick: (ms: number) => void;
   now: () => Date;
   nowIso: () => string;
 };
 function openRig(path: string = tmpDb(), opts: DurableStoreOptions = {}): Rig {
   let nowMs = T0;
-  const store = openStore(path, { now: () => new Date(nowMs), ...opts });
+  const source = makeTestSource();
+  const verifier =
+    typeof createProviderEvidenceVerifier === "function" ? createProviderEvidenceVerifier(source.api) : undefined;
+  const storeOpts: any = { now: () => new Date(nowMs), ...opts };
+  if (verifier) storeOpts.evidenceVerifier = verifier;
+  const store = openStore(path, storeOpts);
   return {
     store,
+    source,
+    verifier,
     tick: (ms: number) => {
       nowMs += ms;
     },
@@ -129,9 +174,8 @@ function settleIndeterminate(rig: Rig, quoteId = "q1", subscriptionId = "sub_1",
   return att.attemptId;
 }
 
-// Round-2 API accessors (absent or differently shaped on the round-1
-// head — the helpers degrade there and the assertions fail).
-const establishResolutionEvidence: any = (durableModule as any).establishResolutionEvidence;
+// API accessors (absent or differently shaped on earlier heads —
+// the helpers degrade there and the assertions fail).
 function resolve(store: DurableQuoteStore, attemptId: string, input: unknown): any {
   return (store as any).resolveAttempt(attemptId, input);
 }
@@ -154,12 +198,23 @@ function isEvidenceRefusal(e: unknown): boolean {
   return (e as { code?: string })?.code === "RESOLUTION_EVIDENCE_REFUSED";
 }
 
+/** The landed subscription state a landing record observes (shared by the operation record and the reconciliation record). */
+function landedStateFor(subscriptionId: string): Record<string, unknown> {
+  return {
+    id: subscriptionId,
+    version: "v2",
+    status: "active",
+    items: [{ id: "item_1", offeringRef: "plan", quantity: 2 }],
+  };
+}
+
 let refSeq = 0;
 /**
  * A simulated provider record for an attempt, bound to the attempt in
  * every identity field, observed at the rig's current time (AFTER
  * settlement), from a FINAL log whose completeness watermark covers
- * the settlement. Overrides attack one field at a time.
+ * the settlement. Overrides attack one field at a time. The record is
+ * STAGED at the rig's source; establishment fetches it.
  */
 function providerRecord(rig: Rig, attemptId: string, classification: string, overrides: Record<string, unknown> = {}): Record<string, unknown> {
   const attempt = rig.store.getAttempt(attemptId)!;
@@ -171,12 +226,7 @@ function providerRecord(rig: Rig, attemptId: string, classification: string, ove
           reference: `oplog-ref-${++refSeq}`,
           operationFound: true,
           providerOperationId: "op_58_landing",
-          observedState: {
-            id: attempt.subscriptionId,
-            version: "v2",
-            status: "active",
-            items: [{ id: "item_1", offeringRef: "plan", quantity: 2 }],
-          },
+          observedState: landedStateFor(attempt.subscriptionId),
         }
       : {
           source: "PROVIDER_OPERATION_LOG",
@@ -199,9 +249,42 @@ function providerRecord(rig: Rig, attemptId: string, classification: string, ove
     ...overrides,
   };
 }
+/** Stage the record at the rig's source and establish through the rig's verifier (the only minting path, round 3). */
 function establish(rig: Rig, attemptId: string, classification: string, overrides: Record<string, unknown> = {}): any {
+  const record = providerRecord(rig, attemptId, classification, overrides);
+  rig.source.operationRecords.set(rig.store.getAttempt(attemptId)!.idempotencyKey, record);
   const attempt = rig.store.getAttempt(attemptId)!;
-  return establishResolutionEvidence(attempt, providerRecord(rig, attemptId, classification, overrides), classification, rig.now());
+  return rig.verifier.establish(attempt, classification, rig.now());
+}
+
+let finSeq = 0;
+/**
+ * A simulated financial reconciliation record for a landed attempt,
+ * bound to the attempt AND to the resolution's evidence reference,
+ * whose landed state IS the state the resolution established.
+ * Staged at the rig's source; the store's reconcile path fetches it
+ * through its verifier — digests are computed from it, never
+ * supplied by the caller (round 3, R4').
+ */
+function stageReconciliationRecord(rig: Rig, attemptId: string, resolution: any, overrides: Record<string, unknown> = {}): Record<string, unknown> {
+  const attempt = rig.store.getAttempt(attemptId)!;
+  const record: Record<string, unknown> = {
+    source: "PROVIDER_OPERATION_LOG",
+    reference: `finrec-ref-${++finSeq}`,
+    provider: attempt.provider,
+    site: attempt.site ?? undefined,
+    subscriptionId: attempt.subscriptionId,
+    quoteId: attempt.quoteId,
+    idempotencyKey: attempt.idempotencyKey,
+    requestHash: attempt.requestHash,
+    resolutionReference: resolution.evidenceReference,
+    landedState: landedStateFor(attempt.subscriptionId),
+    financialOutcome: { status: "RECONCILED", currency: "usd", immediateNet: 1000, recurringAmount: 5000 },
+    reconciledAt: rig.nowIso(),
+    ...overrides,
+  };
+  rig.source.reconciliationRecords.set(attempt.idempotencyKey, record);
+  return record;
 }
 function resolveInput(classification: string, token: unknown, overrides: Record<string, unknown> = {}): Record<string, unknown> {
   return {
@@ -574,7 +657,8 @@ test("Test 58.12: valid CONFIRMED_NON_EXECUTION evidence resolves with a bound r
   assert.match(record.evidenceHash, /^[0-9a-f]{64}$/);
   assert.equal(record.logFinal, true, "the provider-finality attestation is persisted with the record");
   assert.ok(record.completeThrough, "the completeness watermark is persisted with the record");
-  assert.equal(record.establishmentProcedure, "establishResolutionEvidence", "the record states the establishment procedure that minted its evidence");
+  assert.equal(record.establishmentProcedure, "createProviderEvidenceVerifier", "the record states the establishment path that minted its evidence");
+  assert.equal(record.trustTier, "VERIFIED", "a resolution established through the store's configured verifier persists at the VERIFIED trust tier");
   assert.ok(record.resolvedAt && record.observedAt, "resolution and observation timestamps are recorded");
 
   const report = rig.store.recoveryReport();
@@ -635,14 +719,18 @@ test("Test 58.13: CONFIRMED_LANDING alone unblocks nothing; the reconciliation b
   );
   assert.equal(landingReconciliation(rig.store, attemptId), undefined);
 
-  // The barrier refuses a landed-state digest that is not the
-  // resolution's established observed-state digest.
+  // The barrier refuses a reconciliation whose fetched record
+  // describes a DIFFERENT landed state than the resolution
+  // established (its internally computed digest cannot match) —
+  // and there is no caller-digest input to shortcut it (R4'; the
+  // digest-input counterexample is pinned in test59.4).
+  stageReconciliationRecord(rig, attemptId, record, {
+    landedState: { id: "sub_1", version: "v2", status: "active", items: [] },
+  });
   assert.throws(
     () =>
       reconcileLanded(rig.store, attemptId, {
         operatorId: "operator-1",
-        landedStateDigest: sha256("test58: some other state"),
-        financialOutcomeDigest: sha256("test58: reconciled financial outcome record"),
         justification: "Landed state and financial consequences reconciled against provider records.",
       }),
     (e: unknown) => isEvidenceRefusal(e),
@@ -650,16 +738,20 @@ test("Test 58.13: CONFIRMED_LANDING alone unblocks nothing; the reconciliation b
   );
   assert.equal(landingReconciliation(rig.store, attemptId), undefined, "the refused reconciliation records nothing");
 
-  // The barrier satisfied: digests recorded, bound to the landed state.
+  // The barrier satisfied through the verifier boundary: the
+  // digests on the record were computed from the fetched
+  // reconciliation record, bound to the landed state.
+  const finRecord = stageReconciliationRecord(rig, attemptId, record);
   const reconciliation = reconcileLanded(rig.store, attemptId, {
     operatorId: "operator-1",
-    landedStateDigest: record.observedProviderStateDigest,
-    financialOutcomeDigest: sha256("test58: reconciled financial outcome record"),
     justification: "Landed state and financial consequences reconciled against provider records.",
   });
   assert.equal(reconciliation.attemptId, attemptId);
   assert.equal(reconciliation.landedStateVersion, "v2");
   assert.equal(reconciliation.landedStateDigest, record.observedProviderStateDigest);
+  assert.equal(reconciliation.financialOutcomeDigest, sha256(canonical(finRecord.financialOutcome)));
+  assert.equal(reconciliation.evidenceReference, finRecord.reference);
+  assert.equal(reconciliation.trustTier, "VERIFIED");
   assert.match(reconciliation.recordHash, /^[0-9a-f]{64}$/);
   assert.deepEqual(landingReconciliation(rig.store, attemptId), reconciliation);
 
@@ -693,8 +785,6 @@ test("Test 58.13: CONFIRMED_LANDING alone unblocks nothing; the reconciliation b
     () =>
       reconcileLanded(rig.store, attemptId, {
         operatorId: "operator-1",
-        landedStateDigest: record.observedProviderStateDigest,
-        financialOutcomeDigest: sha256("test58: reconciled financial outcome record"),
         justification: "Duplicate reconciliation attempt.",
       }),
     (e: unknown) => isEvidenceRefusal(e),
@@ -729,7 +819,7 @@ test("Test 58.14a: a legacy RESOLVED flag with NO resolution record still blocks
   b.close();
 });
 
-test("Test 58.14b: a hand-built v1 database migrates to schema v3 in place — attempts intact and blocking, resolutions table empty", () => {
+test("Test 58.14b: a hand-built v1 database migrates to schema v4 in place — attempts intact and blocking, resolutions table empty", () => {
   const path = tmpDb();
   // Minimal v1 schema, copied from the baseline (schema v1)
   // SCHEMA_STATEMENTS in durable-store.ts.
@@ -773,7 +863,7 @@ test("Test 58.14b: a hand-built v1 database migrates to schema v3 in place — a
 
   const check = rawDb(path);
   const version = check.prepare(`SELECT value FROM meta WHERE key='schema_version'`).get() as { value: string };
-  assert.equal(version.value, "3", "the database was migrated to schema v3");
+  assert.equal(version.value, "4", "the database was migrated to schema v4");
   const table = check.prepare(`SELECT name FROM sqlite_master WHERE type='table' AND name='attempt_resolutions'`).get();
   assert.ok(table, "attempt_resolutions exists after migration");
   const count = check.prepare(`SELECT COUNT(*) AS n FROM attempt_resolutions`).get() as { n: number };
@@ -781,7 +871,7 @@ test("Test 58.14b: a hand-built v1 database migrates to schema v3 in place — a
   check.close();
 });
 
-test("Test 58.14c: a v2-era terminal resolution row migrates to v3 preserved but NON-LIFTING (no provider finality on record)", () => {
+test("Test 58.14c: a v2-era terminal resolution row migrates to v4 preserved but NON-LIFTING (no provider finality on record; trust backfilled ASSERTED)", () => {
   const path = tmpDb();
   // Hand-built v2 database: base schema + the v2 attempt_resolutions
   // table (schema as of head d0f35c8, before the v3 finality
@@ -864,15 +954,18 @@ test("Test 58.14c: a v2-era terminal resolution row migrates to v3 preserved but
   const store = openStore(path);
   const check = rawDb(path);
   const version = check.prepare(`SELECT value FROM meta WHERE key='schema_version'`).get() as { value: string };
-  assert.equal(version.value, "3", "the v2 database was migrated to schema v3");
+  assert.equal(version.value, "4", "the v2 database was migrated to schema v4");
   const logFinal = check.prepare(`SELECT log_final FROM attempt_resolutions WHERE resolution_id='res_v2_legacy'`).get() as { log_final: unknown };
   assert.equal(logFinal.log_final, null, "migration does not backfill provider finality for a v2-era record");
+  const tier = check.prepare(`SELECT trust_tier FROM attempt_resolutions WHERE resolution_id='res_v2_legacy'`).get() as { trust_tier: unknown };
+  assert.equal(tier.trust_tier, "ASSERTED", "migration backfills the ASSERTED trust tier for a v2-era record — it is never silently upgraded to VERIFIED (round 3, R2')");
   check.close();
 
   const record = getResolution(store, "att_v2_legacy");
   assert.ok(record, "the v2-era record is preserved and readable");
   assert.equal(record.classification, "CONFIRMED_NON_EXECUTION");
   assert.equal(record.logFinal, false, "the v2-era record carries no provider-finality attestation");
+  assert.equal(record.trustTier, "ASSERTED", "the v2-era record reads at the ASSERTED trust tier");
   assert.equal(
     store.findBlockingAttempt("q-v2", "sub_v2")?.attemptId,
     "att_v2_legacy",
@@ -1085,10 +1178,9 @@ test("Test 58.17: recoveryReport derives intervention and next action from the a
   // After the reconciliation barrier is recorded, the landing item
   // flips to no-intervention with the fresh-quote-only action.
   const landRecord = getResolution(rig.store, attLand);
+  stageReconciliationRecord(rig, attLand, landRecord);
   reconcileLanded(rig.store, attLand, {
     operatorId: "operator-1",
-    landedStateDigest: landRecord.observedProviderStateDigest,
-    financialOutcomeDigest: sha256("test58.17: reconciled financial outcome record"),
     justification: "Landed state and financial consequences reconciled against provider records.",
   });
   const reconciledItem = itemFor(attLand);
