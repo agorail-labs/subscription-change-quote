@@ -23,10 +23,17 @@ protocol allowed an adapter to claim, not any adapter's arithmetic:
 
 It also normatively describes two capabilities the implementation gained while closing those
 defects: a provider-neutral post-commit state-verification contract, and durable
-quote/receipt/attempt storage with write-ahead dispatch.
+quote/receipt/attempt storage with write-ahead dispatch. The reconciliation round (against
+PRs #24–#27) adds normative descriptions of four further merged behaviours: fail-closed
+authorization preservation for full-replacement dispatch (§3.15, §6.17), shared runtime
+proposal validation (§6.18), subscription identity binding and currency/cadence unit
+comparability (§3.16, §6.19), and the append-only receipt-evidence model with derived
+current views that replaces every candidate-equals-actual requirement (§3.10, §6.15,
+§6.16).
 
 **Relationship to the implementation.** The normative text below was written against the
-merged implementation on `main` (PRs #8, #10–#11, #13–#20) and agrees with it, except where a
+merged implementation on `main` (PRs #8, #10–#11, #13–#20, and — after the PR #21
+reconciliation round — PRs #23–#27, at `main` 82cbd1d) and agrees with it, except where a
 discrepancy is recorded inline with a `DISCREPANCY` marker and entered in
 `research/v0.6.2-release-gaps.md`. Where this candidate and the code disagree silently, the
 code is not thereby conformed and this text is not thereby correct — the gap register is the
@@ -327,10 +334,10 @@ type SubscriptionChangeReceipt = {
 - A repeated `commitChangeQuote` call against a quote_id that has already been
   successfully committed MUST return the EXACT SAME receipt object/value as the first
   successful commit, and MUST NOT perform a second provider mutation — see §6.10. In
-  v0.6.2 this means the **original recorded receipt**: if the receipt has since been
-  superseded by a verification transition (§6.15), a replaying caller still receives the
-  receipt as originally recorded; the current verified view is exposed only through
-  separate store reads.
+  v0.6.2 this means the **original recorded receipt**: if evidence appended under §6.15
+  has since changed the receipt's derived current view, a replaying caller still receives
+  the receipt as originally recorded; the current view is exposed only through separate
+  store reads, never through replay.
 - *(v0.6.2, BREAKING — BC-5/BC-6 companion)* `status` is widened from the single v0.6.1
   literal `"COMMITTED"`. `"COMMITTED"` holds iff the commit's outcome is
   COMMITTED_AND_VERIFIED; `"COMMITTED_UNVERIFIED"` holds iff the outcome is
@@ -397,14 +404,24 @@ permitted: in particular, a candidate is never derived from a further provider r
 performed after the mutation landed, and never copied from a pre-mutation estimate or
 preview as if it were a committed figure. A candidate is recorded deliberately, so
 that a later independent verification has the ORIGINAL figures to verify against: the
-candidate is part of the recorded receipt's canonical identity (§6.16) and MUST NOT be
-silently replaced, recomputed, or dropped before that verification. A candidate is NOT
-compliance evidence: no envelope assessment (§6.13) and no reconciliation (§6.14) may
-treat it as DETERMINED or established, and it can never by itself produce
-reconciliation OK or a verified transition. What establishes the dimension later is
-the §6.15 upgrade procedure — independent post-commit evidence whose committed figures
-must EQUAL the recorded candidate amounts; evidence about different figures is refused
-as a conflicting receipt identity, and the recorded receipt is never rewritten.
+candidate is part of the recorded receipt's canonical identity (§6.16) — the recorded
+candidate figures themselves are identity elements — and MUST NOT be silently replaced,
+recomputed, or dropped. A candidate is NOT compliance evidence: no envelope assessment
+(§6.13) and no reconciliation (§6.14) may treat it as DETERMINED or established, and it
+can never by itself produce reconciliation OK or a verified promotion. What establishes
+the dimension later is the §6.15 evidence procedure — independent post-commit evidence
+that establishes the dimension's actual on its own. **A candidate is a claim to be
+judged, not an identity element to be matched** (A-17-1): evidence whose independently
+established actuals DIFFER from the recorded candidates MUST NOT be refused on that
+ground and MUST NOT be reported as a receipt-identity conflict; the differing actual is
+recorded in the append-only evidence record, the derived view displays it, and the
+reconciliation — computed against the original quoted effect and envelope, never
+against the candidate — judges it (an out-of-envelope established actual is
+verified-with-violation, §6.15). A receipt-identity conflict
+(`CONFLICTING_RECEIPT_IDENTITY`) arises only when presented material names a different
+recorded identity: a different receipt, a different quote or subscription binding, or a
+record whose identity digest does not match its recorded contents. The recorded receipt
+is never rewritten by later evidence.
 Consumers MUST NOT present a candidate as a verified, reconciled, or charged amount.
 Outside this carve-out the rule remains categorical, and §6.13 enforcement is
 unchanged: a number under UNKNOWN determinacy on a quote-side or revalidated effect
@@ -463,7 +480,12 @@ type CommittedFigureSource =
   reconcile UNVERIFIED, never OK (§6.14).
 - `defined_equal_exact` establishes ONLY where the applicable EXACT contract justifies it:
   EXACT mode, with the dimension's determinacy established. An EXACT-shaped assertion
-  without establishing evidence does not verify.
+  without establishing evidence does not verify. **The label excuses ABSENT unit
+  statements only, never CONTRADICTING ones** (§3.16, P16-3): a committed effect labelled
+  `defined_equal_exact` that explicitly states a currency or cadence contradicting the
+  quote's is judged on the contradiction (VIOLATED), on every reconciliation path
+  including the no-envelope path; a label never overrides contradictory observed units
+  or actuals.
 - `unestablished` is the committed-role source of every dimension that could not be
   established. Where such a dimension carries a number on a COMMITTED_UNVERIFIED
   receipt, that number is a **candidate** under §3.10's carve-out — recorded, labeled,
@@ -541,7 +563,13 @@ type MutationOutcome =
 - **COMMITTED_AND_VERIFIED** — the landing is established, the intended state is verified
   (§6.12), and the committed actuals reconcile OK or VIOLATED over established figures
   (a verified-with-violation commit is COMMITTED_AND_VERIFIED with reconciliation
-  VIOLATED — "verified" means *measured*, not *within tolerance*).
+  VIOLATED — "verified" means *measured*, not *within tolerance*). The outcome asserts
+  exactly those three things — landing, target state, finances. It makes **no
+  authorization-preservation claim**: it does not assert that state outside the
+  authorized target was preserved, and target-state equality is not preservation
+  evidence (§6.12, §6.17). Where a dispatch mechanism cannot support a preservation
+  claim for OPERATION-authorized changes, the commit refuses pre-dispatch instead of
+  letting the outcome be misread as covering preservation (§6.17).
 
 Conflating INDETERMINATE with CONFIRMED_NON_EXECUTION is a normative violation: under
 v0.6.1 both surfaced as "an error, no receipt," and a caller retrying an INDETERMINATE
@@ -574,6 +602,14 @@ The normative semantics are §6.12. The three constant-false fields are part of 
 that the boundary between *state observed* and *execution/attribution/finances established*
 is structural, not merely documented.
 
+The expectation side (`PostCommitStateExpectation`) carries an optional
+`expectedSubscriptionRef` (v0.6.2, PR #26): when present, the hook performs the
+`state:subscriptionIdentity` check — the observed snapshot MUST name that subscription,
+and a snapshot naming a different subscription, carrying no id, or absent where the check
+applies makes the identity dimension unverifiable/contradicted per §6.19, never verified.
+The field is OPTIONAL in this version: whether it becomes a required expectation field in
+a future major version is an OPEN DECISION (gap register G-16, A-16 carry-forward).
+
 ### 3.14 Error codes *(v0.6.1, one addition)*
 
 ```ts
@@ -588,8 +624,62 @@ type SCQErrorCode =
   | "CHANGE_CONFLICT"
   | "PROVIDER_ERROR"
   | "QUOTE_DRIFTED"
-  | "CONFLICTING_RECEIPT_IDENTITY";   // v0.6.2 NEW — receipt-identity conflicts (§6.16)
+  | "CONFLICTING_RECEIPT_IDENTITY"   // v0.6.2 NEW — receipt-identity conflicts (§6.16)
+  | "AUTHORIZATION_PRESERVATION_UNENFORCEABLE";  // v0.6.2 NEW — §6.17 (PR #24)
 ```
+
+### 3.15 Authorization scope and mutation capability *(v0.6.2 NEW — PR #24)*
+
+```ts
+type AuthorizationScope = "OPERATION" | "TARGET_REPLACEMENT";
+type MutationCapability = "CONDITIONAL_WRITE" | "TARGETED_UPDATE" | "FULL_REPLACEMENT_ONLY";
+```
+
+- `authorizationScope` states the breadth of mutation the caller authorized. **OPERATION**
+  (the default — an absent scope reads as OPERATION, and a `null` scope likewise reads as
+  absent) authorizes exactly the proposed operation: state outside the operation's target
+  is not authorized to change. **TARGET_REPLACEMENT** authorizes replacement of the
+  subscription's full target state. TARGET_REPLACEMENT is a *recognized* declaration that
+  no adapter in this version implements: it MUST be refused at quote creation with
+  `UNSUPPORTED_CHANGE` — never silently accepted, downgraded to OPERATION, or executed.
+  Its semantics (consent, migration, receipt claims) are an OPEN DECISION for a future
+  revision (gap register G-14).
+- `mutationCapability` states what the adapter's dispatch mechanism can enforce. It is
+  **declared by the adapter, never by the caller and never read from caller-controlled
+  state**: in the reference implementation the Chargebee-live declaration is a
+  module-private constant (`FULL_REPLACEMENT_ONLY` — its sole update dispatch is
+  `update_for_items` with `replace_items_list=true`) exposed through a getter, so runtime
+  assignment or `Object.defineProperty` on an instance cannot falsify it. A quote records
+  the scope and the adapter's declared capability; at commit, a recorded capability that
+  differs from the adapter's declaration, or an unknown recorded capability value,
+  refuses at the preservation gate (unknown classifies as FULL_REPLACEMENT_ONLY).
+- The preservation rule itself is §6.17: an OPERATION-authorized commit through a
+  FULL_REPLACEMENT_ONLY mechanism MUST refuse pre-dispatch.
+
+### 3.16 Units of comparison: currency and cadence *(v0.6.2 NEW — PR #26)*
+
+A financial figure is denominated: a recurring amount carries a `currency` and may carry
+a `cadence` (`CommercialEffect.recurring`); comparison contexts may additionally thread
+billing currency/cadence per side (`ComparisonUnitContext`). Comparability of units is a
+**per-dimension precondition** of numeric comparison (§6.19), not a post-hoc annotation:
+
+- An *established contradiction* (both sides' currency established and different, or both
+  sides' cadence established and different — compared case-insensitively) is itself
+  established evidence: the dimension classifies VIOLATED on the contradiction.
+- A *participating currency that cannot be established* on a side makes the dimension's
+  numeric evidence unusable: the dimension classifies UNVERIFIED (pre-dispatch, the gate
+  refuses with a truthful unestablishable-units reason — never a proven-drift claim).
+  Masked numeric differences on such a dimension are not violations; an independently
+  established violation on another dimension still classifies VIOLATED.
+- Cadence stated on one side only is not decidable from the record and does not block
+  (the schema makes cadence optional — test49.14 pins this reading; see the A-16-3
+  carry-forward in gap register G-16).
+- `CommercialEffect.immediate` has **no currency field** in this version. The immediate
+  dimension's currency is therefore sourced from the same inputs as the recurring
+  dimension's (threaded billing context, then the side's recurring currency), so
+  currency-unestablishability is currently *correlated* across dimensions. The schema
+  extension that would give `immediate` its own currency (A-16-3) is an OPEN DECISION
+  (gap register G-16) and is NOT made by this candidate.
 
 ---
 
@@ -644,7 +734,10 @@ where no EXACT-backing mechanism exists.
   required mitigation: it reports; it does not undo.
 - **Fail-closed determinacy** *(v0.6.2 NEW)*: before the envelope comparison runs — at
   quote revalidation and at post-commit reconciliation — every dimension is assessed
-  under §3.10/§3.11. An unenforceable dimension (UNKNOWN on either side, an invalid
+  under §3.10/§3.11, and its units are assessed under §3.16/§6.19: numeric comparison
+  runs only where unit comparability is established, an established unit contradiction
+  is itself a violation, and an unestablishable participating currency yields UNVERIFIED
+  rather than a numeric verdict. An unenforceable dimension (UNKNOWN on either side, an invalid
   DETERMINED value, an unjustified or internally inconsistent NOT_APPLICABLE, or — for
   the committed side — figures without an establishing source) **refuses the commit
   pre-mutation** with `QUOTE_NOT_DETERMINISTIC`, and **reports UNVERIFIED post-commit**
@@ -706,6 +799,11 @@ rules. Rules 6.12–6.16 are new in v0.6.2.
 **6.2 (v0.2)** `commitChangeQuote` MUST validate the subscription's current
 version/fingerprint against the quote's captured precondition before performing any
 mutating call, and MUST refuse with `QUOTE_STALE` (no mutation) if it has changed.
+*(v0.6.2 clarification — PR #23 recommendation 4):* the precondition is evaluated
+against the last pre-dispatch read; it does not by itself bind the dispatch, which is
+bound only where the provider enforces a conditional write (§3.15 capability
+declaration). Where no conditional write exists, §6.3's BEST_EFFORT honesty governs the
+window between this check and the mutating call.
 
 **6.3 (v0.2)** No adapter MAY use an adapter-local lock, mutex, or semaphore to simulate
 atomic state-precondition-then-mutation. The TOCTOU race window between validation and
@@ -847,6 +945,19 @@ contract `verifyPostCommitState(expectation, observation)`:
 - The hook's result is a VALUE, not evidence: it carries no brand, and the store's
   verification procedure (§6.15) MUST refuse it exactly as it refuses any unbranded,
   caller-asserted verdict.
+- **Identity binding (§6.19).** Where the expectation carries `expectedSubscriptionRef`,
+  the hook's `state:subscriptionIdentity` check MUST be performed: an observed snapshot
+  naming a different subscription is a contradiction of the identity dimension; a
+  snapshot carrying no id, or no snapshot where the check applies, leaves the identity
+  unverifiable. State read from a different subscription is not evidence about this
+  quote's subscription, on any path.
+- **Preservation is not verified here.** A VERIFIED verdict — including a FULL_ITEM_SET
+  verdict — is target-state conformance against the authorized expectation. It is NOT
+  evidence that state outside the authorized target was preserved, and MUST NOT be
+  presented as such: where the commit mechanism enumerates the full target state
+  (full-list replacement), the verdict says nothing about whether out-of-scope state
+  survived, because the mechanism replaced the list wholesale (§6.17 states what each
+  dispatch class can claim).
 
 **6.13 (v0.6.2 NEW — fail-closed envelope enforcement; BC-1)** `checkAcceptanceEnvelope`
 (pre-mutation) and `reconcileCommittedEffect` (post-commit) share ONE per-dimension,
@@ -857,7 +968,13 @@ develop parallel interpretations of §3.10/§3.11. The report-only diagnostic
 - A dimension is **comparable** iff both sides are DETERMINED with finite values and
   role-appropriate provenance: quote-role sides require the dimension's provenance note;
   the committed role additionally requires an establishing `committedSource`
-  (`provider_actual` or `defined_equal_exact`).
+  (`provider_actual` or `defined_equal_exact`). Comparability of *figures* is necessary
+  but not sufficient for numeric comparison: the dimension's **units** must also satisfy
+  §6.19 — an established unit contradiction classifies the dimension VIOLATED on the
+  contradiction itself (pre-mutation, the gate's refusal reason names the failed unit
+  precondition rather than a numeric drift), and an unestablishable participating
+  currency makes the dimension unenforceable for numeric purposes (pre-mutation refusal
+  with an unestablishable-units reason; post-commit UNVERIFIED).
 - A dimension is **skipped** iff both sides assert a justified NOT_APPLICABLE (§3.10).
   A skipped dimension is never compared as zero.
 - Anything else is **unenforceable**: UNKNOWN on either side (legacy payloads included),
@@ -887,13 +1004,19 @@ develop parallel interpretations of §3.10/§3.11. The report-only diagnostic
 landed, so an unenforceable dimension is reported, not refused. The verdict is:
 
 1. **VIOLATED** — an ESTABLISHED violation: at least one dimension both sides establish
-   whose committed value exceeds the envelope. Precedence: an established violation is
-   reported even when another dimension remains unestablished — a proven violation is
-   never downgraded by an unrelated unknown.
+   whose committed value exceeds the envelope, **or an established unit contradiction
+   (§6.19) on a participating dimension** — the contradiction is itself the established
+   evidence and classifies on its own, at differing numbers or equal ones. Precedence:
+   an established violation is reported even when another dimension remains
+   unestablished — a proven violation is never downgraded by an unrelated unknown, and
+   a masked numeric difference on an unestablishable-units dimension never displaces an
+   independently established violation on another dimension.
 2. **UNVERIFIED** — no established violation, but at least one dimension cannot be
    established (UNKNOWN on either side, an invalid DETERMINED value, committed figures
    of estimate or unestablished provenance, an unjustified NOT_APPLICABLE, or a
-   NOT_APPLICABLE over a present field). Compliance was not proven, so OK is not
+   NOT_APPLICABLE over a present field, **or a participating currency that cannot be
+   established — numeric differences across unestablished units are not evidence and
+   never classify VIOLATED**). Compliance was not proven, so OK is not
    available; an UNKNOWN committed dimension cannot produce OK by absence, by numeric
    coincidence, or by sharing the quote's number. This includes a dimension carrying a
    §3.10 candidate: the candidate is recorded *because* the dimension is unestablished,
@@ -908,7 +1031,15 @@ ONLY when the committed figures the receipt reports are themselves established a
 NOT_APPLICABLE). If any committed dimension is unestablished, the result is UNVERIFIED:
 an unknown financial outcome must not masquerade as verified actuals merely because no
 envelope was stated. A dimension carrying only a §3.10 candidate is unestablished for
-this purpose.
+this purpose. **Unit comparability applies on this path exactly as on the envelope
+paths (§6.19, P16-2/P16-3):** an established unit contradiction classifies VIOLATED
+(the CANCEL envelope exception excuses the missing envelope, not contradictory units);
+a participating currency that cannot be established classifies UNVERIFIED; and the
+`defined_equal_exact` label excuses absent unit statements only — a committed effect
+labelled `defined_equal_exact` that explicitly states a contradicting currency or
+cadence classifies VIOLATED, while one whose stated units are identical to the quote's
+(or unstated on both sides, established by the EXACT construction) reconciles OK as
+before.
 
 **Legacy receipts.** Historical receipts recorded under v0.6.1 remain valid historical
 records with their original identities. They MUST NOT be re-reconciled under v0.6.2 and
@@ -922,7 +1053,8 @@ evidence into verified financial actuals (§6.16).
   by operation-bound evidence (a mutation response bound to the operation, or an
   operation-keyed post-commit read — never state matching alone); state VERIFIED under
   §6.12 where state verification applies; and reconciliation OK or VIOLATED over
-  established actuals. COMMITTED_UNVERIFIED requires landing established by the same
+  established actuals, composed under the evidence-record rules below (append-only
+  record, derived view, coherent promotion basis). COMMITTED_UNVERIFIED requires landing established by the same
   standard, with the unestablished dimensions named. INDETERMINATE and
   CONFIRMED_NON_EXECUTION follow §3.12's definitions; in particular, an adapter's rule
   for classifying a dispatched mutation's failure as CONFIRMED_NON_EXECUTION must be
@@ -949,30 +1081,104 @@ evidence into verified financial actuals (§6.16).
   CONFIRMED_NON_EXECUTION attempt — whose non-execution was independently confirmed
   pre-effect — may be re-dispatched once under the same quote and key under §6.16's
   gates (§3.12; OPEN DECISION G-13).
-- **Upgrading a COMMITTED_UNVERIFIED receipt.** The transition to COMMITTED_AND_VERIFIED
-  happens only through the store's establishment procedure
-  (`establishVerification` → `verifyCommitReceipt`), which:
-  - accepts only evidence minted from an INDEPENDENT post-commit `ProviderObservation`
-    (a read of provider-side state after the commit, naming the quote's subscription,
-    whose committed figures carry an establishing source, and which is not the quote's
-    own quoted effect relabeled);
-  - computes the §6.12 state verification and the §6.14 reconciliation FROM the
-    observation — the caller never asserts either verdict;
-  - brands the resulting evidence token (module-private brand); a caller-constructed
-    object with identical fields is self-asserted and refused, as is a token whose
-    contents were altered after minting (the store re-validates the token against the
-    recorded receipt);
-  - requires the evidence's committed figures to equal the amounts RECORDED on the
-    receipt at commit time (a VIOLATED outcome is expressed through reconciliation,
-    never by substituting different figures) — where the recorded amount is a §3.10
-    candidate, this equality is the comparison the candidate exists for: the
-    independent evidence must confirm the candidate's figures exactly, and a candidate
-    that independent evidence contradicts can never be upgraded on this record;
-  - refuses transitions whose recomputed reconciliation is UNVERIFIED, and refuses
-    non-VERIFIED state results.
-  A successful transition ends in exactly one of two terminal shapes, both with outcome
-  COMMITTED_AND_VERIFIED: reconciliation OK, or reconciliation VIOLATED. The original
-  recorded receipt is never overwritten (§3.9 replay rule; §6.16 immutability).
+- **Later establishment: the append-only evidence record (A-17-1…A-17-5).** A recorded
+  receipt's committed figures are established later only through evidence appended to
+  its **evidence record** — never by rewriting the receipt, and never by matching its
+  recorded candidates. For each recorded receipt the store MUST maintain an append-only
+  evidence record. Each entry MUST carry: (a) the recorded identity digest of the
+  receipt it appends to; (b) an evidence identity derived from the entry's contents and
+  that digest (content-derived evidence id), such that resubmitting identical evidence
+  is an idempotent no-op and an entry whose stated identity does not match its contents
+  is invalid; (c) the establishing evidence itself — minted from an INDEPENDENT
+  post-commit `ProviderObservation` (a read of provider-side state after the commit,
+  naming the quote's subscription, whose committed figures carry an establishing
+  source, and which is not the quote's own quoted effect relabeled), with the §6.12
+  state verification and a reconciliation computed FROM the observation (the caller
+  never asserts either verdict), the observed committed effect with per-dimension
+  determinacy, provenance, currency and cadence; (d) a per-dimension disposition toward
+  the recorded candidates (ESTABLISHES / CONFIRMS / CONTRADICTS_CANDIDATE /
+  UNRESOLVED); and (e) conflict flags recording, per dimension, contradiction with an
+  actual accepted from an earlier entry. Entries are immutable once appended and MUST
+  be defensively copied on ingress and on read, so later mutation of a presented token
+  cannot rewrite recorded history. The store's minting procedure
+  (`establishVerification`) brands the evidence token (module-private brand); a
+  caller-constructed object with identical fields is self-asserted and refused, as is a
+  token whose contents were altered after minting (content validation plus a
+  minting-time content digest; the store re-validates the token against the recorded
+  receipt and quote).
+  - **Three determinations are kept distinct.** ADMISSIBILITY — whether an entry may be
+    recorded at all (branded/minted, bound to the receipt's quote and subscription,
+    unaltered since minting, of establishing provenance — estimate lineage and
+    self-asserted verdicts are refused — internally consistent, and recomputed against
+    the recorded quote and envelope under §6.19's unit rules; candidate equality is NOT
+    an admissibility condition; evidence observed against a MISMATCH state is refused
+    at recording, while UNVERIFIABLE-state evidence is admissible but cannot satisfy
+    promotion's state limb). ESTABLISHMENT — which dimensions an entry independently
+    establishes: exactly those carrying a DETERMINED figure (or NOT_APPLICABLE); an
+    UNKNOWN figure establishes nothing. PROMOTION — whether the derived view may read
+    verified (below). Evidence that is admissible but partial, admissible but
+    state-unverifiable, or admissible but conflicted MUST be recordable without
+    promoting (`recordReceiptEvidence`); `verifyCommitReceipt` remains the single-shot
+    transition that appends a promotable token and returns the derived view, and
+    appends NOTHING when the composed trail does not promote.
+  - **The derived current view.** The current view of a commit is DERIVED from the
+    recorded receipt plus its evidence record; it is never authored independently, and
+    verification MUST NOT rewrite the recorded receipt (A-17-3). Per dimension the view
+    displays the accepted established actual where one exists, with the establishing
+    evidence's determinacy and provenance; a dimension no accepted evidence establishes
+    is shown as recorded — the candidate, for display only — and MUST NOT be presented
+    as established. The composed committed effect takes, per dimension, the accepted
+    established figure, determinacy and provenance (A-17-4): its whole-effect committed
+    source claims an establishing source ONLY when every participating dimension is
+    established — while any participating dimension remains unestablished the composed
+    source reads `unestablished`, so a view can never display COMMITTED_AND_VERIFIED
+    over fields still labelled UNKNOWN/unestablished. Reconciliation for a verified
+    view is computed against the ORIGINAL QUOTED effect and the proposal's acceptance
+    envelope, never against the recorded candidate as the financial baseline: an
+    established actual outside the envelope reads VIOLATED, never OK.
+  - **Composition and conflicts.** Per dimension, the first establishing entry sets the
+    accepted actual; a later entry with the same value confirms it; partial entries
+    compose across the record. Where a later admissible entry establishes a DIFFERENT
+    actual for an already-established dimension, the entry MUST be appended and
+    flagged, the previously accepted actual MUST NOT be replaced, and while the
+    conflict stands the view MUST read COMMITTED_UNVERIFIED with an UNVERIFIED
+    reconciliation naming the conflict — never an unqualified OK. Conflict resolution
+    is an operator act outside the protocol's automatic rules.
+  - **Promotion.** The derived view promotes to COMMITTED_AND_VERIFIED only when ALL of
+    the following hold conjunctively: the evidence record is non-empty; no unresolved
+    conflict stands; the reconciliation recomputed over the composed established effect
+    against the original quoted effect and envelope is DETERMINED — OK
+    (verified-with-compliance) or VIOLATED (verified-with-violation), which MUST remain
+    distinguishable outcomes; some entry's state result is VERIFIED; and the
+    **promotion basis is cross-observation coherent** (next bullet). A promoted outcome
+    is therefore exactly one of two terminal shapes, both COMMITTED_AND_VERIFIED:
+    reconciliation OK, or reconciliation VIOLATED. INDETERMINATE /
+    CONFIRMED_NON_EXECUTION records (no receipt) cannot be verified into existence.
+  - **Cross-observation coherence (A-17-5, as completed by the degenerate-revision
+    rule).** The promotion basis is the set of entries the verified claim rests on: the
+    accepted establisher of each established dimension, together with the entry
+    carrying the VERIFIED state result when no establisher carries it. An entry
+    established against an observed post-commit state carries that state's identity —
+    `observedStateDigest`, a digest of the resulting snapshot's subscription id and
+    state-revision `version`, stamped at minting and bound into the entry's
+    content-derived evidence id. The basis is coherent iff it consists of a single
+    entry, or every entry in it carries the SAME observed-state identity. An entry
+    carrying NO observed-state identity MUST NOT take part in a promotion basis of more
+    than one entry. Composition for display is unrestricted — actuals established
+    against different revisions are still recorded and shown — but an incoherent basis
+    MUST leave the view COMMITTED_UNVERIFIED with an UNVERIFIED reconciliation whose
+    reason names the incoherence. **Identity existence:** an observed-state identity
+    exists ONLY when both components are established — the snapshot is present AND its
+    subscription id is a non-empty string AND its `version` is a non-empty string
+    (non-empty judged after trimming; non-string runtime values establish nothing).
+    Otherwise the observation stamps no identity and the entry is treated exactly like
+    a snapshot-less one. Established components are digested verbatim — trimming
+    decides existence, never equality. The single-entry basis rule is unchanged: a lone
+    entry composes nothing, so there is no cross-observation claim for a degenerate
+    revision to falsify.
+  - **Identity conflicts, delimited.** `CONFLICTING_RECEIPT_IDENTITY` is retained for
+    genuinely different receipts, wrong quote/subscription bindings, and tampered
+    recovery sets — never for candidate≠actual (A-17-1).
 - **Operator reconciliation.** A conforming deployment MUST be able to enumerate
   receipts in the UNVERIFIED state and attempts in unresolved states
   (DISPATCHING/INDETERMINATE) for operator review, and MUST provide the recovery
@@ -985,17 +1191,42 @@ MUST persist quotes, receipts, and mutation attempts durably, such that:
 
 - **Original-receipt replay.** A recorded receipt is retrievable verbatim after any
   restart, and §6.10 replay returns it without revalidation (§3.9).
-- **Receipt identity.** Each recorded receipt has a canonical identity (the tuple of
+- **Receipt identity.** Each recorded receipt has a canonical identity — the tuple of
   receiptId, quoteId, subscriptionId, recorded outcome, recorded reconciliation status,
-  and recorded committed figures) with a digest verified at recording and at recovery.
-  Reusing an identity under different content, or a persisted record whose fields no
-  longer match its recorded digest, is a `CONFLICTING_RECEIPT_IDENTITY` refusal. The
-  original record is always preserved; identity is never resolved by overwriting.
+  recorded `immediate.net`, and recorded `recurring.resultingAmount` (the recorded
+  candidate figures themselves, where present) — with a digest verified at recording
+  and at recovery. Reusing an identity under different content, or a persisted record
+  whose fields no longer match its recorded digest, is a `CONFLICTING_RECEIPT_IDENTITY`
+  refusal. The original record is always preserved; identity is never resolved by
+  overwriting, and later evidence never revises the identity (A-17-1).
+- **Evidence-record persistence and recovery.** The append-only evidence record (§6.15)
+  persists with the receipt. Recovery re-validates EVERY entry (identity-digest
+  binding, live-equivalent admissibility, entry/evidence reconciliation agreement,
+  derived fields recomputed and compared, evidence-id uniqueness) and NEVER trusts a
+  persisted current view: the persisted view is adopted only if it deep-equals the
+  derived view, and adoption installs the derived view; an incoherent restore set is
+  rejected atomically, as a whole, at both restore paths (in-memory and durable).
+  Appends are atomic at the stated boundary: in-memory append + derivation is one
+  synchronous step; the durable store persists quote row + receipt record in one SQLite
+  transaction and poisons on failure, so an interrupted append recovers exactly the
+  pre- or post-append record — never a promoted view without its evidence. Legacy
+  one-transition trails in the historical entry shape are accepted and normalized at
+  recovery, with their view re-derived under §6.15 — a legacy record carrying a
+  verified label over unestablished figures restores truthfully rather than refusing or
+  persisting the mislabel (A-17-6).
 - **Recovery coherence.** On adoption after restart, the whole recovered set is
   validated for coherence (record↔quote association, recorded-state legality,
   verification-trail coherence, per-record integrity digests). Any failure refuses the
   WHOLE set — partial adoption of a corrupt record set is prohibited — and every read /
-  replay egress validates the records it serves.
+  replay egress validates the records it serves. One check is specific to the
+  observed-state digest: a persisted entry's stored `observedStateDigest` is a *stated*
+  field recovery cannot recompute from source (the originating snapshot is not
+  persisted), but the two digest values minted under the pre-correction rule from
+  degenerate revisions of a record's subscription — an empty version, and an absent
+  version — ARE computable at recovery from the subscription id, and recovery MUST
+  refuse any entry carrying either, whole-set, at the shared coherence check: that
+  coherence claim was never sound. The residual limitation this leaves is recorded
+  non-normatively in §9 (U-14) and gap register G-15.
 - **Write-ahead attempts.** Before any dispatch, the mutation intent — quote,
   subscription, provider, site, the exact canonical request, its request hash, the
   idempotency key, attempt identity, and the pre-dispatch fingerprint — is persisted in
@@ -1030,8 +1261,13 @@ MUST persist quotes, receipts, and mutation attempts durably, such that:
   the exact request authorized. *(Doctrine: OPEN DECISION G-13 / U-13.)*
 - **Same-subscription concurrency.** A second dispatch for a subscription with an
   unresolved attempt MUST be refused; the exclusion is checked inside the persistence
-  transaction, bound to the full identity (provider, site, subscription, quote), not
-  merely asserted by callers beforehand.
+  transaction, not merely asserted by callers beforehand. *(Reconciliation note — code
+  governs:* the reference implementation's blocking check keys on (quote_id OR
+  subscription_id) and carries no provider/site predicate, so the same subscription id
+  on two different sites mutually blocks — an over-broad, availability-side,
+  fail-closed-direction divergence from the full-identity keying an earlier draft of
+  this clause stated. Recorded as gap register G-21; the normative requirement is the
+  in-transaction refusal, and the keying refinement is tracked, not silently claimed.)*
 - **Crash/restart recovery.** A DISPATCHING attempt found at recovery is NEVER
   automatically retried. After the deployment's recovery grace window (the reference
   implementation defaults to 30 s, distinguishing a crashed writer from a live one
@@ -1054,6 +1290,111 @@ SQLite (WAL mode, `synchronous=FULL`) via an optional native dependency, per-quo
 version compare-and-swap write-through, and SHA-256 record digests. Those mechanics are
 one conforming realization, not protocol requirements; another store providing the same
 guarantees conforms equally.
+
+**6.17 (v0.6.2 NEW — authorization preservation; PR #24)** Where a commit's dispatch
+mechanism cannot preserve state outside the authorized operation's target, the
+authorization's breadth decides the outcome — before dispatch:
+
+- The adapter's mutation capability is adapter-declared (§3.15) and MUST NOT be read
+  from caller-controlled or runtime-mutable state. A quote records the authorization
+  scope and the declared capability; a recorded capability that differs from the
+  adapter's declaration, or an unknown recorded capability value (classified as
+  FULL_REPLACEMENT_ONLY), refuses at this gate.
+- An **OPERATION-authorized** update commit dispatched through a **FULL_REPLACEMENT_ONLY**
+  mechanism (the dispatch enumerates the complete target item list, e.g.
+  `update_for_items` with `replace_items_list=true`) MUST refuse **pre-dispatch** with
+  `AUTHORIZATION_PRESERVATION_UNENFORCEABLE`. The refusal carries CONFIRMED_NON_EXECUTION
+  semantics: zero dispatches, zero durable dispatch attempts, no receipt, and it is
+  never INDETERMINATE. Neither the absence of observed concurrency nor a fresh
+  pre-dispatch read lifts the refusal: a read is not a conditional write, and no
+  documented Chargebee conditional-write/CAS mechanism closes the window between the
+  last read and the replacement dispatch (the concurrent-addition race is Issue #22
+  Finding 1: a concurrent item is deleted by the replacement while a target-state check
+  still passes). This is a standing limitation of the mechanism, not a transient
+  defect (§9 U-15 / gap register G-17).
+- **TARGET_REPLACEMENT** scope is refused at quote creation with `UNSUPPORTED_CHANGE`
+  (recognized, unimplemented — §3.15); no waiver or configuration bypass exists.
+- A quote created through such an adapter SHOULD disclose the commit consequence at
+  creation (the recorded scope + capability pair), so the refusal never surprises a
+  caller at commit time.
+- **Preservation claims.** No receipt, view, or report may claim or imply preservation
+  of unnamed/out-of-scope state for a commit dispatched as a full-list replacement;
+  target-state equality is not preservation evidence (§6.12). CANCEL quotes on the
+  Chargebee-live adapter are refused at creation (the adapter has never dispatched a
+  cancellation), unchanged by this rule.
+
+**6.18 (v0.6.2 NEW — runtime proposal validation; PR #25)** Type definitions are not
+runtime validation. Adapters MUST validate caller-controlled proposals at runtime
+through the shared validator (`validateProposalRuntime` at creation;
+`validateStoredQuoteRuntime` over the stored record at commit), as the FIRST statement
+of quote creation and, at commit, after §6.10 replay / INDETERMINATE / expiry /
+fingerprint handling and before any re-preview, durable attempt, or dispatch:
+
+- **Proposal structure and mode.** A malformed proposal structure refuses with
+  `INVALID_PROPOSAL`. `guaranteeMode`: omitted reads as REVALIDATE; only `EXACT` and
+  `REVALIDATE` are valid; an explicit `null` is INVALID (the null asymmetry with
+  `authorizationScope`, which reads `null` as absent, is deliberate and stated here so
+  it is spec, not folklore).
+- **Envelope shape.** A supplied `acceptanceEnvelope` MUST be a plain object carrying
+  only the three named bounds (`maxImmediateNetIncrease`,
+  `maxImmediateCreditDecrease`, `maxRecurringIncrease`), each a finite, non-negative
+  number, read via OWN properties
+  only (inherited bounds never widen tolerance; engine-constructed envelopes are built
+  so a polluted prototype cannot smuggle a bound). Only `undefined` is omission: falsy
+  supplied envelopes (`null`, `false`, `0`, `""`) are malformed, not omitted. Whether
+  bounds must additionally be *safe integers* is an OPEN DECISION (gap register G-18):
+  this candidate specifies the implemented finite-non-negative rule and records the
+  recommendation, it does not impose the stricter rule. Envelope *presence* (the
+  REVALIDATE-requires-envelope rule and its CANCEL exception, §4.2) is enforced at quote
+  creation AFTER effectiveIntent support checks, so an intent-unsupported proposal
+  refuses `UNSUPPORTED_CHANGE` even when it is also envelope-less.
+- **Scope validation is shared.** The authorization-scope rules of §3.15/§6.17 are
+  validated by the same shared path at creation AND at commit, over both stored
+  declaration sites (proposal and quote record): an unknown scope value in a stored
+  record refuses at commit as `INVALID_PROPOSAL` — never gated-as-OPERATION, never
+  INDETERMINATE, zero dispatches.
+- **Zero quantity and DATE representation.** `CHANGE_QUANTITY` with `quantity: 0` is
+  accepted by the validator (finite, ≥ 0) and its meaning is left to provider
+  semantics — a spec ruling is recorded as an open item in gap register G-18. A DATE
+  effective intent's `at` MUST be a string that `Date.parse` accepts.
+- **Post-commit classification never throws.** `reconcileCommittedEffect` NEVER throws:
+  a malformed envelope discovered after the mutation landed classifies — VIOLATED
+  through interpretable bounds, else UNVERIFIED — never OK, and never an exception that
+  loses the receipt (§6.14). Pre-dispatch, invalid input refuses; post-dispatch, it
+  classifies. Recorded-receipt replay (§6.10) precedes stored validation: validation
+  never refuses a legitimate replay.
+
+**6.19 (v0.6.2 NEW — subscription identity binding and unit comparability; PR #26)**
+
+- **Identity binding, pre-dispatch.** Every provider read consumed on a commit path
+  (creation reads and commit-phase validation reads) MUST be bound to the quote's
+  subscription: a read naming a different subscription refuses BEFORE dispatch with
+  CONFIRMED_NON_EXECUTION semantics (zero dispatches, zero durable attempts, no
+  receipt).
+- **Identity binding, post-dispatch.** Provider data naming a foreign subscription,
+  returned after dispatch or by a post-commit re-read, MUST NOT be consumed as evidence
+  for this commit: it cannot verify the record, cannot reconcile OK, and — the work
+  having been dispatched — is never reclassified CONFIRMED_NON_EXECUTION. It classifies
+  as a verification failure over dispatched work. The shared §6.12 hook check
+  (`state:subscriptionIdentity`, §3.13) applies the same binding inside
+  `establishVerification`, so asserted-ref patterns in the simulators are bound through
+  the store as well.
+- **Unit comparability as a precondition.** Financial comparison (envelope gate,
+  reconciliation, store recomputation — one shared assessment,
+  `assessUnitComparability`) is per-dimension and runs BEFORE any numeric evidence is
+  taken from that dimension: (1) an established unit contradiction (§3.16) classifies
+  VIOLATED on the contradiction itself; (2) a numeric violation is available only on
+  dimensions whose units are established and compatible; (3) an unestablishable
+  participating currency classifies UNVERIFIED, and numeric differences on such a
+  dimension are masked there — they are not violations — while an independently
+  established violation on another dimension still classifies VIOLATED. The same
+  precondition governs the pre-dispatch gate's REASON (§6.13) and the
+  malformed-envelope projection's numeric evidence (§6.18), and it applies on the
+  no-envelope path exactly as on the envelope paths (§6.14). Unit context is threaded
+  through quote creation, stored-quote minting/recomputation, and each adapter's
+  establishment path; where an adapter's context is a construction placeholder rather
+  than established context, that limit is disclosed in the provider audit rather than
+  silently relied on.
 
 ---
 
@@ -1143,6 +1484,35 @@ carries their full entries, severities, and recommended resolutions.
   does not authenticate its creation time or issuer against a privileged writer. It is a
   pilot-harness control, NOT a protocol mechanism, and nothing in this candidate makes
   origin-manifest evidence a normative input to any §6 rule.
+- **U-14 (NEW) — Legacy observed-state digest limitation (residual, disclosed).** A
+  persisted evidence entry's stored `observedStateDigest` is a stated field: recovery
+  cannot recompute it from source data, because the originating snapshot is not
+  persisted. Recovery refuses entries carrying the two enumerable old-rule degenerate
+  digests (empty version; absent version — §6.16). **Residual:** digests minted before
+  the identity-existence rule from whitespace-only or non-string version components are
+  not enumerable at recovery and remain stated fields recovery takes as presented. They
+  cannot be minted anymore; closing them at recovery would require persisting the
+  originating snapshot — a format change no merged PR makes. Recorded in gap register
+  G-15.
+- **U-15 (NEW) — Chargebee full-replacement preservation blocker (standing limitation).**
+  With `replace_items_list=true` as the sole update dispatch and no documented
+  conditional write/CAS, OPERATION-scope authorization preservation is unenforceable on
+  Chargebee-live, so such commits refuse pre-dispatch (§6.17). This is a standing
+  limitation of the mechanism, recorded in gap register G-17 — not a resolved item, and
+  not lifted by any pre-dispatch read.
+- **U-16 (NEW) — F3/F4 schema decisions carried undecided (A-16-1…A-16-4 record).** The
+  normative rules of A-16-1 (identity binding) and A-16-2 (unit comparability) ARE
+  stated in this candidate (§6.19) because merged code decided the behaviours. The
+  schema questions remain OPEN and are not resolved by this candidate: A-16-3 (an
+  optional `currency` on `CommercialEffect.immediate`, adapter-populated, with
+  stored-record compatibility, plus a required-resulting-cadence proposal and its
+  stored-record migration note); A-16-4 (the Chargebee-live committed-effect
+  currency-defaulting construction — left unchanged in merged code); whether an
+  `expectedSubscriptionRef`-style binding becomes a REQUIRED expectation field in a
+  future major version (it is optional here, §3.13); cadence vocabulary normalization
+  beyond case-insensitivity; and whether historical receipts should be annotated (never
+  rewritten) with derived unit context when next verified. All are carried in gap
+  register G-16.
 - **U-13 (NEW) — Confirmed-non-execution re-dispatch doctrine awaits ratification**
   (gap G-13, OPEN DECISION). This candidate specifies the implemented doctrine
   (§3.12/§6.15/§6.16): one same-quote, same-key re-dispatch per CONFIRMED_NON_EXECUTION
@@ -1174,7 +1544,7 @@ carries their full entries, severities, and recommended resolutions.
 | (new) | NEW §3.10: three-state determinacy, purity, N/A licensing (field absence + single-action context + citation; recurring never N/A; multi-change unlicensable), legacy UNKNOWN reading, finding order, snapshot determinacy. |
 | (new) | NEW §3.11: committed-figure provenance sources; only provider_actual / defined_equal_exact establish; label ≠ authentication (OPEN DECISION G-01). |
 | (new) | NEW §3.12: four-class mutation-outcome taxonomy with retry rules — including the confirmed-non-execution re-dispatch doctrine (one same-quote, same-key re-dispatch per CONFIRMED_NON_EXECUTION settlement, §6.16 gates; SPEC2 correction — an earlier draft of this candidate said "as a new quote", contradicting the merged ledger; doctrine is OPEN DECISION G-13/U-13). |
-| (new) | §3.10/§3.12 candidate clarification (SPEC3 correction): an UNKNOWN committed dimension on a COMMITTED_UNVERIFIED receipt MAY carry a labeled, non-establishing **candidate** (source disclosed; `committedSource: "unestablished"`; part of the recorded receipt's identity; established later only by §6.15 evidence equal to the recorded candidate). An earlier draft of this candidate stated the no-number rule categorically for UNKNOWN and required committed effects to contain only established figures — wording that declared the merged adapters' deliberate candidate construction (PR #10/#11 doctrine, present in all five adapters) nonconforming. The categorical rule is unchanged for quote/revalidated roles and for §6.13 enforcement. |
+| (new) | §3.10/§3.12 candidate clarification (SPEC3 correction): an UNKNOWN committed dimension on a COMMITTED_UNVERIFIED receipt MAY carry a labeled, non-establishing **candidate** (source disclosed; `committedSource: "unestablished"`; part of the recorded receipt's identity; established later only by §6.15 evidence — as originally corrected, evidence equal to the recorded candidate; that equality requirement was itself superseded in the reconciliation round by A-17-1 (§6.15 as reconciled: evidence establishes independently; differing actuals are judged, not refused). An earlier draft of this candidate stated the no-number rule categorically for UNKNOWN and required committed effects to contain only established figures — wording that declared the merged adapters' deliberate candidate construction (PR #10/#11 doctrine, present in all five adapters) nonconforming. The categorical rule is unchanged for quote/revalidated roles and for §6.13 enforcement. |
 | (new) | NEW §3.13/§6.12: provider-neutral post-commit state-verification contract (verdicts, coverage, multiset tuples, partial/malformed handling, scheduled-cancel timing incl. premature-termination and SV6 classification, constant-false boundary fields). |
 | §4.1 EXACT scope | Unchanged; v0.6.2 note ties EXACT establishment to §3.11. |
 | §4.2 REVALIDATE | Clarifications preserved; NEW fail-closed determinacy paragraph (§6.13 summary). |
@@ -1184,6 +1554,12 @@ carries their full entries, severities, and recommended resolutions.
 | §6.11 Reconciliation | Extended by §6.14: precedence VIOLATED > UNVERIFIED > OK; no-envelope case stated explicitly; legacy receipts never re-reconciled to OK. |
 | (new) | NEW §6.12 state verification; NEW §6.13 fail-closed enforcement (shared assessment, refusal shape, no-intent guarantee); NEW §6.15 outcomes/attribution/recovery/upgrade procedure; NEW §6.16 durable behavior (SQLite/WAL informative only), including the key/hash binding rules with the sole CONFIRMED_NON_EXECUTION re-dispatch exception (SPEC2). |
 | §7 Multi-change | Unchanged, plus the N/A-licensing consequence note. |
+| (new, reconciliation) | NEW §3.15 authorization scope + mutation capability (PR #24); NEW §3.16 units of comparison (PR #26); §3.13 gains the optional `expectedSubscriptionRef` and the `state:subscriptionIdentity` check (PR #26). |
+| (new, reconciliation) | NEW §6.17 authorization preservation (PR #24, incl. PR #23 recommendations 1/2/8 as implemented); NEW §6.18 runtime proposal validation (PR #25, incl. PR #23 recommendation 5); NEW §6.19 identity binding + unit comparability (PR #26, incl. PR #23 recommendations 6/7 as implemented). |
+| §3.10/§3.12/§6.14/§6.15/§6.16 (reconciliation) | Candidate-equality ELIMINATED (A-17-1…A-17-6, PR #27): §6.15's upgrade rule replaced by the append-only evidence record + derived current view + promotion/coherence rules; §3.10 candidate redefined as a claim to be judged, not an identity element to be matched; §6.16 gains evidence-record persistence/recovery, legacy-trail normalization, and the degenerate-digest recovery refusal; §6.13/§6.14 gain the §6.19 unit precondition including the no-envelope path and the P16-3 label rule. |
+| §3.14 Error codes | One further addition: `AUTHORIZATION_PRESERVATION_UNENFORCEABLE` (PR #24). |
+| §6.2 (reconciliation) | Temporal-scope clarification (PR #23 recommendation 4): the fingerprint precondition is evaluated against the last pre-dispatch read and does not itself bind the dispatch. |
+| §9 Unresolved | U-14 (digest residual), U-15 (preservation blocker), U-16 (A-16 undecided schema set) added in the reconciliation round. |
 | §8 Schema diff | Superseded by this Appendix and §8's BC-1…BC-6 summary. |
 | §9 Unresolved | U-1…U-8 carried; U-9…U-13 added, each cross-referencing the gap register. |
 
@@ -1223,7 +1599,9 @@ COMMITTED_UNVERIFIED receipt MAY carry a labeled candidate (source disclosed in
 provenance, `committedSource: "unestablished"`, reconciliation UNVERIFIED); the
 candidate is part of the recorded receipt's identity, is never compliance evidence,
 never produces OK or a verified transition by itself, and is established later only by
-§6.15 evidence whose figures equal the recorded candidate; on quote/revalidated roles
+§6.15 evidence that establishes the dimension independently — differing established
+actuals are recorded and judged against the quote/envelope, never refused as an
+identity conflict (V62-EVD-09); on quote/revalidated roles
 an UNKNOWN dimension carries no number, and fail-closed enforcement is unchanged.
 
 Outcomes & recovery (§3.12/§6.15): **V62-OUT-01** four-class taxonomy; receipts only for
@@ -1246,6 +1624,60 @@ kind-contradiction ambiguity = UNVERIFIABLE) · **V62-SV-07** expectation side i
 authorized-side only (incl. termBoundaryAt) · **V62-SV-08** state verdict establishes
 neither execution, attribution, nor finances (constant-false fields; result refused as
 evidence).
+
+Authorization preservation (§3.15/§6.17): **V62-AUTH-01** capability is
+adapter-declared and not runtime-mutable; recorded capability differing/unknown refuses
+· **V62-AUTH-02** OPERATION-authorized update commit through a FULL_REPLACEMENT_ONLY
+mechanism refuses pre-dispatch with AUTHORIZATION_PRESERVATION_UNENFORCEABLE
+(CONFIRMED_NON_EXECUTION semantics, zero attempts/dispatches) · **V62-AUTH-03**
+TARGET_REPLACEMENT refused at creation (UNSUPPORTED_CHANGE); no waiver/config bypass ·
+**V62-AUTH-04** no receipt/view/report claims preservation of unnamed state for a
+full-list-replacement dispatch; target-state equality is not preservation evidence ·
+**V62-AUTH-05** scope/capability validated at creation AND commit over both stored
+declaration sites (shared with §6.18).
+
+Runtime proposal validation (§6.18): **V62-RTV-01** shared runtime validation at
+creation (first statement) and over the stored record at commit (after §6.10 replay,
+before re-preview/attempts/dispatch) · **V62-RTV-02** guaranteeMode: omitted ⇒
+REVALIDATE; only EXACT/REVALIDATE valid; explicit null invalid · **V62-RTV-03**
+envelope shape: plain object, only the three named bounds, finite non-negative numbers,
+own-property reads only; only undefined is omission · **V62-RTV-04**
+reconcileCommittedEffect never throws: malformed envelope post-commit classifies
+VIOLATED through interpretable bounds, else UNVERIFIED, never OK · **V62-RTV-05**
+envelope-presence enforcement at creation after effectiveIntent support checks
+(UNSUPPORTED_CHANGE precedence) · **V62-RTV-06** DATE `at` must be a Date.parse-able
+string; quantity 0 accepted and left to provider semantics.
+
+Identity binding & unit comparability (§3.16/§6.19): **V62-IDU-01** pre-dispatch
+foreign reads refuse (CONFIRMED_NON_EXECUTION, zero attempts) · **V62-IDU-02**
+post-dispatch foreign data is never evidence (never VERIFIED/OK, never
+CONFIRMED_NON_EXECUTION for dispatched work) · **V62-IDU-03** shared-hook
+expected-subscription check (state:subscriptionIdentity) binds establishment ·
+**V62-IDU-04** unit comparability is a per-dimension precondition: established
+contradiction ⇒ VIOLATED on the contradiction; numeric violation only on
+established-and-compatible dimensions; unestablishable participating currency ⇒
+UNVERIFIED (masked numeric differences land there) · **V62-IDU-05** the same
+precondition governs the gate's reason, the malformed-envelope projection, the
+no-envelope path, and store recomputation · **V62-IDU-06** the defined_equal_exact
+label excuses absent unit statements only, never contradicting ones (P16-3).
+
+Receipt evidence (§6.15/§6.16, PR #27): **V62-EVD-09** later establishment is
+append-only and identity-bound; candidate equality is NOT an admissibility or identity
+condition (A-17-1/A-17-2) · **V62-EVD-10** admissibility / establishment / promotion are
+separate determinations; admissible-but-partial/state-unverifiable/conflicted evidence
+records without promoting · **V62-EVD-11** the current view is derived, never authored;
+recovery never trusts a persisted view (deep-equal or whole-set refusal); appends are
+atomic at the stated boundary; legacy one-transition trails normalize and re-derive ·
+**V62-EVD-12** conflicts append + flag, never substitute; a standing conflict pins the
+view COMMITTED_UNVERIFIED with UNVERIFIED reconciliation · **V62-EVD-13**
+verified-with-violation is a first-class, distinguishable promoted outcome (recomputed
+vs the original quote + envelope, never the candidate) · **V62-EVD-14**
+cross-observation promotion coherence: the promotion basis must share ONE
+observed-state identity; identity-less entries cannot join a cross-entry basis;
+single-entry basis unchanged · **V62-EVD-15** identity existence: an observed-state
+identity exists only when snapshot id AND version are each established non-empty
+strings (degenerate revisions stamp no identity); recovery refuses entries carrying
+the two enumerable old-rule degenerate digests.
 
 Durable behavior (§6.16): **V62-DUR-01** verbatim original-receipt replay after restart ·
 **V62-DUR-02** receipt identity digest; conflicts refuse, originals preserved ·
