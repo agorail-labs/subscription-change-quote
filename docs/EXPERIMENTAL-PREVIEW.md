@@ -1,4 +1,10 @@
-# SCQ v0.6.1 — Experimental developer-preview notes
+# SCQ v0.6.1 — Experimental developer-preview notes (superseded)
+
+**Superseded.** SCQ v0.6.2 is now the project's current experimental specification
+([specification](../spec/scq-v0.6.2-spec.md); [release notes](../research/v0.6.2-release-notes.md);
+[migration guide](../research/v0.6.2-migration-guide.md)). This document is retained unchanged
+below as the v0.6.1-era preview record: its version-specific statements (including test counts
+and the frozen-contract note) describe the v0.6.1 publication state, not the current one.
 
 **Status:** Published as a public experimental repository for external review. **Not endorsed as a standard**, not an adopted specification of any provider or standards body, and the reference package is **not published to npm** (the repository is public; the npm package is not).
 

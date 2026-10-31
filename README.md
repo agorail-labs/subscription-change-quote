@@ -1,8 +1,8 @@
 # Subscription Change Quote (SCQ)
 
 ```text
-Status: Experimental protocol / external review candidate
-Version: SCQ v0.6.1
+Status: Experimental protocol
+Version: SCQ v0.6.2 (experimental specification)
 ```
 
 SCQ is a protocol-neutral contract for making changes to an **existing subscription** —
@@ -55,7 +55,8 @@ v0.6.1 is a **standards-hardening cycle** over the v0.6 protocol freeze candidat
 providers, actions, or major schema concepts were added. It narrows EXACT's semantics, requires
 post-commit reconciliation, and makes quote expiration and commit idempotency explicit
 normative rules. See [`spec/scq-v0.6.1-spec.md`](spec/scq-v0.6.1-spec.md) for the full
-normative diff from v0.6.
+normative diff from v0.6. The same frozen scope carries into v0.6.2 unchanged — v0.6.2 is a
+semantics cycle and adds no providers, actions, or guarantee modes.
 
 ## Evidence levels — read this before trusting any capability claim
 
@@ -98,6 +99,47 @@ UNVERIFIED                   — intentionally left open; SCQ reports UNKNOWN ra
 this repository as implying otherwise. Full detail, including exactly which Chargebee findings
 are live-confirmed versus simulated, is in [`research/EVIDENCE.md`](research/EVIDENCE.md).
 
+## Current status and known limitations (v0.6.2)
+
+SCQ v0.6.2 is published as an **experimental** normative specification (ratified by the
+maintainer, PR #21). Publication asserts the specification's semantics only. It is **not** a
+conformance certification for any implementation, **not** a release of the reference package,
+and **not** an authorization to execute subscription changes against any provider.
+
+- **Three conformance rows are PARTIAL** (of 75 rules; see
+  [`conformance/v0.6.2-traceability.md`](conformance/v0.6.2-traceability.md)): snapshot
+  determinacy is emitted but consumed by no enforcement path (V62-DET-08, G-07); the core
+  trusts adapter-established EXACT source classification and does not independently
+  authenticate provider events (V62-EVD-01, G-01 — a forged-label contradiction against the
+  record's own figures is now refused, but observation origin is not authenticated); and
+  three state-establishment paths remain adapter-owned rather than consuming the shared
+  verification hook (V62-SV-02, G-08 — the Chargebee-simulator update path was migrated to
+  the hook; Chargebee-simulator cancel, Paddle cancel, and Zuora remain adapter-owned).
+- **G-09 is closed** — the inherited v0.6.1 test-path gaps are closed at simulation level
+  (PR #36).
+- **G-20:** the research suite stands at 11 pass / 7 fail **by design** — seven harnesses
+  are refused pre-dispatch by the authorization-preservation gate. Their intended properties
+  are accounted for by converted regression evidence (test47, test49, test50, test55).
+- **G-21 remains open:** durable-recovery limitations include INDETERMINATE-attempt
+  resolution evidence not being persisted (issue #43, P0) and dispatch exclusion not scoped
+  by provider/site (issue #45); issues #44 and #46 track further residuals.
+- **G-17:** the Chargebee live adapter's only update mechanism is full-list replacement
+  (`FULL_REPLACEMENT_ONLY`), so OPERATION-authorized updates are **refused before dispatch**
+  (`AUTHORIZATION_PRESERVATION_UNENFORCEABLE`). The G-17 mechanism research and prototype
+  (PR #38) are **mock-only** — not a live Chargebee mutation capability; no documented
+  conditional write exists. A Chargebee test-site commit remains **NO-GO** (issue #12).
+- **No complete independent provider-backed commit validation exists.** No live
+  provider-backed commit has ever been executed; the evidence classes above (simulated
+  tests, provider documentation, historical live read/quote observations) remain distinct.
+- **No production certification, no provider endorsement, and no blanket
+  implementation-conformance claim** is made by this publication.
+- **The reference package is not published to npm.** `reference/package.json` remains
+  `private: true` with v0.6.1-asserting metadata, unchanged; package release is a separate
+  gated decision (currently NO-GO).
+
+Full disclosures are in the [v0.6.2 release notes](research/v0.6.2-release-notes.md) and the
+[gap register](research/v0.6.2-release-gaps.md).
+
 ## Repository structure
 
 ```text
@@ -106,11 +148,21 @@ examples/                   Concrete normalized proposal/quote/receipt/failure e
 conformance/                Draft conformance suite — maps tests to normative rules
 research/                   Evidence register and full multi-cycle research findings
 standards/                  Fit analysis against ACP and UCP, and a discussion-draft pre-SEP
-reference/                  TypeScript reference implementation and full test suite (115 tests)
+reference/                  TypeScript reference implementation and full test suite (803 tests)
 ```
 
-- [`spec/scq-v0.6.1-spec.md`](spec/scq-v0.6.1-spec.md) — the normative specification. Start here
-  for the actual protocol.
+- [`spec/scq-v0.6.2-spec.md`](spec/scq-v0.6.2-spec.md) — **current standard:** the normative
+  specification, published as an experimental specification. Start here for the actual
+  protocol.
+- [`spec/scq-v0.6.1-spec.md`](spec/scq-v0.6.1-spec.md) — the previous specification, retained
+  unchanged.
+- [`research/v0.6.2-migration-guide.md`](research/v0.6.2-migration-guide.md) — the adopter
+  migration path from v0.6.1 (BC-1…BC-6 breaking changes and fail-closed behaviour).
+- [`research/v0.6.2-release-notes.md`](research/v0.6.2-release-notes.md) — the v0.6.2 release
+  notes, including the known-limitations disclosures.
+- [`conformance/v0.6.2-traceability.md`](conformance/v0.6.2-traceability.md) — clause-by-clause
+  mapping of the 75 v0.6.2 rules to implementation and tests, including the three PARTIAL
+  rows.
 - [`spec/security-considerations.md`](spec/security-considerations.md) — threat model: TOCTOU,
   stale quotes, replay, envelope bypass, silent partial execution, malicious adapters, and more.
 - [`examples/SCQ-EXAMPLES.md`](examples/SCQ-EXAMPLES.md) — worked proposal/quote/receipt
@@ -137,7 +189,7 @@ ACP has adopted or will adopt SCQ.
 
 ## Developer quickstart
 
-For the experimental preview's actual scope and limitations, see [preview notes](docs/EXPERIMENTAL-PREVIEW.md). For responsible vulnerability reporting, see [Security](SECURITY.md).
+For v0.6.2's scope and known limitations, see the [release notes](research/v0.6.2-release-notes.md). (The v0.6.1-era [preview notes](docs/EXPERIMENTAL-PREVIEW.md) are retained as a superseded historical record.) For responsible vulnerability reporting, see [Security](SECURITY.md).
 
 Start with the [simulator-only seat-expansion walkthrough](docs/QUICKSTART.md). It shows quote inspection, separate business spending caps, a default no-mutation path, and an explicitly simulated commit. The reference project is **not yet published as an npm package** and its adapters are not production billing SDK integrations.
 
@@ -160,12 +212,12 @@ npm install
 npm test
 ```
 
-Compiles with `tsc` and runs the full suite (115 tests) via Node's built-in test runner. No
+Compiles with `tsc` and runs the full suite (803 tests) via Node's built-in test runner. No
 external test framework dependency.
 
 ## Community and feedback
 
-SCQ v0.6.1 is open for **external technical review**, not yet a production-ready billing SDK or an adopted industry standard.
+SCQ v0.6.2 is open for **external technical review**, not yet a production-ready billing SDK or an adopted industry standard.
 
 - [GitHub Issues](../../issues) — reproducible bugs, specification inconsistencies, documentation corrections, or conformance gaps.
 - [GitHub Discussions](../../discussions) — integration questions, architectural tradeoffs, evidence requests, and feedback on possible future extensions. (Discussions is enabled on the public repository.)
