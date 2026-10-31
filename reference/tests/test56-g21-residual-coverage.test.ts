@@ -15,7 +15,7 @@ import { ChargebeeAdapter } from "../src/adapters/chargebee-adapter.js";
 import { freshChargebeeFixture } from "./fixtures.js";
 import { makeStoredQuote } from "./helpers/durable-fixtures.js";
 
-// Test 53 — SCQ v0.6.2 conformance closure (issue #29): G-21
+// Test 56 — SCQ v0.6.2 conformance closure (issue #29): G-21
 // Finding-7 residuals. TEST-ONLY pins of CURRENT behaviour plus
 // documentation; no behaviour changes. Where a pin holds a
 // documented limitation in place it is labelled a LIMITATION PIN:
@@ -26,9 +26,9 @@ import { makeStoredQuote } from "./helpers/durable-fixtures.js";
 // Item map (G-21 register entry, research/v0.6.2-release-gaps.md):
 //   (3) Exclusion keying — findBlockingAttempt keys on
 //       (quote_id OR subscription_id) with no provider/site
-//       predicate (§6.16 as implemented): 53.1, 53.2.
+//       predicate (§6.16 as implemented): 56.1, 56.2.
 //   (2) resolveAttempt attestation — an INDETERMINATE attempt is
-//       unblocked by an operator's free-text note alone: 53.3–53.5.
+//       unblocked by an operator's free-text note alone: 56.3–56.5.
 //       The CONFIRMED_NON_EXECUTION same-key re-arm itself is
 //       already pinned at the coordinator level by test29.8/29.9,
 //       and key non-reassociation (incl. across sites) by
@@ -58,16 +58,16 @@ import { makeStoredQuote } from "./helpers/durable-fixtures.js";
 //       state re-read + fingerprint bracket), its wrong-state and
 //       wrong-actual negatives are pinned by test25.17b and
 //       test25.20, and an EXACT-guarantee CANCEL does not exist
-//       there at all — 53.6 pins its refusal at quote creation.
+//       there at all — 56.6 pins its refusal at quote creation.
 //   (4) Post-commit evidence attribution residue — test50 pins the
 //       token binding across quote+subscription (50.6), foreign
 //       snapshots (50.7), presented-receipt conflicts (50.5) and
 //       restore-set tampering (50.20/50.22/50.23/50.25/50.36).
 //       The residue pinned here: the quote binding ISOLATED from
-//       the subscription binding (53.7), and a WHOLESALE trail
+//       the subscription binding (56.7), and a WHOLESALE trail
 //       transplant — a genuine, internally valid trail re-filed
 //       under a different record — at both restore paths
-//       (53.8, 53.9).
+//       (56.8, 56.9).
 //
 // All evidence is SIMULATED (durable-store SQLite files in a temp
 // dir; simulator adapters). No live provider is touched.
@@ -95,7 +95,7 @@ const INTENT = (quoteId: string, subscriptionId: string, site: string, key: stri
 // documented divergence tracked in G-21, not a conformance claim.
 // ---------------------------------------------------------------------------
 
-test("Test 53.1 (G-21(3), LIMITATION PIN): a DISPATCHING attempt under one Chargebee site blocks a dispatch for the same subscription id under a DIFFERENT site", () => {
+test("Test 56.1 (G-21(3), LIMITATION PIN): a DISPATCHING attempt under one Chargebee site blocks a dispatch for the same subscription id under a DIFFERENT site", () => {
   const store = openStore(tmpDb());
   store.put(makeStoredQuote("qA", "sub_xsite"));
   store.put(makeStoredQuote("qB", "sub_xsite"));
@@ -129,7 +129,7 @@ test("Test 53.1 (G-21(3), LIMITATION PIN): a DISPATCHING attempt under one Charg
   store.close();
 });
 
-test("Test 53.2 (G-21(3), boundary): once the blocking attempt reaches a terminal record, the other site's dispatch is no longer blocked", () => {
+test("Test 56.2 (G-21(3), boundary): once the blocking attempt reaches a terminal record, the other site's dispatch is no longer blocked", () => {
   const store = openStore(tmpDb());
   store.put(makeStoredQuote("qA", "sub_xsite"));
   store.put(makeStoredQuote("qB", "sub_xsite"));
@@ -161,7 +161,7 @@ function indeterminateStore(): { store: DurableQuoteStore; attemptId: string } {
   return { store, attemptId: att.attemptId };
 }
 
-test("Test 53.3 (G-21(2)): an unresolved INDETERMINATE attempt refuses both same-key retry and new-key dispatch until an operator resolves it", () => {
+test("Test 56.3 (G-21(2)): an unresolved INDETERMINATE attempt refuses both same-key retry and new-key dispatch until an operator resolves it", () => {
   const { store, attemptId } = indeterminateStore();
   const att = store.getAttempt(attemptId)!;
   assert.equal(att.state, "INDETERMINATE");
@@ -181,7 +181,7 @@ test("Test 53.3 (G-21(2)): an unresolved INDETERMINATE attempt refuses both same
   store.close();
 });
 
-test("Test 53.4 (G-21(2), LIMITATION PIN): resolution is a flag, not evidence — the resolved attempt record carries only the free-text note's effect (operatorReviewState), and no structured resolution record exists", () => {
+test("Test 56.4 (G-21(2), LIMITATION PIN): resolution is a flag, not evidence — the resolved attempt record carries only the free-text note's effect (operatorReviewState), and no structured resolution record exists", () => {
   const { store, attemptId } = indeterminateStore();
   const NOTE = "reconciled against the provider console, 2026-10-30";
   const resolved = store.resolveAttempt(attemptId, NOTE);
@@ -207,7 +207,7 @@ test("Test 53.4 (G-21(2), LIMITATION PIN): resolution is a flag, not evidence �
   store.close();
 });
 
-test("Test 53.5 (G-21(2)): after resolution, the same key returns the standing INDETERMINATE attempt un-re-armed, and a new key may dispatch", () => {
+test("Test 56.5 (G-21(2)): after resolution, the same key returns the standing INDETERMINATE attempt un-re-armed, and a new key may dispatch", () => {
   const { store, attemptId } = indeterminateStore();
   store.resolveAttempt(attemptId, "operator reconciled; no execution found");
 
@@ -230,7 +230,7 @@ test("Test 53.5 (G-21(2)): after resolution, the same key returns the standing I
 // wrong actual are caught by independent establishment).
 // ---------------------------------------------------------------------------
 
-test("Test 53.6 (G-21(1)): a Chargebee CANCEL quote requesting the EXACT guarantee is refused at creation (UNSUPPORTED_CHANGE)", async () => {
+test("Test 56.6 (G-21(1)): a Chargebee CANCEL quote requesting the EXACT guarantee is refused at creation (UNSUPPORTED_CHANGE)", async () => {
   const { sim, sub } = freshChargebeeFixture();
   const store = new QuoteStore();
   const adapter = new ChargebeeAdapter(sim, store);
@@ -370,7 +370,7 @@ function twoQuoteStore(): QuoteStore {
   return store;
 }
 
-test("Test 53.7 (G-21(4)): evidence minted for one quote is refused for another quote on the SAME subscription — the quote/operation binding isolated", () => {
+test("Test 56.7 (G-21(4)): evidence minted for one quote is refused for another quote on the SAME subscription — the quote/operation binding isolated", () => {
   const store = twoQuoteStore();
   const tokenA = establishVerification(store.get("q53_a")!, observation53());
 
@@ -402,7 +402,7 @@ function transplantedPayload(): string {
   return JSON.stringify({ records: [recB] });
 }
 
-test("Test 53.8 (G-21(4)): a wholesale trail transplant — genuine entries re-filed under a different record — refuses restore; nothing is adopted", () => {
+test("Test 56.8 (G-21(4)): a wholesale trail transplant — genuine entries re-filed under a different record — refuses restore; nothing is adopted", () => {
   const restored = new QuoteStore();
   restored.put(makeQuote53("q53_b"));
   assert.throws(
@@ -413,7 +413,7 @@ test("Test 53.8 (G-21(4)): a wholesale trail transplant — genuine entries re-f
   assert.equal(restored.get("q53_b")!.commit_receipt, undefined, "no partial adoption from a transplanted trail");
 });
 
-test("Test 53.9 (G-21(4)): the transplant is refused at the DURABLE restore path too, and a reopen adopts nothing", () => {
+test("Test 56.9 (G-21(4)): the transplant is refused at the DURABLE restore path too, and a reopen adopts nothing", () => {
   const path = tmpDb();
   const a = openStore(path);
   a.put(makeStoredQuote("q53_b", SUB53));
