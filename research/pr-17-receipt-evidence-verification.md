@@ -378,6 +378,85 @@ No pre-existing test was modified. Full suite 710 → 714;
 research suite unchanged (11 pass / 7 fail; repro46 still 0/3
 at the PR-14 gate, unaffected).
 
+### Degenerate revisions: the identity-existence rule (re-review)
+
+**The edge case.** `observedStateDigestOf` checked that a
+snapshot EXISTS but never validated its revision. Two
+observations of DIFFERENT post-commit states whose snapshots
+carried an empty version therefore received the SAME coherence
+identity — the digest of {subscription, ""} — and a promotion
+basis composed from them was judged coherent: the §8 false
+promotion, re-entering through degenerate revisions. The same
+held for a version missing at runtime (a deserialized record):
+the canonical form drops undefined components, so every
+version-less observation of a subscription shared the digest
+of {subscription}. Reproduced failing-first on the head
+carrying the §8 correction (test50: 32 pass / 4 fail; both
+attack constructions composed to COMMITTED_AND_VERIFIED with
+reconciliation OK, the two entries carrying byte-identical
+digests).
+
+**The rule.** An observed-state identity exists only when BOTH
+components are established: the snapshot is present AND its
+subscription id is a non-empty string AND its state-revision
+`version` is a non-empty string — non-empty judged after
+trimming, so whitespace-only components establish nothing, and
+non-string runtime values (any shape a deserialized record can
+carry) establish nothing. The check is runtime-shaped, not
+type-shaped, because these snapshots cross serialization
+boundaries. Otherwise `observedStateDigestOf` returns
+undefined and the entry is treated exactly like a snapshot-
+less observation under the §8 rule: recordable and
+displayable, unable to join a cross-entry promotion basis.
+Established components are digested verbatim — the trim
+decides existence only, never equality — so genuine same-
+revision composition (50.31) is untouched.
+
+**Why the single-entry rule is unchanged.** A single-entry
+basis composes nothing: the entry's figures and its state
+verdict were computed inside ONE observation, so there is no
+cross-observation claim for a degenerate revision to falsify.
+A lone entry minted from an empty-version observation can
+still promote on its own (its admissibility — association,
+provenance, recomputation — gates it as before); what it can
+no longer do is SHARE an identity with another entry.
+Cross-entry promotion is the only place identity is compared,
+and it is the only place the rule bites.
+
+**Restore consequence.** A persisted entry's stored
+`observedStateDigest` is a stated field: recovery cannot
+recompute it from source data (the originating snapshot is
+not persisted), and the entry/evidence-id checks bind the
+stated value only to itself. The two digest values pre-fix
+minting produced from degenerate revisions of a subscription —
+an empty version, and an absent version — ARE computable at
+recovery from the record's own subscription id, so recovery
+now refuses any entry carrying either: its coherence claim
+was never sound (every degenerate-revision observation of
+that subscription shared the value), and deriving a promotion
+from it after restart would preserve exactly the false
+promotion this rule removes. The refusal is whole-set and
+atomic, at the shared coherence check both restore paths use.
+No entry the live paths can produce carries either value, and
+a sound digest cannot collide with them short of a hash
+break. One residual, stated plainly: digests minted pre-fix
+from whitespace-only or non-string version components are not
+enumerable at recovery and remain stated fields recovery
+takes as presented — they cannot be minted anymore, and a
+pre-fix record carrying one would have had to originate from
+a runtime-corrupt snapshot; closing that at recovery would
+require persisting the originating snapshot, a format change
+this correction does not make.
+
+**Accounting.** test50 grows 31 → 36 (append-only: 50.32
+unit pins on `observedStateDigestOf`, 50.33 empty-version
+attack, 50.34 missing-version attack, 50.35 empty-vs-real
+control — incoherent before and after, 50.36 recovery
+refusal of old-rule degenerate digests, with the untampered
+set as its adopting control). No pre-existing test was
+modified. Full suite 714 → 719; research suite unchanged
+(11 pass / 7 fail).
+
 **Documentation note on this file.** As committed at `4cad3c4`
 this note ended mid-sentence in §7, at a literal truncation
 marker, and the paste-ready PR #21 amendment list was absent

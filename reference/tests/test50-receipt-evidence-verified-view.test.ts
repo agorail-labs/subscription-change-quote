@@ -1,5 +1,6 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
+import { createHash } from "node:crypto";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { rmSync } from "node:fs";
@@ -15,6 +16,7 @@ import { checkIdempotentReplay } from "../src/core/scq-engine.js";
 import {
   QuoteStore,
   establishVerification,
+  observedStateDigestOf,
   receiptIdentityDigest,
   type StoredQuote,
 } from "../src/store/quote-store.js";
@@ -941,5 +943,232 @@ test("Test 50.27: durable store — an interrupted evidence append cannot persis
     assert.equal(q.commit_receipt?.outcome, "COMMITTED_UNVERIFIED", "the disk holds exactly the pre-append state — no phantom promotion");
     assert.equal(q.commit_receipt_verifications?.length ?? 0, 0);
     reopened.close();
+  }
+});
+
+// ---------------------------------------------------------------------------
+// Degenerate-revision edge case (PR-17 re-review of the §8
+// correction): `observedStateDigestOf` checked that a snapshot
+// EXISTS but never validated its revision. Two observations of
+// DIFFERENT post-commit states whose snapshots carry an empty
+// (or runtime-missing) version therefore received the SAME
+// coherence identity — the digest of {subscription, ""} — and a
+// promotion basis composed from them was judged coherent: the
+// false-promotion class §8 closed, re-entering through
+// degenerate revisions. An observed-state identity must exist
+// only when BOTH components are established: a present snapshot
+// whose id AND version are each a non-empty string (after
+// trimming); anything else is no identity, and the entry is
+// treated exactly like a snapshot-less observation — recordable
+// and displayable, unable to join a cross-entry promotion.
+// ---------------------------------------------------------------------------
+
+test("Test 50.32 (degenerate revision, unit pins): an observed-state identity exists only when both components are established", () => {
+  // No snapshot at all: no identity (pre-existing behavior).
+  assert.equal(observedStateDigestOf(undefined), undefined);
+  // Empty version: degenerate — no identity (pre-fix this
+  // returned the digest of {id, ""}, shared by EVERY empty-
+  // version observation of the subscription).
+  assert.equal(observedStateDigestOf({ id: SUB, version: "" }), undefined);
+  // Whitespace-only version: not an established revision.
+  assert.equal(observedStateDigestOf({ id: SUB, version: "   " }), undefined);
+  // Version missing at runtime (a deserialized record's shape):
+  // no identity.
+  assert.equal(observedStateDigestOf({ id: SUB } as { id: string; version: string }), undefined);
+  // Non-string version at runtime: no identity.
+  assert.equal(observedStateDigestOf({ id: SUB, version: 3 as unknown as string }), undefined);
+  // The subscription id component is validated the same way.
+  assert.equal(observedStateDigestOf({ id: "", version: "v3" }), undefined);
+  assert.equal(observedStateDigestOf({ id: "  ", version: "v3" }), undefined);
+  // An established pair yields a defined identity, and distinct
+  // real revisions yield distinct identities (pre-existing
+  // behavior, pinned).
+  const d3 = observedStateDigestOf({ id: SUB, version: "v3" });
+  assert.equal(typeof d3, "string");
+  assert.notEqual(observedStateDigestOf({ id: SUB, version: "v2" }), d3);
+});
+
+function snapshotEmptyVersionCollectionOmitted(): SubscriptionSnapshot {
+  return {
+    id: SUB,
+    version: "",
+    status: "active",
+    billing: { currency: "USD", cadence: "MONTHLY", recurringAmount: QUOTED.recurring },
+  } as unknown as SubscriptionSnapshot;
+}
+
+function snapshotEmptyVersionExtraItem(): SubscriptionSnapshot {
+  return {
+    id: SUB,
+    version: "",
+    status: "active",
+    items: [
+      { id: "item_1", offeringRef: "plan", quantity: 2 },
+      { id: "item_2", offeringRef: "addon", quantity: 1 },
+    ],
+    billing: { currency: "USD", cadence: "MONTHLY", recurringAmount: QUOTED.recurring },
+  };
+}
+
+test("Test 50.33 (degenerate revision, attack 1): dimensions established against different states whose snapshots both carry an EMPTY version must not compose into a promoted view", () => {
+  const { store } = seededStore("q50_33", candidates({ immediate: QUOTED.immediate, recurring: QUOTED.recurring }));
+
+  // Entry A: immediate actual from an observation of one
+  // post-commit state (read omits the item collection; state
+  // UNVERIFIABLE) whose snapshot carries version "".
+  const obsA = observationFromRecord(makeProviderRecord(), { omit: ["recurring"], source: "test50.33: read of an empty-version state (immediate)" });
+  obsA.resultingSnapshot = snapshotEmptyVersionCollectionOmitted();
+  const tokenA = mint(store, "q50_33", obsA);
+  assert.equal(tokenA.stateVerification, "UNVERIFIABLE", "fixture check: the collection-omitted read does not verify");
+  store.recordReceiptEvidence("q50_33", tokenA);
+
+  // Entry B: recurring actual from an observation of a
+  // DIFFERENT state (an extra item has landed) whose snapshot
+  // ALSO carries version "" — and carries the VERIFIED verdict
+  // for its state.
+  const obsB = observationFromRecord(makeProviderRecord(), { omit: ["immediate"], source: "test50.33: read of another empty-version state (recurring)" });
+  obsB.resultingSnapshot = snapshotEmptyVersionExtraItem();
+  const tokenB = mint(store, "q50_33", obsB);
+  assert.equal(tokenB.stateVerification, "VERIFIED", "fixture check: the targeted check passes against entry B's state");
+  const view = store.recordReceiptEvidence("q50_33", tokenB);
+
+  // Both entries are recorded and their actuals displayed —
+  // but an empty revision establishes NO observed-state
+  // identity, so neither entry can join a cross-entry
+  // promotion basis: the two states were never shown to be one
+  // state. (Pre-fix, both entries carried the digest of
+  // {SUB, ""} — the basis read as coherent and this view
+  // promoted to COMMITTED_AND_VERIFIED/OK.)
+  assert.equal(view.committedEffect.immediate?.net, QUOTED.immediate, "the immediate actual is still displayed");
+  assert.equal(view.committedEffect.recurring?.resultingAmount, QUOTED.recurring, "the recurring actual is still displayed");
+  const entries = store.get("q50_33")!.commit_receipt_verifications ?? [];
+  assert.equal(entries.length, 2);
+  assert.ok(
+    entries.every((e) => e.observedStateDigest === undefined),
+    "neither entry carries an observed-state identity: an empty revision establishes none"
+  );
+  assert.equal(view.outcome, "COMMITTED_UNVERIFIED", "an empty revision must not let two different states share a coherence identity");
+  assert.equal(view.reconciliation.status, "UNVERIFIED");
+  assert.match(view.reconciliation.status === "UNVERIFIED" ? view.reconciliation.reason : "", /different observed|incoheren|coheren/i);
+});
+
+test("Test 50.34 (degenerate revision, attack 2): dimensions established against different states whose snapshots carry NO version at runtime must not compose into a promoted view", () => {
+  const { store } = seededStore("q50_34", candidates({ immediate: QUOTED.immediate, recurring: QUOTED.recurring }));
+
+  const noVersionSnapshot = (withItems: boolean): SubscriptionSnapshot =>
+    ({
+      id: SUB,
+      status: "active",
+      ...(withItems
+        ? {
+            items: [
+              { id: "item_1", offeringRef: "plan", quantity: 2 },
+              { id: "item_2", offeringRef: "addon", quantity: 1 },
+            ],
+          }
+        : {}),
+      billing: { currency: "USD", cadence: "MONTHLY", recurringAmount: QUOTED.recurring },
+    }) as unknown as SubscriptionSnapshot;
+
+  // Entry A: immediate actual, observation of one state, its
+  // snapshot deserialized WITHOUT a version field.
+  const obsA = observationFromRecord(makeProviderRecord(), { omit: ["recurring"], source: "test50.34: read of a version-less state (immediate)" });
+  obsA.resultingSnapshot = noVersionSnapshot(false);
+  const tokenA = mint(store, "q50_34", obsA);
+  assert.equal(tokenA.stateVerification, "UNVERIFIABLE");
+  store.recordReceiptEvidence("q50_34", tokenA);
+
+  // Entry B: recurring actual, observation of a DIFFERENT
+  // state, also version-less, carrying VERIFIED for its state.
+  const obsB = observationFromRecord(makeProviderRecord(), { omit: ["immediate"], source: "test50.34: read of another version-less state (recurring)" });
+  obsB.resultingSnapshot = noVersionSnapshot(true);
+  const tokenB = mint(store, "q50_34", obsB);
+  assert.equal(tokenB.stateVerification, "VERIFIED", "fixture check: the targeted check passes against entry B's state");
+  const view = store.recordReceiptEvidence("q50_34", tokenB);
+
+  assert.equal(view.committedEffect.immediate?.net, QUOTED.immediate);
+  assert.equal(view.committedEffect.recurring?.resultingAmount, QUOTED.recurring);
+  assert.equal(view.outcome, "COMMITTED_UNVERIFIED", "a missing revision must not let two different states share a coherence identity");
+  assert.equal(view.reconciliation.status, "UNVERIFIED");
+  assert.match(view.reconciliation.status === "UNVERIFIED" ? view.reconciliation.reason : "", /different observed|incoheren|coheren/i);
+});
+
+test("Test 50.35 (degenerate revision, control): an empty-version entry beside a real-revision entry is incoherent — before and after the fix", () => {
+  const { store } = seededStore("q50_35", candidates({ immediate: QUOTED.immediate, recurring: QUOTED.recurring }));
+
+  const obsA = observationFromRecord(makeProviderRecord(), { omit: ["recurring"], source: "test50.35: read of an empty-version state (immediate)" });
+  obsA.resultingSnapshot = snapshotEmptyVersionCollectionOmitted();
+  store.recordReceiptEvidence("q50_35", mint(store, "q50_35", obsA));
+
+  const obsB = observationFromRecord(makeProviderRecord(), { omit: ["immediate"], source: "test50.35: read of state v3 (recurring)" });
+  obsB.resultingSnapshot = snapshotV3ExtraItem();
+  const tokenB = mint(store, "q50_35", obsB);
+  assert.equal(tokenB.stateVerification, "VERIFIED");
+  const view = store.recordReceiptEvidence("q50_35", tokenB);
+
+  // Control: the digests already differed pre-fix ({SUB, ""}
+  // vs {SUB, "v3"}), and post-fix the empty-version entry
+  // carries no identity at all — either way the basis is
+  // incoherent and the view must not promote.
+  assert.equal(view.outcome, "COMMITTED_UNVERIFIED");
+  assert.equal(view.reconciliation.status, "UNVERIFIED");
+});
+
+test("Test 50.36 (degenerate revision at recovery): a persisted trail whose entries carry an old-rule degenerate observed-state digest refuses the whole restore set", () => {
+  // Build a sound, promoting trail (the 50.31 same-revision
+  // form) and persist it.
+  const { store } = seededStore("q50_36", candidates({ immediate: QUOTED.immediate, recurring: QUOTED.recurring }));
+  const v3NoItems = (): SubscriptionSnapshot =>
+    ({
+      id: SUB,
+      version: "v3",
+      status: "active",
+      billing: { currency: "USD", cadence: "MONTHLY", recurringAmount: QUOTED.recurring },
+    }) as unknown as SubscriptionSnapshot;
+  const obsA = observationFromRecord(makeProviderRecord(), { omit: ["recurring"] });
+  obsA.resultingSnapshot = v3NoItems();
+  store.recordReceiptEvidence("q50_36", mint(store, "q50_36", obsA));
+  const obsB = observationFromRecord(makeProviderRecord(), { omit: ["immediate"] });
+  obsB.resultingSnapshot = v3NoItems();
+  store.recordReceiptEvidence("q50_36", mint(store, "q50_36", obsB));
+  const obsC = observationFromRecord(makeProviderRecord(), { omit: ["immediate", "recurring"] });
+  obsC.resultingSnapshot = snapshotV3ExtraItem();
+  const liveView = store.recordReceiptEvidence("q50_36", mint(store, "q50_36", obsC));
+  assert.equal(liveView.outcome, "COMMITTED_AND_VERIFIED", "fixture check: the sound trail promotes");
+  const persisted = store.serializeReceiptRecords();
+
+  // Control: the untampered set restores and adopts the
+  // promoted view — the refusal below is caused by the
+  // degenerate digests, not by incidental corruption.
+  const control = new QuoteStore();
+  control.put(makeQuote50("q50_36"));
+  control.restoreReceiptRecords(persisted);
+  assert.equal(control.get("q50_36")!.commit_receipt?.outcome, "COMMITTED_AND_VERIFIED");
+
+  // The two digest values the PRE-FIX rule minted from
+  // degenerate revisions of this subscription: an empty
+  // version, and an absent version (the canonical form drops
+  // undefined components). Rewrite every entry's stored
+  // observed-state identity to each in turn (the stated
+  // evidenceId is removed, so the set is judged on its stored
+  // contents and derivation, exactly as a pre-fix persisted
+  // record would be). Under the stored degenerate digests the
+  // derivation reproduces the promoted view — the entries all
+  // "share" one identity — so only the coherence soundness of
+  // the identity itself can refuse this set.
+  const degenerateDigests = [
+    createHash("sha256").update(`{"subscriptionId":${JSON.stringify(SUB)},"version":""}`, "utf8").digest("hex"),
+    createHash("sha256").update(`{"subscriptionId":${JSON.stringify(SUB)}}`, "utf8").digest("hex"),
+  ];
+  for (const degenerate of degenerateDigests) {
+    const forged = JSON.parse(persisted);
+    for (const entry of forged.records[0].verifications) {
+      entry.observedStateDigest = degenerate;
+      delete entry.evidenceId;
+    }
+    const r = new QuoteStore();
+    r.put(makeQuote50("q50_36"));
+    assert.throws(() => r.restoreReceiptRecords(JSON.stringify(forged)), /degenerate/i);
+    assert.equal(r.get("q50_36")!.commit_receipt, undefined, "no partial adoption");
   }
 });

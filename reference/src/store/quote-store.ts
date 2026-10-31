@@ -186,7 +186,10 @@ export type ReceiptEvidenceEntry = {
    * protocol's own staleness semantics already use). Stamped at
    * minting from the observation itself and bound into the
    * entry's `evidenceId`; absent when the observation carried
-   * no resulting snapshot (and on legacy entries). It is a
+   * no resulting snapshot — or one whose subscription id or
+   * state revision was degenerate (empty / missing / non-string:
+   * no identity is established, see `observedStateDigestOf`) —
+   * and on legacy entries. It is a
    * COHERENCE KEY for composition, not an authenticity proof:
    * it lets the promotion rule require that the entries a
    * promoted view rests on were established against ONE observed
@@ -226,6 +229,21 @@ export function evidenceEntryId(
 }
 
 /**
+ * PR-17 re-review (degenerate-revision edge case): one component
+ * of an observed-state identity is ESTABLISHED only when it is a
+ * non-empty string (after trimming). Anything else — absent,
+ * undefined, a non-string runtime value (a deserialized record
+ * can carry any shape), an empty string, a whitespace-only
+ * string — establishes nothing. The check is deliberately
+ * runtime-shaped, not type-shaped: the snapshots this runs over
+ * cross serialization boundaries where the declared types are
+ * not enforced.
+ */
+function isEstablishedIdentityComponent(value: unknown): boolean {
+  return typeof value === "string" && value.trim().length > 0;
+}
+
+/**
  * PR-17 review correction: the observed-state identity of one
  * provider observation — the (subscription, state-revision)
  * pair of its resulting snapshot, digested. Two observations of
@@ -237,9 +255,27 @@ export function evidenceEntryId(
  * state identity (undefined): its figures may be recorded, but
  * they cannot take part in a cross-entry promotion (see the
  * coherence rule in `analyzeEvidenceTrail`).
+ *
+ * PR-17 re-review (degenerate-revision edge case): the identity
+ * exists only when BOTH components are established (see
+ * `isEstablishedIdentityComponent`). The original form checked
+ * only that a snapshot EXISTS, so every observation of a
+ * subscription whose snapshot carried an empty (or runtime-
+ * missing) version received the SAME identity — the digest of
+ * {subscription, ""} — and two observations of DIFFERENT states
+ * composed as though they were one state: the §8 false
+ * promotion, re-entering through degenerate revisions. A
+ * degenerate component now yields no identity at all, and the
+ * observation is treated exactly like a snapshot-less one.
+ * Components that ARE established are digested verbatim (exact-
+ * string identity, as before): the trim decides existence only,
+ * never equality.
  */
 export function observedStateDigestOf(snapshot: { id: string; version: string } | undefined): string | undefined {
   if (!snapshot) return undefined;
+  if (!isEstablishedIdentityComponent(snapshot.id) || !isEstablishedIdentityComponent(snapshot.version)) {
+    return undefined;
+  }
   return createHash("sha256")
     .update(canonical({ subscriptionId: snapshot.id, version: snapshot.version }), "utf8")
     .digest("hex");
@@ -1396,8 +1432,43 @@ export class QuoteStore {
     if (recordedOutcome !== "COMMITTED_UNVERIFIED") {
       throw incoherent(`a verification trail exists on a record that was never COMMITTED_UNVERIFIED`);
     }
+    // PR-17 re-review (degenerate-revision edge case): the two
+    // observed-state digests the PRE-FIX minting rule produced
+    // from a degenerate state revision of THIS subscription —
+    // an empty version, and an absent version (the canonical
+    // form drops undefined components). A stored entry carrying
+    // either was minted from a revision that established no
+    // state identity (or forged to look like one): its
+    // coherence claim was never sound — EVERY degenerate-
+    // revision observation of the subscription shared the value
+    // — so the set is refused rather than deriving a promotion
+    // from it. The current minting rule stamps no identity for
+    // such observations at all, so no entry the live paths can
+    // produce carries either value; a sound digest (a real
+    // revision's) cannot collide with them short of a hash
+    // break. (Digests minted pre-fix from whitespace-only or
+    // non-string version components are not enumerable this
+    // way; they remain stated fields, as all entry content is —
+    // recovery's posture toward them is unchanged and they
+    // cannot be minted anymore.)
+    const degenerateStateDigests = new Set([
+      createHash("sha256")
+        .update(canonical({ subscriptionId: destination.subscription_id, version: "" }), "utf8")
+        .digest("hex"),
+      createHash("sha256")
+        .update(canonical({ subscriptionId: destination.subscription_id }), "utf8")
+        .digest("hex"),
+    ]);
     const seenIds = new Set<string>();
     for (const entry of trail) {
+      if (entry.observedStateDigest !== undefined && degenerateStateDigests.has(entry.observedStateDigest)) {
+        throw incoherent(
+          `the trail entry's observed-state identity is the digest of a degenerate state revision ` +
+            `(an empty or absent version) for subscription ${destination.subscription_id} — an identity ` +
+            `no established revision produces, shared by every degenerate-revision observation of the ` +
+            `subscription; a promotion derived from it would rest on a coherence claim that was never sound`
+        );
+      }
       if (entry.identityDigest !== raw.identity_digest) {
         throw new SCQError(
           "CONFLICTING_RECEIPT_IDENTITY",
@@ -1752,6 +1823,7 @@ export function establishVerification(quote: StoredQuote, observation: ProviderO
     ...(observation.observedAt ? { at: observation.observedAt } : {}),
   };
   establishedEvidenceTokens.add(token);
+  const observedStateDigest = observedStateDigestOf(observation.resultingSnapshot);
   establishedTokenBindings.set(token, {
     quoteId: quote.quote_id,
     subscriptionId: quote.subscription_id,
@@ -1761,11 +1833,10 @@ export function establishVerification(quote: StoredQuote, observation: ProviderO
     // evidence entry built from this token can carry it into
     // the trail, where the promotion rule's cross-observation
     // coherence check compares it across entries. (An
-    // observation with no resulting snapshot stamps nothing:
+    // observation with no resulting snapshot — or a degenerate
+    // subscription id / state revision on it — stamps nothing:
     // no observed-state identity was established.)
-    ...(observation.resultingSnapshot
-      ? { observedStateDigest: observedStateDigestOf(observation.resultingSnapshot) }
-      : {}),
+    ...(observedStateDigest !== undefined ? { observedStateDigest } : {}),
   });
   return token;
 }
