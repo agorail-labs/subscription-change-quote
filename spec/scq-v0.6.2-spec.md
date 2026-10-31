@@ -1355,10 +1355,15 @@ fingerprint handling and before any re-preview, durable attempt, or dispatch:
   tolerance; engine-constructed envelopes are built so a polluted prototype cannot
   smuggle a bound); any own enumerable key outside the three names refuses the
   envelope as malformed. The envelope's prototype is NOT inspected: this rule
-  specifies the implemented acceptance shape, not plain-objectness — a class instance
-  or built-in object (for example a `Date` or a `Map`) carrying no own fields is
-  therefore accepted as a bound-less envelope, with the missing-bounds default of
-  §6.13 applying. Requiring a true plain object (a prototype check) would refuse
+  specifies the implemented acceptance shape, not plain-objectness. The consequence
+  is three-way: supported bounds the object carries as OWN properties are honored (a
+  class instance with its own valid `maxRecurringIncrease` has that bound applied);
+  inherited bounds are ignored (never read, never copied); and a non-plain object
+  with no supported own bounds — for example a `Date` or a `Map` carrying no own
+  fields — is accepted and receives zero tolerance, with the missing-bounds default
+  of §6.13 applying. In short: a non-plain object with no supported own bounds
+  receives zero tolerance; supported own bounds are honored, and inherited bounds are
+  ignored. Requiring a true plain object (a prototype check) would refuse
   envelopes the implementation currently accepts and is tracked as an OPEN DECISION
   (gap register G-22), not imposed here. Only `undefined` is omission: falsy
   supplied envelopes (`null`, `false`, `0`, `""`) are malformed, not omitted. Whether
@@ -1661,8 +1666,10 @@ creation (first statement) and over the stored record at commit (after §6.10 re
 before re-preview/attempts/dispatch) · **V62-RTV-02** guaranteeMode: omitted ⇒
 REVALIDATE; only EXACT/REVALIDATE valid; explicit null invalid · **V62-RTV-03**
 envelope shape: non-null, non-array object (prototype NOT inspected — the stricter
-plain-object rule is OPEN, G-22), only the three named bounds as own properties, finite
-non-negative numbers; only undefined is omission · **V62-RTV-04**
+plain-object rule is OPEN, G-22); only the three named bounds are read, as own
+properties, finite non-negative numbers; supported own bounds are honored, inherited
+bounds are ignored, and a non-plain object with no supported own bounds receives zero
+tolerance; only undefined is omission · **V62-RTV-04**
 reconcileCommittedEffect never throws: malformed envelope post-commit classifies
 VIOLATED through interpretable bounds, else UNVERIFIED, never OK · **V62-RTV-05**
 envelope-presence enforcement at creation after effectiveIntent support checks
