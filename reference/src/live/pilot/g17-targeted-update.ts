@@ -100,10 +100,35 @@
 //       interleavingExcluded: false. No verdict here is, or may be
 //       translated into, a general SCQ verified-receipt claim.
 //
+// SAFETY CORRECTIONS (G17-R5/R6, independent re-review of PR #38):
+//   R5. MOCK-ONLY BY CONSTRUCTION. The first version accepted any
+//       ChargebeeClient — including one backed by the default fetch
+//       transport and real credentials — which would have made this
+//       research module a live-mutation path bypassing the live
+//       adapter's guard. The constructor now accepts ONLY a
+//       G17MockChargebee instance (checked at runtime, so casts and
+//       plain-JS consumers are also refused) and builds its own
+//       client over the mock's transport. There is no environment
+//       flag or configuration that makes a real client eligible.
+//   R6. FAIL-CLOSED ON MISSING PROVIDER EVIDENCE. Snapshot parsing
+//       used to manufacture reassuring defaults (expected id when
+//       the provider id was absent, `false` for a missing
+//       scheduling flag, 0/1 for missing item fields). Absent or
+//       invalid REQUIRED evidence — subscription identity, status,
+//       currency, resource_version, has_scheduled_changes,
+//       has_scheduled_advance_invoices, and per-item identity /
+//       quantity / unit price / amount — is now a pre-dispatch
+//       refusal (REFUSED_MISSING_PROVIDER_EVIDENCE), the expected
+//       subscription identity is checked on every read, and
+//       scheduled advance invoices must be present AND false
+//       (mirroring the pilot preflight's requirement) or the
+//       dispatch refuses as a scheduled-effect risk.
+//
 // Every verdict produced against the G-17 mock is SIMULATED
 // evidence. No verdict in this module is a live-provider claim.
 
 import { ChargebeeClient, ChargebeeHttpError } from "../chargebee-http.js";
+import { G17MockChargebee } from "./g17-mock-transport.js";
 
 export type G17Operation =
   | { kind: "ADD_ADDON"; itemPriceId: string; quantity: number }
@@ -127,11 +152,13 @@ export type G17Snapshot = {
   currencyCode: string;
   resourceVersion: number;
   hasScheduledChanges: boolean;
+  hasScheduledAdvanceInvoices: boolean;
   items: G17ItemState[];
 };
 
 export type G17Classification =
   | "REFUSED_UNSUPPORTED_OPERATION"
+  | "REFUSED_MISSING_PROVIDER_EVIDENCE"
   | "REFUSED_PRE_DISPATCH_DRIFT"
   | "REFUSED_SCHEDULED_CHANGE_AT_RISK"
   | "DISPATCH_REJECTED"
@@ -144,7 +171,7 @@ export type G17Classification =
 
 /**
  * The SCQ action schema, mirrored from core/types.ts `ChangeAction`
- * (pinned against the source by test 53.31). ADD_ADDON and
+ * (pinned against the source by test 57.31). ADD_ADDON and
  * REMOVE_ADDON are provider operation classes with NO counterpart
  * here (G17-R1).
  */
@@ -210,21 +237,52 @@ export type G17Prepared = {
   t2: G17Snapshot;
 };
 
-export function snapshotFromSubscriptionJson(json: any, subscriptionId: string): G17Snapshot {
+/** Thrown when a provider read lacks REQUIRED evidence (G17-R6). */
+export class G17MissingEvidenceError extends Error {
+  constructor(message: string) { super(message); this.name = "G17MissingEvidenceError"; }
+}
+
+function reqString(v: unknown, field: string): string {
+  if (typeof v !== "string" || v.trim() === "") throw new G17MissingEvidenceError(`required provider evidence missing or invalid: ${field}`);
+  return v;
+}
+function reqBool(v: unknown, field: string): boolean {
+  if (typeof v !== "boolean") throw new G17MissingEvidenceError(`required provider evidence missing or invalid: ${field} (a missing/unknown scheduling flag is NOT read as false)`);
+  return v;
+}
+function reqNumber(v: unknown, field: string, opts: { min?: number; exclusiveMin?: boolean } = {}): number {
+  if (typeof v !== "number" || !Number.isFinite(v)) throw new G17MissingEvidenceError(`required provider evidence missing or invalid: ${field} (no value is fabricated)`);
+  if (opts.min !== undefined && (opts.exclusiveMin ? v <= opts.min : v < opts.min)) throw new G17MissingEvidenceError(`required provider evidence out of range: ${field}=${v}`);
+  return v;
+}
+
+/**
+ * Strict snapshot parser (G17-R6). NOTHING is defaulted: the
+ * provider's own subscription id is required (never replaced by the
+ * expected id), both scheduling flags are required booleans, and
+ * every item must carry identity, type, quantity, unit price and
+ * amount. Any gap throws G17MissingEvidenceError, which the
+ * prototype converts into a pre-dispatch refusal.
+ */
+export function snapshotFromSubscriptionJson(json: any): G17Snapshot {
   const sub = json?.subscription;
-  if (!sub || typeof sub !== "object") throw new Error("G-17 prototype: subscription response missing `subscription` object");
+  if (!sub || typeof sub !== "object") throw new G17MissingEvidenceError("provider response missing the `subscription` object entirely");
+  if (!Array.isArray(sub.subscription_items) || sub.subscription_items.length === 0) {
+    throw new G17MissingEvidenceError("required provider evidence missing or invalid: subscription.subscription_items (absent or empty item evidence cannot ground a preservation claim)");
+  }
   return {
-    subscriptionId: sub.id ?? subscriptionId,
-    status: String(sub.status ?? ""),
-    currencyCode: String(sub.currency_code ?? ""),
-    resourceVersion: Number(sub.resource_version ?? 0),
-    hasScheduledChanges: sub.has_scheduled_changes === true,
-    items: (Array.isArray(sub.subscription_items) ? sub.subscription_items : []).map((i: any) => ({
-      itemPriceId: String(i.item_price_id),
-      itemType: String(i.item_type ?? ""),
-      quantity: Number(i.quantity ?? 1),
-      unitPrice: Number(i.unit_price ?? 0),
-      amount: Number(i.amount ?? 0),
+    subscriptionId: reqString(sub.id, "subscription.id"),
+    status: reqString(sub.status, "subscription.status"),
+    currencyCode: reqString(sub.currency_code, "subscription.currency_code"),
+    resourceVersion: reqNumber(sub.resource_version, "subscription.resource_version"),
+    hasScheduledChanges: reqBool(sub.has_scheduled_changes, "subscription.has_scheduled_changes"),
+    hasScheduledAdvanceInvoices: reqBool(sub.has_scheduled_advance_invoices, "subscription.has_scheduled_advance_invoices"),
+    items: sub.subscription_items.map((i: any, idx: number) => ({
+      itemPriceId: reqString(i?.item_price_id, `subscription_items[${idx}].item_price_id`),
+      itemType: reqString(i?.item_type, `subscription_items[${idx}].item_type`),
+      quantity: reqNumber(i?.quantity, `subscription_items[${idx}].quantity`, { min: 0, exclusiveMin: true }),
+      unitPrice: reqNumber(i?.unit_price, `subscription_items[${idx}].unit_price`, { min: 0 }),
+      amount: reqNumber(i?.amount, `subscription_items[${idx}].amount`, { min: 0 }),
     })),
   };
 }
@@ -291,11 +349,37 @@ function diffSnapshots(base: G17Snapshot, other: G17Snapshot): string[] {
 }
 
 export class G17TargetedUpdatePrototype {
-  constructor(private client: ChargebeeClient, private subscriptionId: string) {}
+  private client: ChargebeeClient;
+
+  /**
+   * G17-R5: mock-only BY CONSTRUCTION. The only accepted first
+   * argument is a G17MockChargebee instance; the prototype builds
+   * its own ChargebeeClient over the mock's transport and never
+   * sees caller-supplied credentials, sites, or transports. A
+   * ChargebeeClient — default (real fetch) or otherwise — is
+   * ineligible, and the runtime instanceof check refuses casts and
+   * plain-JS consumers as well. No flag re-enables a real client.
+   */
+  constructor(mock: G17MockChargebee, private subscriptionId: string) {
+    if (!(mock instanceof G17MockChargebee)) {
+      throw new Error("G17TargetedUpdatePrototype is mock-only by construction (G17-R5): its first argument must be a G17MockChargebee instance. A ChargebeeClient (default real-HTTP or otherwise), a raw transport, or any live-capable object is ineligible, and no configuration makes it eligible.");
+    }
+    this.client = new ChargebeeClient({ site: "g17-mock", apiKey: "g17-mock-key" }, mock.transport);
+  }
 
   async readSnapshot(): Promise<G17Snapshot> {
     const { json } = await this.client.getSubscription(this.subscriptionId);
-    return snapshotFromSubscriptionJson(json, this.subscriptionId);
+    let snap: G17Snapshot;
+    try {
+      snap = snapshotFromSubscriptionJson(json);
+    } catch (e) {
+      if (e instanceof G17MissingEvidenceError) throw new G17Refusal("REFUSED_MISSING_PROVIDER_EVIDENCE", `${e.message}. Missing provider evidence is unknown, not a reassuring default; the prototype refuses before any dispatch.`);
+      throw e;
+    }
+    if (snap.subscriptionId !== this.subscriptionId) {
+      throw new G17Refusal("REFUSED_MISSING_PROVIDER_EVIDENCE", `provider read identified subscription "${snap.subscriptionId}", not the expected "${this.subscriptionId}". Identity is established from the provider response, never manufactured from the request.`);
+    }
+    return snap;
   }
 
   /**
@@ -310,7 +394,13 @@ export class G17TargetedUpdatePrototype {
     if (operation.kind === "CHANGE_QUANTITY" && !t0.items.some((i) => i.itemPriceId === operation.itemPriceId)) {
       throw new G17Refusal("REFUSED_UNSUPPORTED_OPERATION", `CHANGE_QUANTITY target ${operation.itemPriceId} is absent from the T0 snapshot; a quantity change for a non-existent item is the ADD_ADDON class.`);
     }
+    if (t0.subscriptionId !== this.subscriptionId) {
+      throw new G17Refusal("REFUSED_MISSING_PROVIDER_EVIDENCE", `the T0 snapshot identifies subscription "${t0.subscriptionId}", not the expected "${this.subscriptionId}". Two matching foreign or identity-less reads do not establish identity (G17-R6).`);
+    }
     const t2 = await this.readSnapshot();
+    if (t0.hasScheduledAdvanceInvoices || t2.hasScheduledAdvanceInvoices) {
+      throw new G17Refusal("REFUSED_SCHEDULED_CHANGE_AT_RISK", "scheduled advance invoices are present (has_scheduled_advance_invoices=true). The pilot preflight requires this flag present AND false for the same reason as scheduled changes: an update interacts with scheduled financial effects outside the authorized operation.");
+    }
     if (t2.hasScheduledChanges) {
       throw new G17Refusal("REFUSED_SCHEDULED_CHANGE_AT_RISK", "T2 re-read shows has_scheduled_changes=true. Chargebee documents that an update deletes an existing scheduled change (Ramps disabled) or deletes/drafts ramps (compatibility mode); dispatching would change state outside the authorized operation even if every item survived.");
     }

@@ -90,6 +90,20 @@ export type G17MockOptions = {
   ignoreTarget?: boolean;
   /** Apply the update, record idempotency, then throw (lost response). */
   loseUpdateResponse?: boolean;
+  // G17-R6 evidence faults: malformed reads the prototype must
+  // refuse on, never default around.
+  /** Omit `subscription.id` from every response. */
+  omitSubscriptionId?: boolean;
+  /** Return this (foreign) subscription id instead of the real one. */
+  subscriptionIdOverride?: string;
+  /** Omit `has_scheduled_changes` from every response. */
+  omitHasScheduledChanges?: boolean;
+  /** Omit `has_scheduled_advance_invoices` from every response. */
+  omitHasScheduledAdvanceInvoices?: boolean;
+  /** Report `has_scheduled_advance_invoices: true`. */
+  hasScheduledAdvanceInvoices?: boolean;
+  /** Omit this field from every subscription item in responses. */
+  omitItemField?: "item_price_id" | "quantity" | "unit_price" | "amount";
 };
 
 export type G17Call = {
@@ -222,21 +236,28 @@ export class G17MockChargebee {
   peekCoupons(): string[] { return [...this.coupons]; }
 
   private subscriptionJson(): any {
-    return {
-      subscription: {
-        id: G17_SUBSCRIPTION_ID,
-        status: this.status,
-        currency_code: this.currencyCode,
-        resource_version: this.resourceVersion,
-        current_term_start: 1700000000,
-        current_term_end: 1702592000,
-        next_billing_at: 1702592000,
-        has_scheduled_changes: this.hasScheduledChanges,
-        coupon_ids: [...this.coupons],
-        has_scheduled_advance_invoices: false,
-        subscription_items: this.items.map((i) => ({ ...i })),
-      },
+    const sub: any = {
+      id: G17_SUBSCRIPTION_ID,
+      status: this.status,
+      currency_code: this.currencyCode,
+      resource_version: this.resourceVersion,
+      current_term_start: 1700000000,
+      current_term_end: 1702592000,
+      next_billing_at: 1702592000,
+      has_scheduled_changes: this.hasScheduledChanges,
+      coupon_ids: [...this.coupons],
+      has_scheduled_advance_invoices: this.options.hasScheduledAdvanceInvoices === true,
+      subscription_items: this.items.map((i) => ({ ...i })),
     };
+    // G17-R6 evidence faults (opt-in per test).
+    if (this.options.omitSubscriptionId) delete sub.id;
+    if (this.options.subscriptionIdOverride) sub.id = this.options.subscriptionIdOverride;
+    if (this.options.omitHasScheduledChanges) delete sub.has_scheduled_changes;
+    if (this.options.omitHasScheduledAdvanceInvoices) delete sub.has_scheduled_advance_invoices;
+    if (this.options.omitItemField) {
+      for (const item of sub.subscription_items) delete item[this.options.omitItemField];
+    }
+    return { subscription: sub };
   }
 
   private parseUpdateBody(body: string): { replaceItemsList: boolean; items: Array<{ item_price_id: string; quantity?: number; unit_price?: number }>; mandatoryItemsToRemove: string[] } {
