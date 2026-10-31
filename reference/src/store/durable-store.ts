@@ -45,7 +45,7 @@ import {
   type StoredQuote,
 } from "./quote-store.js";
 
-export const DURABLE_SCHEMA_VERSION = 3;
+export const DURABLE_SCHEMA_VERSION = 4;
 
 /**
  * Maximum age, at resolution time, of the provider observation a
@@ -247,18 +247,20 @@ export type ResolutionClassification = "CONFIRMED_NON_EXECUTION" | "CONFIRMED_LA
 export type ResolutionEvidenceSource = "PROVIDER_OPERATION_LOG" | "PROVIDER_IDEMPOTENCY_REGISTRY" | "PROVIDER_AUDIT_EXPORT";
 
 /**
- * An actual provider-record object, as obtained by whatever
- * deployment-side lookup read the provider's operation log /
- * idempotency registry / audit export for THIS attempt. This is the
- * input to the establishment procedure — it is validated field by
- * field against the attempt and, for absence claims, against
- * provider finality (R3). It is never itself accepted by
- * `resolveAttempt`: only the branded token the establishment
- * procedure mints from it is (R2).
+ * An actual provider-record object, as returned by a
+ * `ProviderRecordSource` that read the provider's operation log /
+ * idempotency registry / audit export for THIS attempt. It is
+ * validated field by field against the attempt and, for absence
+ * claims, against provider finality (R3) by the verifier's private
+ * establishment core. It is never itself accepted by
+ * `resolveAttempt`, and — since PR #50 correction round 3 (R2') —
+ * it is never SUPPLIED by the caller in the lifting path either:
+ * the verifier fetches it from its configured source. A record a
+ * caller constructs by hand has no path to a token.
  */
 export type ResolutionProviderRecord = {
   source: ResolutionEvidenceSource;
-  /** Operation-bound kind, per classification (see the allowlists beside `establishResolutionEvidence`). */
+  /** Operation-bound kind, per classification (see the allowlists beside the establishment core). */
   kind: string;
   /** The provider record's own reference (log entry / lookup id). One reference establishes one attempt. */
   reference: string;
@@ -291,25 +293,32 @@ export type ResolutionProviderRecord = {
 };
 
 /**
- * A resolution-evidence token minted ONLY by
- * `establishResolutionEvidence` — the durable-store analogue of
- * quote-store's `establishVerification` brand (PR #50 review R2).
- * The object carries the validated fields; its authority is the
- * module-private brand + binding registered at minting, not its
- * shape: a caller-constructed object with identical fields is
- * self-asserted and refused by `resolveAttempt`, and a token whose
- * contents were altered after minting is detected against the
- * minting-time content digest and refused.
+ * A resolution-evidence token minted ONLY by a provider-evidence
+ * verifier (`createProviderEvidenceVerifier`) from a record the
+ * verifier FETCHED from its configured `ProviderRecordSource` —
+ * the durable-store analogue of quote-store's
+ * `establishVerification` brand (PR #50 review R2), hardened in
+ * correction round 3 (R2'). The object carries the validated
+ * fields; its authority is the module-private brand + binding
+ * registered at minting, not its shape: a caller-constructed object
+ * with identical fields is self-asserted and refused by
+ * `resolveAttempt`, a token whose contents were altered after
+ * minting is detected against the minting-time content digest and
+ * refused, and a token minted by any verifier OTHER than the
+ * store's own configured verifier instance is refused (the binding
+ * records the minting verifier's identity).
  *
- * STATED LIMIT (mirroring PR #8 review correction R3 on the receipt
- * path): the brand proves the record passed through the
- * establishment computation WITH ITS CHECKS — binding to the
- * attempt, operation-bound kind, provider finality — at minting
- * time. It does NOT prove the record truly came from a provider:
- * binding records to real provider reads is the adapters' duty, and
- * NO live adapter produces these records in this PR, so no
- * production unblock path is claimed. Until evidence is established
- * at this boundary, recovery fails closed.
+ * TRUST MODEL (round 3): the brand no longer stands alone. In
+ * round 2 the establishment procedure was a public export and
+ * branded caller-supplied objects — the brand proved processing,
+ * not provider origin, and a fabricated record could lift a block.
+ * That path is removed: there is no public function that mints a
+ * token from a caller-supplied record. The remaining trust
+ * decision is explicit and deployment-side: WHOEVER CONFIGURES the
+ * record source behind a store's verifier decides what counts as a
+ * provider read. The library ships NO `ProviderRecordSource`
+ * implementation, and a store configured with no verifier accepts
+ * no terminal evidence at all — out of the box, nothing lifts.
  */
 export type EstablishedResolutionEvidence = {
   attemptId: string;
@@ -371,19 +380,39 @@ export type StoredResolution = {
   completeThrough: string;
   registryCoverage: string | null;
   landedStateVersion: string | null;
-  /** The procedure that minted the evidence ("establishResolutionEvidence"); "" for UNRESOLVED audit records and v2-era rows. */
+  /** The path that minted the evidence ("createProviderEvidenceVerifier" for v4 VERIFIED records); "" for UNRESOLVED and asserted records and pre-v4 rows. */
   establishmentProcedure: string;
+  /**
+   * Trust tier (schema v4, PR #50 correction round 3): "VERIFIED"
+   * for records established through a store-configured
+   * provider-evidence verifier — the only tier that can lift a
+   * dispatch block; "ASSERTED" for operator claims recorded without
+   * verified evidence (`recordAssertedResolution`, UNRESOLVED audit
+   * records) and for EVERY pre-v4 row, which migration backfills to
+   * ASSERTED because pre-v4 evidence was minted through the removed
+   * public establishment function or caller digests.
+   */
+  trustTier: ResolutionTrustTier;
 };
 
+/** The trust tier of a persisted evidence record (schema v4). Only VERIFIED records can lift a dispatch block. */
+export type ResolutionTrustTier = "VERIFIED" | "ASSERTED";
+
 /**
- * A persisted landing reconciliation (R4): the separate, recorded
- * barrier between a CONFIRMED_LANDING resolution and any
- * subscription-wide unblock. `landedStateDigest` must equal the
- * resolution's established observed-state digest (the barrier is
- * bound to the SAME landed state the evidence established);
- * `financialOutcomeDigest` is the sha256 of the deployment's own
- * financial reconciliation record — recorded here, not recomputed
- * (the store cannot recompute a deployment's books; stated limit).
+ * A persisted landing reconciliation (R4, hardened in correction
+ * round 3 — R4'): the separate, recorded barrier between a
+ * CONFIRMED_LANDING resolution and any subscription-wide unblock.
+ * Since round 3 the barrier can only be recorded from a financial
+ * reconciliation record FETCHED through the store's configured
+ * verifier: `landedStateDigest` and `financialOutcomeDigest` are
+ * computed by the verifier from that record (the landed-state
+ * digest must equal the resolution's established observed-state
+ * digest — the barrier is bound to the SAME landed state), and
+ * `evidenceReference` names the fetched reconciliation record.
+ * No caller-supplied digest or record input exists in the path.
+ * Pre-v4 rows carry trustTier "ASSERTED" and a null
+ * evidenceReference (migration backfill) and never satisfy the
+ * barrier.
  */
 export type StoredLandingReconciliation = {
   reconciliationId: string;
@@ -397,6 +426,10 @@ export type StoredLandingReconciliation = {
   reconciledAt: string;
   justification: string;
   recordHash: string;
+  /** Trust tier (schema v4): only "VERIFIED" rows satisfy the barrier; pre-v4 rows are backfilled "ASSERTED". */
+  trustTier: ResolutionTrustTier;
+  /** The fetched financial reconciliation record's own reference; null for pre-v4 rows. */
+  evidenceReference: string | null;
 };
 
 const RESOLUTION_EVIDENCE_SOURCES = new Set<string>([
@@ -414,25 +447,34 @@ const LANDING_EVIDENCE_KINDS = new Set([
 ]);
 
 /**
- * The establishment brand (PR #50 review R2), exactly the
- * quote-store pattern for receipt evidence (PR #8 R3 / PR-17): a
- * module-private WeakSet brands every token
- * `establishResolutionEvidence` mints, and a WeakMap beside it
- * stamps the token's attempt binding and a digest of its contents
- * as minted. Neither is forgeable or serializable: a
- * caller-constructed object is unbranded however faithful its
- * fields, a token minted for one attempt cannot resolve another,
- * and a token altered after minting no longer matches its stamped
- * content digest.
+ * The establishment brands (PR #50 review R2; verifier binding
+ * added in correction round 3, R2'), exactly the quote-store
+ * pattern for receipt evidence (PR #8 R3 / PR-17): module-private
+ * WeakSets brand every token a provider-evidence verifier mints,
+ * and WeakMaps beside them stamp the token's attempt binding, a
+ * digest of its contents as minted, and THE IDENTITY OF THE
+ * MINTING VERIFIER INSTANCE. None of it is forgeable or
+ * serializable: a caller-constructed object is unbranded however
+ * faithful its fields, a token minted for one attempt cannot
+ * resolve another, a token altered after minting no longer matches
+ * its stamped content digest, and a token minted by a verifier the
+ * store does not hold is not the store's capability.
  */
 const establishedResolutionTokens = new WeakSet<object>();
-const establishedResolutionBindings = new WeakMap<object, { attemptId: string; contentDigest: string }>();
+const establishedResolutionBindings = new WeakMap<object, { attemptId: string; verifier: object; contentDigest: string }>();
+const establishedReconciliationTokens = new WeakSet<object>();
+const establishedReconciliationBindings = new WeakMap<object, { attemptId: string; verifier: object; contentDigest: string }>();
 
 /**
- * THE trusted resolution-evidence path (PR #50 review R2/R3) — the
- * only way an `EstablishedResolutionEvidence` token comes into
- * existence. It takes the attempt and an actual provider-record
- * object, and VALIDATES:
+ * The PRIVATE establishment core (PR #50 review R2/R3; made
+ * private in correction round 3, R2') — the validation half of the
+ * verifier, and the only code that mints an
+ * `EstablishedResolutionEvidence` token. It is NOT exported: in
+ * round 2 this computation was the public `establishResolutionEvidence`
+ * and branded caller-supplied records, which is exactly the defect
+ * R2' names. It now runs only inside a verifier, over a record the
+ * verifier FETCHED from its configured source, and stamps the
+ * minting verifier's identity into the token binding. It VALIDATES:
  *
  *  - binding: every identity field of the record (provider, site,
  *    subscription, quote, idempotency key, request hash) equals the
@@ -458,18 +500,13 @@ const establishedResolutionBindings = new WeakMap<object, { attemptId: string; c
  *    (PARTIAL/UNKNOWN refuse — if finality is unavailable, the
  *    attempt stays UNRESOLVED);
  *  - the observation is not future-dated against `now`.
- *
- * STATED LIMIT (see `EstablishedResolutionEvidence`): this
- * computation validates a record's binding, coherence, and
- * finality claims; it cannot prove the record truly came from a
- * provider. That binding is the adapters' duty, and no live
- * adapter produces these records in this PR.
  */
-export function establishResolutionEvidence(
+function establishResolutionEvidenceCore(
   attempt: StoredAttempt,
   record: ResolutionProviderRecord,
   classification: "CONFIRMED_NON_EXECUTION" | "CONFIRMED_LANDING",
   now: Date,
+  verifier: object,
 ): EstablishedResolutionEvidence {
   const refuse = (problem: string): never => {
     throw new ResolutionEvidenceError(
@@ -586,13 +623,287 @@ export function establishResolutionEvidence(
   establishedResolutionTokens.add(token);
   establishedResolutionBindings.set(token, {
     attemptId: attempt.attemptId,
+    verifier,
     contentDigest: sha256(canonicalStringify(token)),
   });
   return token;
 }
 
+/** The lookup a verifier issues for an attempt's operation record — built from the attempt binding, never from caller fields. */
+export type ProviderOperationRecordQuery = {
+  provider: string;
+  site: string | null;
+  subscriptionId: string;
+  quoteId: string;
+  idempotencyKey: string;
+  requestHash: string;
+};
+
+/** The lookup a verifier issues for a landed attempt's financial reconciliation — the operation query plus the resolution's evidence reference. */
+export type ProviderReconciliationQuery = ProviderOperationRecordQuery & {
+  /** The CONFIRMED_LANDING resolution's evidence reference: the reconciliation must be OF that established landing. */
+  resolutionReference: string;
+  providerOperationId: string | null;
+};
+
+/**
+ * A financial reconciliation record, as returned by a
+ * `ProviderRecordSource`'s reconciliation lookup (round 3, R4').
+ * The verifier validates it against the attempt and the landing
+ * resolution and computes BOTH digests from it — the caller of the
+ * barrier never sees a digest input. `landedState` must be the
+ * landed subscription state the resolution established (its
+ * computed digest must equal the resolution's
+ * observedProviderStateDigest); `financialOutcome` is the
+ * reconciliation service's own outcome record for the landed
+ * operation's financial consequences.
+ */
+export type FinancialReconciliationRecord = {
+  /** The reconciliation source's name (non-empty; recorded on the barrier row). */
+  source: string;
+  /** The reconciliation record's own reference (non-empty; persisted as the barrier's evidenceReference). */
+  reference: string;
+  provider: string;
+  site?: string;
+  subscriptionId: string;
+  quoteId: string;
+  idempotencyKey: string;
+  requestHash: string;
+  /** Must equal the landing resolution's evidenceReference — the reconciliation is bound to THAT resolution. */
+  resolutionReference: string;
+  /** The landed subscription state object; its computed digest must equal the resolution's observed-state digest. */
+  landedState: unknown;
+  /** The financial outcome object for the landed operation; its digest is computed by the verifier, never supplied. */
+  financialOutcome: unknown;
+  /** When the reconciliation was performed (parseable ISO timestamp). */
+  reconciledAt: string;
+};
+
+/**
+ * The deployment-side capability that RETRIEVES provider records
+ * (round 3, R2'/R4'). A verifier holds one and fetches through it;
+ * the caller in the lifting path never supplies a record.
+ *
+ * THE LIBRARY SHIPS NO IMPLEMENTATION of this interface. Whoever
+ * provides one — an adapter that reads an authenticated provider
+ * operation log, an internal reconciliation service client — makes
+ * the deployment's trust decision about what counts as provider
+ * evidence. Until a deployment configures one, no evidence can be
+ * established and every INDETERMINATE attempt stays blocked (the
+ * fail-closed production default).
+ */
+export type ProviderRecordSource = {
+  /** Fetch the operation record for the queried attempt binding, or undefined when the source holds none. */
+  fetchOperationRecord(query: ProviderOperationRecordQuery): ResolutionProviderRecord | undefined;
+  /**
+   * Fetch the financial reconciliation record for a landed attempt,
+   * or undefined. OPTIONAL capability: a source without it can
+   * establish resolutions but can never satisfy the landing
+   * reconciliation barrier.
+   */
+  fetchFinancialReconciliation?(query: ProviderReconciliationQuery): FinancialReconciliationRecord | undefined;
+};
+
+/**
+ * A branded landing-reconciliation token minted ONLY by a
+ * verifier's `establishReconciliation` from a FETCHED
+ * `FinancialReconciliationRecord`. Both digests were computed by
+ * the verifier from the record; the token is bound to the attempt,
+ * the resolution it reconciles, and the minting verifier instance.
+ */
+export type EstablishedLandingReconciliation = {
+  attemptId: string;
+  quoteId: string;
+  subscriptionId: string;
+  provider: string;
+  site: string | null;
+  requestHash: string;
+  idempotencyKey: string;
+  /** The landing resolution's evidence reference this reconciliation is bound to. */
+  resolutionReference: string;
+  evidenceSource: string;
+  evidenceReference: string;
+  landedStateVersion: string | null;
+  /** sha256 of the fetched record's landedState — computed at minting, equal to the resolution's observed-state digest. */
+  landedStateDigest: string;
+  /** sha256 of the fetched record's financialOutcome — computed at minting, never caller-supplied. */
+  financialOutcomeDigest: string;
+  reconciledAt: string;
+};
+
+/**
+ * A provider-evidence verifier (round 3): the capability object a
+ * deployment creates over ITS record source and configures on the
+ * store (`DurableStoreOptions.evidenceVerifier`). The store accepts
+ * resolution tokens ONLY from its own configured verifier instance
+ * and invokes that same instance for landing reconciliations.
+ */
+export type ResolutionEvidenceVerifier = {
+  /**
+   * Fetch the attempt's operation record from the source (query
+   * built from the attempt binding) and establish it as resolution
+   * evidence: binding, source/kind pairing, outcome coherence,
+   * provider finality (R3), and the minting-time digest all run
+   * inside. Refuses when the source holds no record or the record
+   * fails validation. The caller supplies NO record.
+   */
+  establish(
+    attempt: StoredAttempt,
+    classification: "CONFIRMED_NON_EXECUTION" | "CONFIRMED_LANDING",
+    now: Date,
+  ): EstablishedResolutionEvidence;
+  /**
+   * Fetch the financial reconciliation record for a landed attempt
+   * from the source and establish it as a reconciliation token:
+   * binding to the attempt AND to the resolution's evidence
+   * reference, the landed-state digest computed from the record
+   * and required to equal the resolution's established digest, and
+   * the financial-outcome digest computed from the record. Refuses
+   * when the source lacks the reconciliation capability or holds
+   * no record, and when the record fails validation.
+   */
+  establishReconciliation(attempt: StoredAttempt, resolution: StoredResolution): EstablishedLandingReconciliation;
+};
+
+function operationQueryOf(attempt: StoredAttempt): ProviderOperationRecordQuery {
+  return {
+    provider: attempt.provider,
+    site: attempt.site,
+    subscriptionId: attempt.subscriptionId,
+    quoteId: attempt.quoteId,
+    idempotencyKey: attempt.idempotencyKey,
+    requestHash: attempt.requestHash,
+  };
+}
+
+/**
+ * Create a provider-evidence verifier over a deployment-supplied
+ * record source (round 3, R2'/R4'). This factory is the ONLY way
+ * evidence tokens come into existence, and it mints them solely
+ * from records the source RETURNS for a binding-built query —
+ * there is no overload, option, or sibling function that mints
+ * from a caller-supplied record. Configuring the resulting
+ * verifier on a store is the deployment's explicit trust decision;
+ * a store with no verifier configured accepts no terminal evidence
+ * (see `DurableStoreOptions.evidenceVerifier`).
+ */
+export function createProviderEvidenceVerifier(source: ProviderRecordSource): ResolutionEvidenceVerifier {
+  if (!source || typeof source !== "object" || typeof source.fetchOperationRecord !== "function") {
+    throw new ResolutionEvidenceError(
+      "A provider-evidence verifier requires a record source with fetchOperationRecord(query) — the verifier retrieves provider records; it does not accept them from callers.",
+    );
+  }
+  const verifier: ResolutionEvidenceVerifier = {
+    establish(attempt, classification, now) {
+      if (!attempt || typeof attempt !== "object") {
+        throw new ResolutionEvidenceError("Establishment refused: an attempt record is required.", {});
+      }
+      const record = source.fetchOperationRecord(operationQueryOf(attempt));
+      if (record === undefined || record === null) {
+        throw new ResolutionEvidenceError(
+          `Establishment refused for attempt ${attempt.attemptId}: the configured provider record source holds no operation record for this attempt's binding — without a fetched provider record there is nothing to establish, and the attempt remains blocked.`,
+          { attemptId: attempt.attemptId },
+        );
+      }
+      return establishResolutionEvidenceCore(attempt, record, classification, now, verifier);
+    },
+    establishReconciliation(attempt, resolution) {
+      const refuse = (problem: string): never => {
+        throw new ResolutionEvidenceError(
+          `Reconciliation establishment refused for attempt ${attempt?.attemptId ?? "(unknown)"}: ${problem}`,
+          { attemptId: attempt?.attemptId },
+        );
+      };
+      if (!attempt || typeof attempt !== "object") refuse("an attempt record is required");
+      if (!resolution || typeof resolution !== "object" || resolution.classification !== "CONFIRMED_LANDING") {
+        refuse("a terminal CONFIRMED_LANDING resolution is required — reconciliation evidence is established against an established landing, not against a claim");
+      }
+      if (typeof source.fetchFinancialReconciliation !== "function") {
+        refuse("the configured provider record source has no financial-reconciliation capability (fetchFinancialReconciliation) — the landing barrier cannot be satisfied until an independent reconciliation source is configured; the subscription remains blocked");
+      }
+      const query: ProviderReconciliationQuery = {
+        ...operationQueryOf(attempt!),
+        resolutionReference: resolution!.evidenceReference,
+        providerOperationId: resolution!.providerOperationId,
+      };
+      const record = source.fetchFinancialReconciliation!(query);
+      if (record === undefined || record === null) {
+        refuse("the configured provider record source holds no financial reconciliation record for this landed attempt — the barrier cannot be satisfied from an attestation");
+      }
+      if (typeof record !== "object" || Array.isArray(record)) refuse("the fetched reconciliation is not a record object");
+      // Binding: the reconciliation must be ABOUT this attempt and
+      // THIS resolution, in every field.
+      if (record!.provider !== attempt!.provider) refuse(`the reconciliation's provider (${String(record!.provider)}) does not match the attempt's provider (${attempt!.provider})`);
+      if ((record!.site ?? null) !== attempt!.site) refuse(`the reconciliation's site (${String(record!.site ?? null)}) does not match the attempt's site (${String(attempt!.site)})`);
+      if (record!.subscriptionId !== attempt!.subscriptionId) refuse(`the reconciliation's subscriptionId (${String(record!.subscriptionId)}) does not match the attempt's (${attempt!.subscriptionId})`);
+      if (record!.quoteId !== attempt!.quoteId) refuse(`the reconciliation's quoteId (${String(record!.quoteId)}) does not match the attempt's (${attempt!.quoteId})`);
+      if (record!.idempotencyKey !== attempt!.idempotencyKey) refuse("the reconciliation's idempotencyKey does not match the attempt's — the reconciliation must be keyed to THIS operation");
+      if (record!.requestHash !== attempt!.requestHash) refuse("the reconciliation's requestHash does not match the attempt's — the reconciliation must be bound to the exact attempted request");
+      if (typeof record!.resolutionReference !== "string" || record!.resolutionReference.trim() === "" || record!.resolutionReference !== resolution!.evidenceReference) {
+        refuse("the reconciliation is not bound to the landing resolution's evidence reference — a reconciliation of some other (or no) resolution establishes nothing here");
+      }
+      const evidenceSource = typeof record!.source === "string" ? record!.source.trim() : "";
+      if (!evidenceSource) refuse("the reconciliation record must name its (non-empty) source");
+      const evidenceReference = typeof record!.reference === "string" ? record!.reference.trim() : "";
+      if (!evidenceReference) refuse("a non-empty reference identifying the financial reconciliation record is required");
+      if (record!.landedState === undefined || record!.landedState === null) {
+        refuse("the reconciliation record must carry the landed state it reconciled — a bare digest assertion establishes nothing");
+      }
+      // The landed-state digest is COMPUTED from the fetched
+      // record and must equal the digest the resolution
+      // established: the barrier is bound to the SAME landed state.
+      const landedStateDigest = sha256(canonicalStringify(record!.landedState));
+      if (landedStateDigest !== resolution!.observedProviderStateDigest) {
+        refuse("the reconciliation's landed state does not digest to the landed state the resolution established — the reconciliation must be OF the established landed state, not of some other state");
+      }
+      if (!record!.financialOutcome || typeof record!.financialOutcome !== "object" || Array.isArray(record!.financialOutcome)) {
+        refuse("the reconciliation record must carry its financial outcome object — the financial-outcome digest is computed from it, never supplied by a caller");
+      }
+      const financialOutcomeDigest = sha256(canonicalStringify(record!.financialOutcome));
+      if (Number.isNaN(Date.parse(record!.reconciledAt ?? ""))) refuse("the reconciliation record's reconciledAt must be a parseable ISO timestamp");
+      const token: EstablishedLandingReconciliation = {
+        attemptId: attempt!.attemptId,
+        quoteId: attempt!.quoteId,
+        subscriptionId: attempt!.subscriptionId,
+        provider: attempt!.provider,
+        site: attempt!.site,
+        requestHash: attempt!.requestHash,
+        idempotencyKey: attempt!.idempotencyKey,
+        resolutionReference: resolution!.evidenceReference,
+        evidenceSource,
+        evidenceReference,
+        landedStateVersion: resolution!.landedStateVersion,
+        landedStateDigest,
+        financialOutcomeDigest,
+        reconciledAt: record!.reconciledAt,
+      };
+      establishedReconciliationTokens.add(token);
+      establishedReconciliationBindings.set(token, {
+        attemptId: attempt!.attemptId,
+        verifier,
+        contentDigest: sha256(canonicalStringify(token)),
+      });
+      return token;
+    },
+  };
+  return verifier;
+}
+
 export type DurableStoreOptions = {
   busyTimeoutMs?: number;
+  /**
+   * The provider-evidence verifier whose established tokens this
+   * store accepts and whose reconciliation establishments satisfy
+   * the landing barrier (round 3, R2'/R4'). Configuring it is the
+   * deployment's explicit trust decision: the verifier's record
+   * source defines what counts as provider evidence. When ABSENT
+   * (the default), the store has no evidence capability at all —
+   * every terminal `resolveAttempt` refuses, the landing barrier
+   * can never be satisfied, and operators may record only ASSERTED
+   * (unverified, non-lifting) claims and UNRESOLVED audit records.
+   * Fail closed by construction.
+   */
+  evidenceVerifier?: ResolutionEvidenceVerifier;
   /**
    * Restart-recovery grace window: a DISPATCHING attempt younger
    * than this is NOT recovered on open, because a second process
@@ -691,6 +1002,15 @@ const SCHEMA_STATEMENTS = [
  * landed_state_version: a v2-era terminal row migrates with these
  * NULL — preserved as a record, but NON-LIFTING at runtime, because
  * finality was never attested for it (see `terminalResolutionFor`).
+ * Schema v4 (PR #50 correction round 3) adds trust_tier: EVERY
+ * pre-v4 row backfills to 'ASSERTED' on migration — pre-v4 evidence
+ * was minted through the removed public establishment function or
+ * accepted as caller digests, i.e. untrusted under the round-3
+ * boundary — so it is preserved and readable but NON-LIFTING; only
+ * rows written by v4 code from a store-configured verifier carry
+ * 'VERIFIED'. The (evidence_source, evidence_reference) replay
+ * uniqueness is scoped accordingly: it covers VERIFIED terminal
+ * records, the only ones whose reference is evidence.
  */
 const RESOLUTION_SCHEMA_STATEMENTS = [
   `CREATE TABLE IF NOT EXISTS attempt_resolutions (
@@ -718,10 +1038,11 @@ const RESOLUTION_SCHEMA_STATEMENTS = [
      log_final INTEGER,
      complete_through TEXT,
      registry_coverage TEXT,
-     landed_state_version TEXT
+     landed_state_version TEXT,
+     trust_tier TEXT
    )`,
   `CREATE INDEX IF NOT EXISTS idx_attempt_resolutions_attempt ON attempt_resolutions(attempt_id)`,
-  `CREATE UNIQUE INDEX IF NOT EXISTS idx_attempt_resolutions_evidence_ref ON attempt_resolutions(evidence_source, evidence_reference) WHERE classification != 'UNRESOLVED'`,
+  `CREATE UNIQUE INDEX IF NOT EXISTS idx_attempt_resolutions_evidence_ref ON attempt_resolutions(evidence_source, evidence_reference) WHERE classification != 'UNRESOLVED' AND trust_tier = 'VERIFIED'`,
 ];
 
 /** Columns added to attempt_resolutions by the v2 → v3 migration (PR #50 correction round). */
@@ -740,6 +1061,11 @@ const RESOLUTION_V3_COLUMNS: Array<readonly [string, string]> = [
  * checksum of the row's canonical payload: an internal-consistency
  * checksum (it detects mismatched edits; it is not keyed
  * authentication), re-verified on open like the resolution rows.
+ * Schema v4 (correction round 3) adds trust_tier and
+ * evidence_reference: a v4 row is written only from a fetched,
+ * verifier-established reconciliation record and names it; pre-v4
+ * rows backfill to trust_tier 'ASSERTED' with a NULL reference and
+ * never satisfy the barrier.
  */
 const LANDING_RECONCILIATION_SCHEMA_STATEMENTS = [
   `CREATE TABLE IF NOT EXISTS landing_reconciliations (
@@ -754,7 +1080,9 @@ const LANDING_RECONCILIATION_SCHEMA_STATEMENTS = [
      reconciled_at TEXT NOT NULL,
      justification TEXT NOT NULL,
      payload_json TEXT NOT NULL,
-     record_hash TEXT NOT NULL UNIQUE
+     record_hash TEXT NOT NULL UNIQUE,
+     trust_tier TEXT,
+     evidence_reference TEXT
    )`,
   `CREATE INDEX IF NOT EXISTS idx_landing_reconciliations_attempt ON landing_reconciliations(attempt_id)`,
 ];
@@ -766,6 +1094,7 @@ export class DurableQuoteStore extends QuoteStore {
   private readonly recoveryGraceMs: number;
   private readonly faults: DurableStoreOptions["faults"];
   private readonly nowFn: () => Date;
+  private readonly evidenceVerifier?: ResolutionEvidenceVerifier;
   private attemptSeq = 0;
   private resolutionSeq = 0;
 
@@ -777,6 +1106,14 @@ export class DurableQuoteStore extends QuoteStore {
     this.faults = opts.faults;
     this.recoveryGraceMs = opts.recoveryGraceMs ?? 30_000;
     this.nowFn = opts.now ?? (() => new Date());
+    if (opts.evidenceVerifier !== undefined) {
+      if (!opts.evidenceVerifier || typeof opts.evidenceVerifier !== "object" || typeof opts.evidenceVerifier.establish !== "function") {
+        throw new DurableStoreError(
+          "Durable store misconfigured: evidenceVerifier must be a verifier created by createProviderEvidenceVerifier(source) — the store accepts evidence only through that capability boundary.",
+        );
+      }
+      this.evidenceVerifier = opts.evidenceVerifier;
+    }
     const Sqlite = loadSqlite();
     let db: Db;
     try {
@@ -810,8 +1147,8 @@ export class DurableQuoteStore extends QuoteStore {
       const version = row ? Number(row.value) : NaN;
       if (Number.isInteger(version) && version === DURABLE_SCHEMA_VERSION) return;
       if (Number.isInteger(version) && version === 1) {
-        // v1 → v3: ONE transaction creates the append-only
-        // attempt_resolutions table (at its v3 shape) and the
+        // v1 → v4: ONE transaction creates the append-only
+        // attempt_resolutions table (at its v4 shape) and the
         // landing_reconciliations table and advances the version
         // marker. No existing row is touched: v1 attempts keep their
         // state and their operator_review_state flag verbatim — in
@@ -828,24 +1165,47 @@ export class DurableQuoteStore extends QuoteStore {
         return;
       }
       if (Number.isInteger(version) && version === 2) {
-        // v2 → v3 (PR #50 correction round): ONE transaction adds
-        // the provider-finality / landed-version columns to
-        // attempt_resolutions and creates landing_reconciliations.
-        // No existing row is altered: a v2-era terminal resolution
-        // keeps log_final NULL and is therefore preserved as a
-        // record but NON-LIFTING (finality was never attested).
+        // v2 → v4 (PR #50 correction rounds 1+3): ONE transaction
+        // adds the provider-finality / landed-version columns
+        // (v3) and the trust_tier column (v4) to
+        // attempt_resolutions, creates landing_reconciliations at
+        // its v4 shape, backfills trust, and re-scopes the replay
+        // index. No existing row is altered in content: a v2-era
+        // terminal resolution keeps log_final NULL (finality was
+        // never attested) and gains trust_tier 'ASSERTED' — under
+        // both rules it is preserved as a record but NON-LIFTING.
         const tx = this.db.transaction(() => {
           for (const [name, type] of RESOLUTION_V3_COLUMNS) {
             this.db.exec(`ALTER TABLE attempt_resolutions ADD COLUMN ${name} ${type}`);
           }
           for (const stmt of LANDING_RECONCILIATION_SCHEMA_STATEMENTS) this.db.exec(stmt);
+          this.migrateTrustTierV4();
+          this.db.prepare(`UPDATE meta SET value = ? WHERE key = 'schema_version'`).run(String(DURABLE_SCHEMA_VERSION));
+        });
+        tx.immediate();
+        return;
+      }
+      if (Number.isInteger(version) && version === 3) {
+        // v3 → v4 (PR #50 correction round 3): ONE transaction adds
+        // trust_tier to attempt_resolutions and trust_tier +
+        // evidence_reference to landing_reconciliations, backfills
+        // EVERY pre-v4 row to 'ASSERTED', and re-scopes the replay
+        // index to VERIFIED rows. Round-2/3-era evidence was minted
+        // through the public establishment function (R2') or
+        // accepted as caller digests (R4') — untrusted under the
+        // round-3 boundary — so no pre-v4 row may keep lifting;
+        // each remains preserved and readable at the ASSERTED tier.
+        const tx = this.db.transaction(() => {
+          this.db.exec(`ALTER TABLE landing_reconciliations ADD COLUMN trust_tier TEXT`);
+          this.db.exec(`ALTER TABLE landing_reconciliations ADD COLUMN evidence_reference TEXT`);
+          this.migrateTrustTierV4();
           this.db.prepare(`UPDATE meta SET value = ? WHERE key = 'schema_version'`).run(String(DURABLE_SCHEMA_VERSION));
         });
         tx.immediate();
         return;
       }
       throw new DurableRecoveryError(
-        `Recovery refused: unsupported durable schema version ${row?.value ?? "(missing)"}; this build supports ${DURABLE_SCHEMA_VERSION} (with in-place migrations from versions 1 and 2). Nothing was adopted.`,
+        `Recovery refused: unsupported durable schema version ${row?.value ?? "(missing)"}; this build supports ${DURABLE_SCHEMA_VERSION} (with in-place migrations from versions 1, 2 and 3). Nothing was adopted.`,
         { schemaVersion: row?.value ?? null },
       );
     }
@@ -857,6 +1217,26 @@ export class DurableQuoteStore extends QuoteStore {
       this.db.prepare(`INSERT INTO meta (key, value) VALUES ('created_at', ?)`).run(this.nowFn().toISOString());
     });
     tx.immediate();
+  }
+
+  /**
+   * The shared v3/v2 → v4 trust-tier step (runs INSIDE the caller's
+   * migration transaction): add the trust_tier column to
+   * attempt_resolutions, backfill EVERY pre-existing resolution and
+   * reconciliation row to 'ASSERTED' (the conservative tier — see
+   * the v3 branch comment), and re-scope the (source, reference)
+   * replay index to VERIFIED terminal rows. Index replacement is
+   * metadata, not row alteration: no row is modified except the
+   * trust_tier backfill itself, and no row is deleted.
+   */
+  private migrateTrustTierV4(): void {
+    this.db.exec(`ALTER TABLE attempt_resolutions ADD COLUMN trust_tier TEXT`);
+    this.db.exec(`UPDATE attempt_resolutions SET trust_tier = 'ASSERTED' WHERE trust_tier IS NULL`);
+    this.db.exec(`UPDATE landing_reconciliations SET trust_tier = 'ASSERTED' WHERE trust_tier IS NULL`);
+    this.db.exec(`DROP INDEX IF EXISTS idx_attempt_resolutions_evidence_ref`);
+    this.db.exec(
+      `CREATE UNIQUE INDEX idx_attempt_resolutions_evidence_ref ON attempt_resolutions(evidence_source, evidence_reference) WHERE classification != 'UNRESOLVED' AND trust_tier = 'VERIFIED'`,
+    );
   }
 
   // -- load + recovery --------------------------------------------------------
@@ -961,9 +1341,14 @@ export class DurableQuoteStore extends QuoteStore {
    * consistency discipline as resolution rows — the record checksum
    * recomputes from the stored payload, the payload's fields equal
    * the row columns, the referenced attempt exists, and the row is
-   * bound to that attempt's terminal CONFIRMED_LANDING resolution
+   * bound to a terminal CONFIRMED_LANDING resolution of its attempt
    * (same landed state version and state digest). A reconciliation
    * that does not re-verify must never unblock a subscription.
+   * Round 3: the binding check accepts a terminal landing
+   * resolution at EITHER trust tier — a pre-v4 (ASSERTED) row was
+   * recorded against a pre-v4 resolution and must still verify as a
+   * RECORD; whether it can satisfy the barrier is a separate,
+   * tier-gated question (`landingReconciliationFor`).
    */
   private verifyLandingReconciliationsOnOpen(): void {
     const rows = this.db.prepare(`SELECT * FROM landing_reconciliations ORDER BY rowid`).all() as Array<Record<string, unknown>>;
@@ -989,18 +1374,28 @@ export class DurableQuoteStore extends QuoteStore {
         subscriptionId: row.subscription_id, landedStateVersion: row.landed_state_version,
         landedStateDigest: row.landed_state_digest, financialOutcomeDigest: row.financial_outcome_digest,
         operatorId: row.operator_id, reconciledAt: row.reconciled_at, justification: row.justification,
+        // v4 fields. A pre-v4 payload does not carry them: it reads
+        // as the migration backfill (ASSERTED, no reference), which
+        // is exactly the preserved-but-non-lifting rule.
+        trustTier: (row.trust_tier as string | null) ?? "ASSERTED",
+        evidenceReference: (row.evidence_reference as string | null) ?? null,
       };
+      const payloadDefaults: Record<string, unknown> = { trustTier: "ASSERTED", evidenceReference: null };
       for (const [k, v] of Object.entries(columnBinding)) {
-        if ((payloadFields as Record<string, unknown>)[k] !== v) refuse(`has a payload binding that disagrees with its record columns (${k})`);
+        const carried = (payloadFields as Record<string, unknown>)[k];
+        const actual = carried === undefined ? payloadDefaults[k] : carried;
+        if (actual !== v) refuse(`has a payload binding that disagrees with its record columns (${k})`);
       }
       const attemptRow = this.db.prepare(`SELECT * FROM attempts WHERE attempt_id = ?`).get(row.attempt_id) as Record<string, unknown> | undefined;
       if (!attemptRow) refuse("references an attempt that does not exist");
-      const resolution = this.terminalResolutionFor(row.attempt_id as string);
-      if (!resolution || resolution.classification !== "CONFIRMED_LANDING") {
-        refuse("is not bound to a terminal CONFIRMED_LANDING resolution for its attempt");
-      }
-      if (resolution!.landedStateVersion !== row.landed_state_version || resolution!.observedProviderStateDigest !== row.landed_state_digest) {
-        refuse("is bound to a different landed state than the resolution established");
+      const bound = this.resolutionsForAttempt(row.attempt_id as string).some(
+        (r) =>
+          r.classification === "CONFIRMED_LANDING" &&
+          r.landedStateVersion === (row.landed_state_version as string) &&
+          r.observedProviderStateDigest === (row.landed_state_digest as string),
+      );
+      if (!bound) {
+        refuse("is not bound to a terminal CONFIRMED_LANDING resolution for its attempt with the same landed state");
       }
     }
   }
@@ -1056,11 +1451,14 @@ export class DurableQuoteStore extends QuoteStore {
         completeThrough: row.complete_through ?? "",
         registryCoverage: row.registry_coverage ?? null,
         landedStateVersion: row.landed_state_version ?? null,
+        // v4 field. A pre-v4 payload predates it: it reads as the
+        // migration backfill (ASSERTED), the non-lifting tier.
+        trustTier: (row.trust_tier as string | null) ?? "ASSERTED",
       };
-      // Defaults for fields a v2-era payload does not carry at all
+      // Defaults for fields a pre-v4 payload does not carry at all
       // (an explicitly-null payload field is a real value, not an
       // absence — hence the undefined test, not ??).
-      const payloadDefaults: Record<string, unknown> = { logFinal: false, completeThrough: "", registryCoverage: null, landedStateVersion: null, establishmentProcedure: "" };
+      const payloadDefaults: Record<string, unknown> = { logFinal: false, completeThrough: "", registryCoverage: null, landedStateVersion: null, establishmentProcedure: "", trustTier: "ASSERTED" };
       for (const [k, v] of Object.entries(columnBinding)) {
         const carried = (payloadFields as Record<string, unknown>)[k];
         const actual = carried === undefined ? payloadDefaults[k] : carried;
@@ -1394,6 +1792,7 @@ export class DurableQuoteStore extends QuoteStore {
           return "";
         }
       })(),
+      trustTier: (row.trust_tier as string) === "VERIFIED" ? "VERIFIED" : "ASSERTED",
     };
   }
 
@@ -1402,22 +1801,43 @@ export class DurableQuoteStore extends QuoteStore {
     return (this.db.prepare(`SELECT * FROM attempt_resolutions WHERE attempt_id = ? ORDER BY rowid`).all(attemptId) as Array<Record<string, unknown>>).map((r) => this.rowToResolution(r));
   }
 
-  /** The attempt's terminal (CONFIRMED_*) resolution if one exists, otherwise its latest record, otherwise undefined. */
+  /**
+   * The attempt's governing resolution record: a VERIFIED terminal
+   * (CONFIRMED_*) record if one exists, else any terminal record
+   * (an ASSERTED claim), else its latest record, else undefined.
+   */
   getResolution(attemptId: string): StoredResolution | undefined {
     const all = this.resolutionsForAttempt(attemptId);
-    return all.find((r) => r.classification !== "UNRESOLVED") ?? all[all.length - 1];
+    return (
+      all.find((r) => r.classification !== "UNRESOLVED" && r.trustTier === "VERIFIED") ??
+      all.find((r) => r.classification !== "UNRESOLVED") ??
+      all[all.length - 1]
+    );
   }
 
   /**
-   * The terminal (block-relevant) resolution for an attempt, if one
-   * was established WITH provider finality. COMPATIBILITY RULE
-   * (schema v3): a v2-era terminal row carries log_final NULL —
-   * finality was never attested for it — so it is preserved as a
-   * record (see `getResolution` / `resolutionsForAttempt`) but is
-   * NON-LIFTING here and can never satisfy this lookup.
+   * The terminal (block-LIFTING) resolution for an attempt, if one
+   * was established through this store's verifier boundary WITH
+   * provider finality. COMPATIBILITY RULES: a v2-era terminal row
+   * carries log_final NULL — finality was never attested for it
+   * (schema v3) — and EVERY pre-v4 row carries trust_tier ASSERTED
+   * — its evidence was minted through the removed public
+   * establishment function or, for reconciliations, caller digests
+   * (schema v4). Either defect makes the row a preserved record
+   * (see `getResolution` / `resolutionsForAttempt`) that is
+   * NON-LIFTING here and can never satisfy this lookup. ASSERTED
+   * operator claims (`recordAssertedResolution`) are non-lifting
+   * by the same tier rule.
    */
   private terminalResolutionFor(attemptId: string): StoredResolution | undefined {
-    return this.resolutionsForAttempt(attemptId).find((r) => r.classification !== "UNRESOLVED" && r.logFinal);
+    return this.resolutionsForAttempt(attemptId).find(
+      (r) => r.classification !== "UNRESOLVED" && r.logFinal && r.trustTier === "VERIFIED",
+    );
+  }
+
+  /** Any terminal-classification record for an attempt (either trust tier), for append-order discipline checks that a standing terminal claim/record already exists. */
+  private anyTerminalResolutionFor(attemptId: string): StoredResolution | undefined {
+    return this.resolutionsForAttempt(attemptId).find((r) => r.classification !== "UNRESOLVED");
   }
 
   private rowToLandingReconciliation(row: Record<string, unknown>): StoredLandingReconciliation {
@@ -1433,11 +1853,24 @@ export class DurableQuoteStore extends QuoteStore {
       reconciledAt: row.reconciled_at as string,
       justification: row.justification as string,
       recordHash: row.record_hash as string,
+      trustTier: (row.trust_tier as string) === "VERIFIED" ? "VERIFIED" : "ASSERTED",
+      evidenceReference: (row.evidence_reference as string | null) ?? null,
     };
   }
 
-  /** The recorded landing reconciliation for an attempt, if the R4 barrier has been satisfied for it. */
+  /**
+   * The VERIFIED landing reconciliation for an attempt, if the
+   * R4/R4' barrier has been satisfied for it through the verifier
+   * boundary. This is the only reader the blocking paths consult:
+   * a pre-v4 (ASSERTED) reconciliation row never satisfies it.
+   */
   landingReconciliationFor(attemptId: string): StoredLandingReconciliation | undefined {
+    const record = this.landingReconciliationRecordFor(attemptId);
+    return record && record.trustTier === "VERIFIED" ? record : undefined;
+  }
+
+  /** The recorded landing reconciliation for an attempt at ANY trust tier (the preserved record, e.g. a pre-v4 ASSERTED row), or undefined. */
+  landingReconciliationRecordFor(attemptId: string): StoredLandingReconciliation | undefined {
     const row = this.db.prepare(`SELECT * FROM landing_reconciliations WHERE attempt_id = ?`).get(attemptId) as Record<string, unknown> | undefined;
     return row ? this.rowToLandingReconciliation(row) : undefined;
   }
@@ -1470,9 +1903,11 @@ export class DurableQuoteStore extends QuoteStore {
    *    recorded, other quotes unblock SUBJECT TO the stale-quote
    *    rule in `beginDispatch`;
    *  - no record, only UNRESOLVED records, a non-lifting v2-era
-   *    record, or a legacy v1 operator_review_state='RESOLVED'
-   *    flag with NO record: the attempt BLOCKS. A legacy flag is
-   *    never silently upgraded.
+   *    record, an ASSERTED (unverified) operator claim, a pre-v4
+   *    ASSERTED-tier record, or a legacy v1
+   *    operator_review_state='RESOLVED' flag with NO record: the
+   *    attempt BLOCKS. A legacy flag is never silently upgraded,
+   *    and an asserted claim is never silently verified.
    */
   findBlockingAttempt(quoteId: string, subscriptionId: string, excludeAttemptId?: string): StoredAttempt | undefined {
     const rows = this.db.prepare(
@@ -1798,17 +2233,24 @@ export class DurableQuoteStore extends QuoteStore {
   /**
    * Explicit operator action: resolve an INDETERMINATE attempt from
    * ESTABLISHED recovery evidence (P0, issue #43; PR #50 correction
-   * round, R2). Never called by any recovery or report path.
+   * round, R2; trust boundary hardened in round 3, R2'). Never
+   * called by any recovery or report path.
    *
    * The round-1 signature accepted a raw caller-asserted evidence
    * object (enum strings, an arbitrary reference, a caller-supplied
-   * digest). That is now impossible — the input must carry a token
-   * minted by `establishResolutionEvidence` (see its contract and
-   * stated limits):
+   * digest); the round-2 signature accepted a token minted by a
+   * PUBLIC establishment function over a caller-supplied record.
+   * Both are now impossible — the input must carry a token minted
+   * by THIS STORE'S configured provider-evidence verifier from a
+   * record the verifier fetched from its source:
    *
+   *  - a store with NO configured verifier refuses every terminal
+   *    resolution (no capability — fail closed);
    *  - a non-object argument, or one whose `evidence` is not a
    *    branded established token, refuses outright — free text and
    *    caller-constructed evidence objects alike;
+   *  - a token minted by a DIFFERENT verifier instance refuses
+   *    (verifier mismatch): capability is instance-bound;
    *  - the token must be bound to THIS attempt and must match its
    *    minting-time content digest (a token altered after minting
    *    refuses);
@@ -1837,7 +2279,7 @@ export class DurableQuoteStore extends QuoteStore {
     this.assertHealthy();
     if (!input || typeof input !== "object" || Array.isArray(input)) {
       throw new ResolutionEvidenceError(
-        `Resolution refused for attempt ${attemptId}: an established-evidence resolution input is required — a free-text operator note is not evidence and raw caller-asserted evidence is no longer accepted; evidence must be established first (establishResolutionEvidence).`,
+        `Resolution refused for attempt ${attemptId}: an established-evidence resolution input is required — a free-text operator note is not evidence and raw caller-asserted evidence is no longer accepted; evidence must be established by this store's configured provider-evidence verifier from a record it fetched.`,
         { attemptId },
       );
     }
@@ -1860,13 +2302,20 @@ export class DurableQuoteStore extends QuoteStore {
         if (this.terminalResolutionFor(attemptId)) {
           refuse(`ALREADY_RESOLVED: the attempt already carries a terminal resolution record; resolution evidence is append-only and a terminal resolution cannot be replaced`);
         }
-        // The trust boundary (R2): only a branded token, bound to
-        // this attempt, unaltered since minting.
+        // The trust boundary (R2, hardened R2'): only a branded
+        // token, minted by THIS store's configured verifier, bound
+        // to this attempt, unaltered since minting.
         const token = (input as { evidence?: unknown }).evidence as EstablishedResolutionEvidence | undefined;
         if (!token || typeof token !== "object" || !establishedResolutionTokens.has(token)) {
-          refuse("the supplied evidence was not established — resolveAttempt accepts only a token minted by establishResolutionEvidence from an actual provider record; caller-asserted evidence objects are refused");
+          refuse("the supplied evidence was not established — resolveAttempt accepts only a token minted by a provider-evidence verifier from a fetched provider record; caller-asserted evidence objects are refused");
         }
         const binding = establishedResolutionBindings.get(token!)!;
+        if (!this.evidenceVerifier) {
+          refuse("this store has no provider-evidence verifier configured — terminal resolution is disabled (fail closed): only a verifier the deployment configured on this store can establish lifting evidence");
+        }
+        if (binding.verifier !== this.evidenceVerifier) {
+          refuse("the established evidence was minted by a different verifier instance than the one configured on this store — a token is capability only for the store whose verifier minted it (verifier mismatch)");
+        }
         if (binding.attemptId !== attemptId) {
           refuse(`the established evidence is bound to attempt ${binding.attemptId}, not to this attempt — a token minted for one attempt cannot resolve another`);
         }
@@ -1928,26 +2377,27 @@ export class DurableQuoteStore extends QuoteStore {
           completeThrough: token!.completeThrough,
           registryCoverage: token!.registryCoverage,
           landedStateVersion: token!.landedStateVersion,
-          establishmentProcedure: "establishResolutionEvidence",
+          establishmentProcedure: "createProviderEvidenceVerifier",
+          trustTier: "VERIFIED" as ResolutionTrustTier,
         };
         const evidenceHash = sha256(canonicalStringify(payloadFields));
         const record: StoredResolution = { ...payloadFields, evidenceHash };
         this.db.prepare(
-          `INSERT INTO attempt_resolutions (resolution_id, attempt_id, quote_id, subscription_id, provider, site, request_hash, idempotency_key, classification, operator_id, resolved_at, evidence_source, evidence_kind, evidence_reference, observed_at, observed_provider_state_digest, provider_operation_id, reconciliation_decision, justification, evidence_payload_json, evidence_hash, log_final, complete_through, registry_coverage, landed_state_version)
-           VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
+          `INSERT INTO attempt_resolutions (resolution_id, attempt_id, quote_id, subscription_id, provider, site, request_hash, idempotency_key, classification, operator_id, resolved_at, evidence_source, evidence_kind, evidence_reference, observed_at, observed_provider_state_digest, provider_operation_id, reconciliation_decision, justification, evidence_payload_json, evidence_hash, log_final, complete_through, registry_coverage, landed_state_version, trust_tier)
+           VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
         ).run(
           record.resolutionId, record.attemptId, record.quoteId, record.subscriptionId, record.provider, record.site,
           record.requestHash, record.idempotencyKey, record.classification, record.operatorId, record.resolvedAt,
           record.evidenceSource, record.evidenceKind, record.evidenceReference, record.observedAt,
           record.observedProviderStateDigest, record.providerOperationId, record.reconciliationDecision,
           record.justification, encodeRecordJson(payloadFields), record.evidenceHash,
-          1, record.completeThrough, record.registryCoverage, record.landedStateVersion,
+          1, record.completeThrough, record.registryCoverage, record.landedStateVersion, record.trustTier,
         );
         this.faults?.insidePersistTx?.("resolveAttempt");
         this.db.prepare(`UPDATE attempts SET operator_review_state='RESOLVED', version=version+1, updated_at=? WHERE attempt_id=?`).run(resolvedAt, attemptId);
         this.db.prepare(`INSERT INTO attempt_history (attempt_id, state, at, note) VALUES (?,?,?,?)`).run(
           attemptId, attempt.state, resolvedAt,
-          `operator resolution recorded (${classification}; established evidence ${record.evidenceSource} ${record.evidenceReference} via establishResolutionEvidence; checksum ${evidenceHash.slice(0, 12)}…): ${justification}`,
+          `operator resolution recorded (${classification}; VERIFIED evidence ${record.evidenceSource} ${record.evidenceReference} established via the store's configured provider-evidence verifier; checksum ${evidenceHash.slice(0, 12)}…): ${justification}`,
         );
       });
       tx.immediate();
@@ -1991,8 +2441,8 @@ export class DurableQuoteStore extends QuoteStore {
         if (attempt.state !== "INDETERMINATE") {
           refuse(`the attempt is ${attempt.state}; only an INDETERMINATE attempt can carry a recovery outcome record`);
         }
-        if (this.terminalResolutionFor(attemptId)) {
-          refuse(`ALREADY_RESOLVED: the attempt already carries a terminal resolution record; an UNRESOLVED record cannot follow it`);
+        if (this.anyTerminalResolutionFor(attemptId)) {
+          refuse(`ALREADY_RESOLVED: the attempt already carries a terminal resolution record (verified or asserted); an UNRESOLVED record cannot follow it`);
         }
         const operatorId = typeof input.operatorId === "string" ? input.operatorId.trim() : "";
         if (!operatorId) refuse("a non-empty operatorId is required — an unattributed record is not auditable");
@@ -2023,18 +2473,19 @@ export class DurableQuoteStore extends QuoteStore {
           registryCoverage: null as string | null,
           landedStateVersion: null as string | null,
           establishmentProcedure: "",
+          trustTier: "ASSERTED" as ResolutionTrustTier,
         };
         const evidenceHash = sha256(canonicalStringify(payloadFields));
         this.db.prepare(
-          `INSERT INTO attempt_resolutions (resolution_id, attempt_id, quote_id, subscription_id, provider, site, request_hash, idempotency_key, classification, operator_id, resolved_at, evidence_source, evidence_kind, evidence_reference, observed_at, observed_provider_state_digest, provider_operation_id, reconciliation_decision, justification, evidence_payload_json, evidence_hash, log_final, complete_through, registry_coverage, landed_state_version)
-           VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
+          `INSERT INTO attempt_resolutions (resolution_id, attempt_id, quote_id, subscription_id, provider, site, request_hash, idempotency_key, classification, operator_id, resolved_at, evidence_source, evidence_kind, evidence_reference, observed_at, observed_provider_state_digest, provider_operation_id, reconciliation_decision, justification, evidence_payload_json, evidence_hash, log_final, complete_through, registry_coverage, landed_state_version, trust_tier)
+           VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
         ).run(
           payloadFields.resolutionId, payloadFields.attemptId, payloadFields.quoteId, payloadFields.subscriptionId, payloadFields.provider, payloadFields.site,
           payloadFields.requestHash, payloadFields.idempotencyKey, payloadFields.classification, payloadFields.operatorId, payloadFields.resolvedAt,
           payloadFields.evidenceSource, payloadFields.evidenceKind, payloadFields.evidenceReference, payloadFields.observedAt,
           payloadFields.observedProviderStateDigest, payloadFields.providerOperationId, payloadFields.reconciliationDecision,
           payloadFields.justification, encodeRecordJson(payloadFields), evidenceHash,
-          0, payloadFields.completeThrough, payloadFields.registryCoverage, payloadFields.landedStateVersion,
+          0, payloadFields.completeThrough, payloadFields.registryCoverage, payloadFields.landedStateVersion, payloadFields.trustTier,
         );
         this.faults?.insidePersistTx?.("recordUnresolvedResolution");
         this.db.prepare(`INSERT INTO attempt_history (attempt_id, state, at, note) VALUES (?,?,?,?)`).run(
@@ -2051,34 +2502,161 @@ export class DurableQuoteStore extends QuoteStore {
   }
 
   /**
-   * The R4 reconciliation barrier: record that a CONFIRMED_LANDING
-   * attempt's landed state and financial consequences have been
-   * reconciled. A landing resolution alone NEVER unblocks the
-   * subscription — until this record exists, the landed attempt
-   * blocks every quote on it (`findBlockingAttempt`); once it
-   * exists, other quotes unblock subject to the stale-quote rule
-   * in `beginDispatch`, and the landed attempt's own quote remains
-   * blocked regardless (R1).
+   * Record an operator's terminal CLAIM about an INDETERMINATE
+   * attempt WITHOUT verified provider evidence (round 3, R2' —
+   * the fail-closed asserted path). The claim is appended to
+   * attempt_resolutions at the ASSERTED trust tier with no evidence
+   * fields at all: it is an audit record of what the operator
+   * asserted, and it is explicitly NOT provider evidence — an
+   * explicitly recorded human claim must not be presented as
+   * independently verified evidence, and this method does not
+   * pretend otherwise. It NEVER lifts: `terminalResolutionFor`
+   * returns only VERIFIED records, the operator_review_state flag
+   * is NOT flipped, the attempt keeps blocking every key, and the
+   * recovery report surfaces the claim as ASSERTED_UNVERIFIED with
+   * intervention still required. A later VERIFIED resolution
+   * through the store's configured verifier remains possible and
+   * supersedes the claim. UNRESOLVED outcomes are not claims of a
+   * terminal outcome — they stay on `recordUnresolvedResolution`.
+   * Refuses for non-INDETERMINATE attempts, for attempts already
+   * VERIFIED-resolved, and for unattributed claims.
+   */
+  recordAssertedResolution(
+    attemptId: string,
+    input: { classification: ResolutionClassification; operatorId: string; justification: string },
+  ): StoredAttempt {
+    this.assertHealthy();
+    if (!input || typeof input !== "object" || Array.isArray(input)) {
+      throw new ResolutionEvidenceError(
+        `Asserted claim refused for attempt ${attemptId}: a claim record { classification, operatorId, justification } is required.`,
+        { attemptId },
+      );
+    }
+    const known = this.getAttempt(attemptId);
+    if (!known) throw new DurableStoreError(`Cannot record an asserted claim for unknown attempt ${attemptId}.`);
+    if (this.faults?.beforePersist) {
+      try { this.faults.beforePersist("recordAssertedResolution"); } catch (e) { this.failPoison("recordAssertedResolution", e); }
+    }
+    const resolvedAt = this.nowFn().toISOString();
+    try {
+      const tx = this.db.transaction(() => {
+        const attempt = this.getAttempt(attemptId)!;
+        const refuse = (problem: string): never => {
+          throw new ResolutionEvidenceError(`Asserted claim refused for attempt ${attemptId}: ${problem}`, { attemptId });
+        };
+        if (attempt.state !== "INDETERMINATE") {
+          refuse(`the attempt is ${attempt.state}; only an INDETERMINATE attempt can carry an asserted claim`);
+        }
+        if (input.classification !== "CONFIRMED_NON_EXECUTION" && input.classification !== "CONFIRMED_LANDING") {
+          refuse(`classification ${String(input.classification)} is not a terminal claim — UNRESOLVED outcomes are recorded via recordUnresolvedResolution, not as asserted claims`);
+        }
+        if (this.terminalResolutionFor(attemptId)) {
+          refuse(`ALREADY_RESOLVED: the attempt already carries a VERIFIED terminal resolution; an asserted claim cannot follow it`);
+        }
+        const operatorId = typeof input.operatorId === "string" ? input.operatorId.trim() : "";
+        if (!operatorId) refuse("a non-empty operatorId is required — an unattributed claim is not auditable");
+        const justification = typeof input.justification === "string" ? input.justification.trim() : "";
+        if (!justification) refuse("a non-empty justification is required");
+        const classification = input.classification;
+        const payloadFields = {
+          resolutionId: `res_${sha256(`${attemptId}|${resolvedAt}|${classification}|asserted`).slice(0, 24)}_${++this.resolutionSeq}`,
+          attemptId: attempt.attemptId,
+          quoteId: attempt.quoteId,
+          subscriptionId: attempt.subscriptionId,
+          provider: attempt.provider,
+          site: attempt.site,
+          requestHash: attempt.requestHash,
+          idempotencyKey: attempt.idempotencyKey,
+          classification,
+          operatorId,
+          resolvedAt,
+          evidenceSource: "",
+          evidenceKind: "",
+          evidenceReference: "",
+          observedAt: resolvedAt,
+          observedProviderStateDigest: "",
+          providerOperationId: null as string | null,
+          reconciliationDecision: "",
+          justification,
+          logFinal: false,
+          completeThrough: "",
+          registryCoverage: null as string | null,
+          landedStateVersion: null as string | null,
+          establishmentProcedure: "",
+          trustTier: "ASSERTED" as ResolutionTrustTier,
+        };
+        const evidenceHash = sha256(canonicalStringify(payloadFields));
+        this.db.prepare(
+          `INSERT INTO attempt_resolutions (resolution_id, attempt_id, quote_id, subscription_id, provider, site, request_hash, idempotency_key, classification, operator_id, resolved_at, evidence_source, evidence_kind, evidence_reference, observed_at, observed_provider_state_digest, provider_operation_id, reconciliation_decision, justification, evidence_payload_json, evidence_hash, log_final, complete_through, registry_coverage, landed_state_version, trust_tier)
+           VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
+        ).run(
+          payloadFields.resolutionId, payloadFields.attemptId, payloadFields.quoteId, payloadFields.subscriptionId, payloadFields.provider, payloadFields.site,
+          payloadFields.requestHash, payloadFields.idempotencyKey, payloadFields.classification, payloadFields.operatorId, payloadFields.resolvedAt,
+          payloadFields.evidenceSource, payloadFields.evidenceKind, payloadFields.evidenceReference, payloadFields.observedAt,
+          payloadFields.observedProviderStateDigest, payloadFields.providerOperationId, payloadFields.reconciliationDecision,
+          payloadFields.justification, encodeRecordJson(payloadFields), evidenceHash,
+          0, payloadFields.completeThrough, payloadFields.registryCoverage, payloadFields.landedStateVersion, payloadFields.trustTier,
+        );
+        this.faults?.insidePersistTx?.("recordAssertedResolution");
+        this.db.prepare(`INSERT INTO attempt_history (attempt_id, state, at, note) VALUES (?,?,?,?)`).run(
+          attemptId, attempt.state, resolvedAt,
+          `operator recorded an ASSERTED (unverified) claim of ${classification} — no provider evidence was established; the claim lifts nothing and the attempt remains blocked: ${justification}`,
+        );
+      });
+      tx.immediate();
+    } catch (e) {
+      if (e instanceof ResolutionEvidenceError || e instanceof DispatchBlockedError) throw e;
+      this.failPoison("recordAssertedResolution", e);
+    }
+    return this.getAttempt(attemptId)!;
+  }
+
+  /**
+   * The R4 reconciliation barrier, hardened in correction round 3
+   * (R4'): record that a CONFIRMED_LANDING attempt's landed state
+   * and financial consequences have been reconciled — from
+   * VERIFIED, operation-bound financial reconciliation evidence,
+   * not from caller assertions. A landing resolution alone NEVER
+   * unblocks the subscription — until this record exists, the
+   * landed attempt blocks every quote on it
+   * (`findBlockingAttempt`); once it exists, other quotes unblock
+   * subject to the stale-quote rule in `beginDispatch`, and the
+   * landed attempt's own quote remains blocked regardless (R1).
    *
-   * The barrier is bound to the resolution's OWN established
-   * evidence: `landedStateDigest` must equal the resolution's
-   * observed-state digest — a reconciliation of some OTHER state
-   * refuses. `financialOutcomeDigest` must be a well-formed sha256:
-   * it is the digest of the deployment's financial reconciliation
-   * record, recorded here but not recomputed (the store cannot
-   * recompute a deployment's books — stated limit, mirroring the
-   * establishment boundary's). One reconciliation per attempt; a
-   * second refuses. Append-only and checksum-verified on open,
-   * like the resolution rows.
+   * Round-2 shape (caller-supplied `landedStateDigest` /
+   * `financialOutcomeDigest`) is REMOVED: a correct-format hash is
+   * not reconciliation, and sha256("not actually reconciled")
+   * satisfied the old barrier. Now the store invokes ITS OWN
+   * configured verifier's `establishReconciliation`, which FETCHES
+   * the financial reconciliation record from the deployment's
+   * record source (bound to the attempt and to the resolution's
+   * evidence reference) and computes both digests from it — the
+   * landed-state digest must equal the resolution's established
+   * observed-state digest. No caller-supplied digest or record
+   * input exists anywhere in the path; an input carrying the old
+   * digest fields refuses explicitly. A store with no verifier, or
+   * whose source lacks the reconciliation capability, refuses —
+   * fail closed until an independent reconciliation source exists.
+   * One reconciliation per attempt; a second refuses. Append-only
+   * and checksum-verified on open, like the resolution rows.
    */
   reconcileLandedAttempt(
     attemptId: string,
-    input: { operatorId: string; landedStateDigest: string; financialOutcomeDigest: string; justification: string },
+    input: { operatorId: string; justification: string },
   ): StoredLandingReconciliation {
     this.assertHealthy();
     if (!input || typeof input !== "object" || Array.isArray(input)) {
       throw new ResolutionEvidenceError(
-        `Landing reconciliation refused for attempt ${attemptId}: a reconciliation record { operatorId, landedStateDigest, financialOutcomeDigest, justification } is required.`,
+        `Landing reconciliation refused for attempt ${attemptId}: a reconciliation request { operatorId, justification } is required — digests and records are established through the store's verifier, never supplied by the caller.`,
+        { attemptId },
+      );
+    }
+    if (
+      Object.prototype.hasOwnProperty.call(input, "landedStateDigest") ||
+      Object.prototype.hasOwnProperty.call(input, "financialOutcomeDigest")
+    ) {
+      throw new ResolutionEvidenceError(
+        `Landing reconciliation refused for attempt ${attemptId}: caller-supplied digests are not accepted (round 3, R4') — the barrier rests on financial reconciliation evidence fetched and digested by the store's configured verifier, not on hashes a caller presents.`,
         { attemptId },
       );
     }
@@ -2087,7 +2665,27 @@ export class DurableQuoteStore extends QuoteStore {
     if (this.faults?.beforePersist) {
       try { this.faults.beforePersist("reconcileLandedAttempt"); } catch (e) { this.failPoison("reconcileLandedAttempt", e); }
     }
-    const reconciledAt = this.nowFn().toISOString();
+    // Capability + establishment run BEFORE the transaction: the
+    // store invokes ITS OWN verifier, which fetches the financial
+    // reconciliation record from its source and mints the branded
+    // token. Establishment refusals are evidence refusals, not
+    // persistence failures — they propagate without poisoning.
+    if (!this.evidenceVerifier) {
+      throw new ResolutionEvidenceError(
+        `Landing reconciliation refused for attempt ${attemptId}: this store has no provider-evidence verifier configured — the RECONCILIATION capability is absent (fail closed): the barrier can only rest on reconciliation evidence established through a configured verifier.`,
+        { attemptId },
+      );
+    }
+    const preAttempt = this.getAttempt(attemptId)!;
+    const preResolution = this.terminalResolutionFor(attemptId);
+    if (preAttempt.state !== "INDETERMINATE" || !preResolution || preResolution.classification !== "CONFIRMED_LANDING") {
+      throw new ResolutionEvidenceError(
+        `Landing reconciliation refused for attempt ${attemptId}: the attempt carries no VERIFIED terminal CONFIRMED_LANDING resolution — there is no established landing to reconcile.`,
+        { attemptId },
+      );
+    }
+    const token = this.evidenceVerifier.establishReconciliation(preAttempt, preResolution);
+    const reconciledAt = token.reconciledAt;
     let record: StoredLandingReconciliation | undefined;
     try {
       const tx = this.db.transaction(() => {
@@ -2100,20 +2698,32 @@ export class DurableQuoteStore extends QuoteStore {
         }
         const resolution = this.terminalResolutionFor(attemptId);
         if (!resolution || resolution.classification !== "CONFIRMED_LANDING") {
-          refuse("the attempt carries no terminal CONFIRMED_LANDING resolution — there is no established landing to reconcile");
+          refuse("the attempt carries no VERIFIED terminal CONFIRMED_LANDING resolution — there is no established landing to reconcile");
         }
-        if (this.landingReconciliationFor(attemptId)) {
+        if (this.landingReconciliationRecordFor(attemptId)) {
           refuse("ALREADY_RECONCILED: a landing reconciliation is already recorded for this attempt; the barrier record is append-only and singular");
         }
         const operatorId = typeof input.operatorId === "string" ? input.operatorId.trim() : "";
         if (!operatorId) refuse("a non-empty operatorId is required — an unattributed reconciliation is not auditable");
         const justification = typeof input.justification === "string" ? input.justification.trim() : "";
         if (!justification) refuse("a non-empty justification is required");
-        if (input.landedStateDigest !== resolution!.observedProviderStateDigest) {
-          refuse("landedStateDigest does not equal the digest of the landed state the resolution established — the reconciliation must be OF the established landed state, not of some other state");
+        // The token must be the one THIS store's verifier minted
+        // for THIS attempt and THIS resolution, unaltered since
+        // minting (defense in depth: this store just minted it via
+        // its own verifier above; the checks keep the acceptance
+        // rule identical in form to resolveAttempt's).
+        if (!establishedReconciliationTokens.has(token)) {
+          refuse("the reconciliation evidence was not established by a provider-evidence verifier");
         }
-        if (typeof input.financialOutcomeDigest !== "string" || !/^[0-9a-f]{64}$/.test(input.financialOutcomeDigest)) {
-          refuse("financialOutcomeDigest must be a 64-character lowercase hex sha256 of the deployment's financial reconciliation record");
+        const binding = establishedReconciliationBindings.get(token)!;
+        if (binding.verifier !== this.evidenceVerifier) {
+          refuse("the reconciliation evidence was minted by a different verifier instance than the one configured on this store (verifier mismatch)");
+        }
+        if (binding.attemptId !== attemptId || sha256(canonicalStringify(token)) !== binding.contentDigest) {
+          refuse("the reconciliation evidence token is not bound to this attempt or was altered after minting");
+        }
+        if (token.resolutionReference !== resolution!.evidenceReference || token.landedStateDigest !== resolution!.observedProviderStateDigest) {
+          refuse("the reconciliation evidence is not bound to this attempt's established landing resolution");
         }
         const payloadFields = {
           reconciliationId: `rec_${sha256(`${attemptId}|${reconciledAt}|landing`).slice(0, 24)}`,
@@ -2121,26 +2731,28 @@ export class DurableQuoteStore extends QuoteStore {
           quoteId: attempt.quoteId,
           subscriptionId: attempt.subscriptionId,
           landedStateVersion: resolution!.landedStateVersion!,
-          landedStateDigest: input.landedStateDigest,
-          financialOutcomeDigest: input.financialOutcomeDigest,
+          landedStateDigest: token.landedStateDigest,
+          financialOutcomeDigest: token.financialOutcomeDigest,
           operatorId,
           reconciledAt,
           justification,
+          trustTier: "VERIFIED" as ResolutionTrustTier,
+          evidenceReference: token.evidenceReference as string | null,
         };
         const recordHash = sha256(canonicalStringify(payloadFields));
         record = { ...payloadFields, recordHash };
         this.db.prepare(
-          `INSERT INTO landing_reconciliations (reconciliation_id, attempt_id, quote_id, subscription_id, landed_state_version, landed_state_digest, financial_outcome_digest, operator_id, reconciled_at, justification, payload_json, record_hash)
-           VALUES (?,?,?,?,?,?,?,?,?,?,?,?)`,
+          `INSERT INTO landing_reconciliations (reconciliation_id, attempt_id, quote_id, subscription_id, landed_state_version, landed_state_digest, financial_outcome_digest, operator_id, reconciled_at, justification, payload_json, record_hash, trust_tier, evidence_reference)
+           VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
         ).run(
           record.reconciliationId, record.attemptId, record.quoteId, record.subscriptionId, record.landedStateVersion,
           record.landedStateDigest, record.financialOutcomeDigest, record.operatorId, record.reconciledAt,
-          record.justification, encodeRecordJson(payloadFields), record.recordHash,
+          record.justification, encodeRecordJson(payloadFields), record.recordHash, record.trustTier, record.evidenceReference,
         );
         this.faults?.insidePersistTx?.("reconcileLandedAttempt");
         this.db.prepare(`INSERT INTO attempt_history (attempt_id, state, at, note) VALUES (?,?,?,?)`).run(
           attemptId, attempt.state, reconciledAt,
-          `landing reconciliation recorded (landed state version ${record.landedStateVersion}; landed-state checksum ${record.landedStateDigest.slice(0, 12)}…; financial-outcome checksum ${record.financialOutcomeDigest.slice(0, 12)}…): ${justification}`,
+          `landing reconciliation recorded (VERIFIED; landed state version ${record.landedStateVersion}; landed-state checksum ${record.landedStateDigest.slice(0, 12)}…; financial-outcome checksum ${record.financialOutcomeDigest.slice(0, 12)}…; reconciliation evidence ${token.evidenceSource} ${token.evidenceReference}): ${justification}`,
         );
       });
       tx.immediate();
@@ -2226,6 +2838,14 @@ export class DurableQuoteStore extends QuoteStore {
       // verbatim (the state field above is never rewritten).
       const resolutionRecords = a.state === "INDETERMINATE" ? this.resolutionsForAttempt(a.attemptId) : [];
       const terminalResolution = a.state === "INDETERMINATE" ? this.terminalResolutionFor(a.attemptId) : undefined;
+      // Round 3: an ASSERTED terminal claim (operator-asserted, no
+      // verified evidence) is surfaced as a claim — classification
+      // shown, tier marked unverified, intervention still required.
+      // It is never reported with the VERIFIED derivations.
+      const assertedTerminal =
+        a.state === "INDETERMINATE" && !terminalResolution
+          ? [...resolutionRecords].reverse().find((r) => r.classification !== "UNRESOLVED" && r.trustTier === "ASSERTED")
+          : undefined;
       const landingReconciled = terminalResolution?.classification === "CONFIRMED_LANDING"
         ? this.landingReconciliationFor(a.attemptId) !== undefined
         : false;
@@ -2241,7 +2861,9 @@ export class DurableQuoteStore extends QuoteStore {
               ? landingReconciled
                 ? "Resolved as CONFIRMED_LANDING and reconciled: the subscription is unblocked for fresh quotes validated against the landed state only; the original quote remains blocked. No automatic re-dispatch is permitted."
                 : "Resolved as CONFIRMED_LANDING from established provider evidence, but the landing is not yet reconciled: record the landed-state reconciliation (reconcileLandedAttempt) before any subscription-wide unblock — until then this attempt blocks the whole subscription. No automatic re-dispatch is permitted."
-              : "Reconcile manually from provider records; only after reconciliation establishes the outcome from structured, operation-bound provider evidence may an operator explicitly resolve this attempt (resolveAttempt) — a free-text note or a matching provider-state snapshot is not sufficient evidence. No automatic re-dispatch is permitted."
+              : assertedTerminal
+                ? `An operator claim of ${assertedTerminal.classification} is recorded but UNVERIFIED (asserted only — no provider evidence was established through this store's configured verifier): this attempt remains blocked until verified evidence resolves it. No automatic re-dispatch is permitted.`
+                : "Reconcile manually from provider records; only after reconciliation establishes the outcome from structured, operation-bound provider evidence may an operator explicitly resolve this attempt (resolveAttempt) — a free-text note or a matching provider-state snapshot is not sufficient evidence. No automatic re-dispatch is permitted."
           : a.state === "DISPATCHING"
             ? "Treat as potentially dispatched: reconcile from provider records before any further action. No re-dispatch."
             : "None.";
@@ -2273,8 +2895,9 @@ export class DurableQuoteStore extends QuoteStore {
         ...(a.state === "INDETERMINATE"
           ? {
               resolution: {
-                classification: terminalResolution?.classification ?? "UNRESOLVED",
-                evidenceHash: terminalResolution?.evidenceHash ?? resolutionRecords[resolutionRecords.length - 1]?.evidenceHash ?? null,
+                classification: terminalResolution?.classification ?? assertedTerminal?.classification ?? "UNRESOLVED",
+                trustTier: terminalResolution ? "VERIFIED" : assertedTerminal ? "ASSERTED_UNVERIFIED" : null,
+                evidenceHash: terminalResolution?.evidenceHash ?? assertedTerminal?.evidenceHash ?? resolutionRecords[resolutionRecords.length - 1]?.evidenceHash ?? null,
               },
             }
           : {}),
