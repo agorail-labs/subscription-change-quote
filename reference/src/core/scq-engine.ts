@@ -1160,6 +1160,15 @@ export function checkAcceptanceEnvelope(
  *    present and malformed-envelope paths never had the skip:
  *    their contradiction checks were already unconditional, as
  *    is the store recomputation that routes through here.)
+ *  - Issue #29 (G-01 / V62-EVD-01): the same record-internal
+ *    logic extends from unit statements to the FIGURES. A
+ *    committed record carrying defined_equal_exact whose
+ *    established figure on a comparable dimension differs from
+ *    the quoted figure contradicts its label on its face and
+ *    classifies VIOLATED on every path — within envelope
+ *    tolerance, behind a malformed bound, with no envelope, and
+ *    for recurring decreases the envelope never bounds. See the
+ *    computation site below; pinned by test53.
  */
 export function reconcileCommittedEffect(
   quoted: CommercialEffect,
@@ -1186,6 +1195,36 @@ export function reconcileCommittedEffect(
   const unitContradiction = unitProblems.find((p) => p.kind === "contradiction");
   const unitUnestablishable = unitProblems.filter((p) => p.kind === "unestablishable");
   const unestablishableDims = new Set(unitUnestablishable.map((p) => p.dimension));
+
+  // Issue #29 (G-01 / V62-EVD-01 closure): the defined_equal_exact
+  // label is not merely a source classification — it is the claim
+  // "committed := quoted BY PROTOCOL DEFINITION" (§3.11). The
+  // P16-3 doctrine already judges that claim against the record's
+  // own UNIT statements; the same record-internal logic applies to
+  // the FIGURES themselves. Where both sides of a dimension are
+  // established (comparable) and the committed record carries the
+  // label, a committed figure that differs from the quoted figure
+  // contradicts the label on its face: the record is, by its own
+  // numbers, not the quoted figures. That contradiction is
+  // established evidence on every path — the caller's acceptance
+  // envelope governs drift in established ACTUALS (provider_actual
+  // figures within tolerance reconcile OK, unchanged), not an
+  // identity claim the record itself falsifies; and a recurring
+  // DECREASE, which the envelope never bounds, equally falsifies
+  // an equality claim. This check authenticates nothing — the
+  // G-01 trust limitation stands (an adapter's classification is
+  // still taken at its word) — it only refuses to let the label
+  // certify figures the record itself shows to be different.
+  const definedEqualFigureContradiction =
+    committed.provenance?.committedSource === "defined_equal_exact"
+      ? assessments.find((d) => d.comparable && d.quoted.value !== d.compared.value)
+      : undefined;
+  const definedEqualContradictionDetail = definedEqualFigureContradiction
+    ? `the committed record carries the defined_equal_exact provenance label, which asserts committed := quoted ` +
+      `by protocol definition (§3.11), but the record's own established ${definedEqualFigureContradiction.dimension} ` +
+      `figure (${definedEqualFigureContradiction.compared.value}) differs from the quoted figure ` +
+      `(${definedEqualFigureContradiction.quoted.value}) — the record contradicts its label on its face`
+    : "";
 
   // PR-15 correction (P15-1): ONLY `undefined` is an omitted
   // envelope. The pre-correction `if (!envelope)` also routed
@@ -1237,6 +1276,17 @@ export function reconcileCommittedEffect(
               `by definition — it excuses absent unit statements only and cannot override the record's own explicit ` +
               `unit statements (second correction round, P16-3).`
             : ``),
+      };
+    }
+    if (definedEqualFigureContradiction) {
+      return {
+        status: "VIOLATED",
+        reason:
+          `Post-commit reconciliation failed: no acceptance envelope applies, and ${definedEqualContradictionDetail}. ` +
+          `A label contradiction is established evidence and is envelope-independent: no tolerance comparison is ` +
+          `needed to know that figures differing from the quote are not the quoted figures the label asserts. The ` +
+          `mutation has already occurred and cannot be rolled back by this reconciliation check; it exists solely ` +
+          `so this is never reported silently.`,
       };
     }
     if (!definedEqualByConstruction) {
@@ -1322,6 +1372,17 @@ export function reconcileCommittedEffect(
           `check; it exists solely so this is never reported silently.`,
       };
     }
+    if (definedEqualFigureContradiction) {
+      return {
+        status: "VIOLATED",
+        reason:
+          `Post-commit reconciliation failed: ${definedEqualContradictionDetail}. A label contradiction is ` +
+          `established from the record itself, so it classifies even though the recorded envelope is ` +
+          `additionally malformed (${envelopeProblem}) — the malformed bound does not downgrade it to ` +
+          `unverifiable. The mutation has already occurred and cannot be rolled back by this reconciliation ` +
+          `check; it exists solely so this is never reported silently.`,
+      };
+    }
     return {
       status: "UNVERIFIED",
       reason:
@@ -1356,6 +1417,17 @@ export function reconcileCommittedEffect(
         `${unitContradiction.detail}. The numeric comparison is not meaningful across differing units, so numeric ` +
         `equality does not reconcile this commit. The mutation has already occurred and cannot be rolled back by ` +
         `this reconciliation check; it exists solely so this is never reported silently.`,
+    };
+  }
+  if (definedEqualFigureContradiction) {
+    return {
+      status: "VIOLATED",
+      reason:
+        `Post-commit reconciliation failed: ${definedEqualContradictionDetail}. The acceptance envelope governs ` +
+        `drift in established actuals; it cannot make a record into the quoted figures its label asserts it is — ` +
+        `a difference within tolerance, and a recurring decrease the envelope does not bound, falsify the ` +
+        `equality claim exactly as a difference beyond tolerance does. The mutation has already occurred and ` +
+        `cannot be rolled back by this reconciliation check; it exists solely so this is never reported silently.`,
     };
   }
   let violation: string | null = null;
