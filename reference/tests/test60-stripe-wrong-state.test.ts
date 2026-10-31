@@ -200,7 +200,7 @@ test("Test 60.6: EXACT update whose post-mutation state is MISSING is COMMITTED_
     recurringFinancialEffect: "UNKNOWN",
   });
   const replay = await adapter.commitChangeQuote(quoteId);
-  assert.equal(replay, receipt, "the recorded receipt replays verbatim; no second dispatch is attempted against missing state");
+  assert.deepEqual(replay, receipt, "the recorded receipt replays verbatim; no second dispatch is attempted against missing state");
 });
 
 test("Test 60.7: EXACT update with a LOST RESPONSE is INDETERMINATE and is never blindly retried", async () => {
@@ -315,7 +315,7 @@ test("Test 60.12: a VIOLATED receipt replays verbatim (no re-dispatch), and the 
   const receipt = await adapter.commitChangeQuote(quoteId);
   assert.equal(receipt.reconciliation.status, "VIOLATED");
   const replay = await adapter.commitChangeQuote(quoteId);
-  assert.equal(replay, receipt, "idempotent replay returns the recorded receipt; the mutation is not re-dispatched");
+  assert.deepEqual(replay, receipt, "idempotent replay returns the recorded receipt; the mutation is not re-dispatched");
   assert.equal(sim.retrieve(sub.id).items[0].quantity, 130, "persisted state untouched by the replay");
   const quote2Id = await exactQuantityQuote(adapter, store, sub.id, 140);
   const receipt2 = await adapter.commitChangeQuote(quote2Id);
