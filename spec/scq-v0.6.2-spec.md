@@ -296,7 +296,7 @@ type SubscriptionChangeReceipt = {
   outcome?: MutationOutcome;                  // v0.6.2 NEW — see §3.12
   resultingSnapshot: SubscriptionSnapshot;
   quotedEffect: CommercialEffect;      // immutable historical record from quote time
-  committedEffect: CommercialEffect;   // what was actually true at mutation time
+  committedEffect: CommercialEffect;   // committed-effect information for the operation (see below)
   guaranteeMode: GuaranteeMode;
   consistencyGuarantee: ConsistencyGuarantee;
   multiChangeConsistency: MultiChangeConsistency;
@@ -307,6 +307,13 @@ type SubscriptionChangeReceipt = {
 
 - A receipt MUST always carry both `quotedEffect` and `committedEffect`, regardless of
   guarantee mode.
+- `committedEffect` records committed-effect *information* for the operation. Whether
+  any figure in it is an established actual or a candidate is determined by that
+  dimension's determinacy (§3.10) and provenance (§3.11 — `committedSource` and the
+  per-dimension determinacy record), NOT by the field's presence: a
+  COMMITTED_UNVERIFIED receipt's `committedEffect` may carry labeled candidates
+  (`committedSource: "unestablished"`) that only later §6.15 evidence can establish,
+  refine, or contradict.
 - For `EXACT`: equality between `quotedEffect` and `committedEffect` is defined over the
   **covered, economically relevant effect dimensions** — it is NOT whole-object deep
   equality. For each dimension under the applicable EXACT `GuaranteeCoverage`
@@ -1206,10 +1213,13 @@ MUST persist quotes, receipts, and mutation attempts durably, such that:
   persisted current view: the persisted view is adopted only if it deep-equals the
   derived view, and adoption installs the derived view; an incoherent restore set is
   rejected atomically, as a whole, at both restore paths (in-memory and durable).
-  Appends are atomic at the stated boundary: in-memory append + derivation is one
-  synchronous step; the durable store persists quote row + receipt record in one SQLite
-  transaction and poisons on failure, so an interrupted append recovers exactly the
-  pre- or post-append record — never a promoted view without its evidence. Legacy
+  Appends MUST be atomic at the stated boundary: appending an evidence entry and
+  updating the derived view take effect as one atomic step, in memory and in durable
+  persistence alike, so an interrupted append recovers exactly the pre-append or the
+  post-append record — never a promoted view without its evidence, and never a
+  partial trail presented as complete. (How a store realizes this atomicity is
+  implementation-specific and informative; see the non-normative note closing this
+  section.) Legacy
   one-transition trails in the historical entry shape are accepted and normalized at
   recovery, with their view re-derived under §6.15 — a legacy record carrying a
   verified label over unestablished figures restores truthfully rather than refusing or
@@ -1287,9 +1297,12 @@ MUST persist quotes, receipts, and mutation attempts durably, such that:
 
 *Informative (non-normative):* the reference implementation realizes this section with
 SQLite (WAL mode, `synchronous=FULL`) via an optional native dependency, per-quote
-version compare-and-swap write-through, and SHA-256 record digests. Those mechanics are
-one conforming realization, not protocol requirements; another store providing the same
-guarantees conforms equally.
+version compare-and-swap write-through, and SHA-256 record digests. In particular, it
+realizes the append-atomicity requirement above by persisting each record (quote row
++ receipt record) in a single SQLite transaction, and it poisons the store on a
+persistence failure rather than serving state whose durability is in doubt. Those
+mechanics are one conforming realization, not protocol requirements; another store
+providing the same guarantees conforms equally.
 
 **6.17 (v0.6.2 NEW — authorization preservation; PR #24)** Where a commit's dispatch
 mechanism cannot preserve state outside the authorized operation's target, the
@@ -1335,12 +1348,19 @@ fingerprint handling and before any re-preview, durable attempt, or dispatch:
   `REVALIDATE` are valid; an explicit `null` is INVALID (the null asymmetry with
   `authorizationScope`, which reads `null` as absent, is deliberate and stated here so
   it is spec, not folklore).
-- **Envelope shape.** A supplied `acceptanceEnvelope` MUST be a plain object carrying
-  only the three named bounds (`maxImmediateNetIncrease`,
-  `maxImmediateCreditDecrease`, `maxRecurringIncrease`), each a finite, non-negative
-  number, read via OWN properties
-  only (inherited bounds never widen tolerance; engine-constructed envelopes are built
-  so a polluted prototype cannot smuggle a bound). Only `undefined` is omission: falsy
+- **Envelope shape.** A supplied `acceptanceEnvelope` MUST be a non-null, non-array
+  object. Only the three named bounds (`maxImmediateNetIncrease`,
+  `maxImmediateCreditDecrease`, `maxRecurringIncrease`) are read, each a finite,
+  non-negative number, and only as OWN properties (inherited bounds never widen
+  tolerance; engine-constructed envelopes are built so a polluted prototype cannot
+  smuggle a bound); any own enumerable key outside the three names refuses the
+  envelope as malformed. The envelope's prototype is NOT inspected: this rule
+  specifies the implemented acceptance shape, not plain-objectness — a class instance
+  or built-in object (for example a `Date` or a `Map`) carrying no own fields is
+  therefore accepted as a bound-less envelope, with the missing-bounds default of
+  §6.13 applying. Requiring a true plain object (a prototype check) would refuse
+  envelopes the implementation currently accepts and is tracked as an OPEN DECISION
+  (gap register G-22), not imposed here. Only `undefined` is omission: falsy
   supplied envelopes (`null`, `false`, `0`, `""`) are malformed, not omitted. Whether
   bounds must additionally be *safe integers* is an OPEN DECISION (gap register G-18):
   this candidate specifies the implemented finite-non-negative rule and records the
@@ -1640,8 +1660,9 @@ Runtime proposal validation (§6.18): **V62-RTV-01** shared runtime validation a
 creation (first statement) and over the stored record at commit (after §6.10 replay,
 before re-preview/attempts/dispatch) · **V62-RTV-02** guaranteeMode: omitted ⇒
 REVALIDATE; only EXACT/REVALIDATE valid; explicit null invalid · **V62-RTV-03**
-envelope shape: plain object, only the three named bounds, finite non-negative numbers,
-own-property reads only; only undefined is omission · **V62-RTV-04**
+envelope shape: non-null, non-array object (prototype NOT inspected — the stricter
+plain-object rule is OPEN, G-22), only the three named bounds as own properties, finite
+non-negative numbers; only undefined is omission · **V62-RTV-04**
 reconcileCommittedEffect never throws: malformed envelope post-commit classifies
 VIOLATED through interpretable bounds, else UNVERIFIED, never OK · **V62-RTV-05**
 envelope-presence enforcement at creation after effectiveIntent support checks
