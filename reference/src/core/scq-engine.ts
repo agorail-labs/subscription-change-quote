@@ -1168,7 +1168,7 @@ export function checkAcceptanceEnvelope(
  *    classifies VIOLATED on every path — within envelope
  *    tolerance, behind a malformed bound, with no envelope, and
  *    for recurring decreases the envelope never bounds. See the
- *    computation site below; pinned by test53.
+ *    computation site below; pinned by test54.
  */
 export function reconcileCommittedEffect(
   quoted: CommercialEffect,
