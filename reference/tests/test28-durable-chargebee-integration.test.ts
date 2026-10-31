@@ -1,6 +1,24 @@
-import { test } from "node:test";
+import { after, test } from "node:test";
 import assert from "node:assert/strict";
-import { mkdtempSync } from "node:fs";
+import { mkdtempSync, rmSync } from "node:fs";
+
+// ---------------------------------------------------------------------------
+// Temp-dir cleanup (test infrastructure): every directory handed out via
+// trackTempDir is removed when this file's tests finish — pass or fail —
+// so repeated suite runs do not accumulate scq-* litter in the OS temp
+// dir. Cleanup runs only after the owning tests complete; durable-store
+// tests that reopen a store across simulated restarts within one test
+// are unaffected.
+// ---------------------------------------------------------------------------
+const tempDirs: string[] = [];
+function trackTempDir(dir: string): string {
+  tempDirs.push(dir);
+  return dir;
+}
+after(() => {
+  for (const dir of tempDirs.splice(0)) rmSync(dir, { recursive: true, force: true });
+});
+
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { SCQError } from "../src/core/types.js";
@@ -27,7 +45,7 @@ const PROPOSAL = (qty: number) => ({
 });
 
 function tmpDb(): string {
-  return join(mkdtempSync(join(tmpdir(), "scq-pr8-int-")), "scq.db");
+  return join(trackTempDir(mkdtempSync(join(tmpdir(), "scq-pr8-int-"))), "scq.db");
 }
 
 function durableAdapter(path: string, mock: PilotMockChargebee) {

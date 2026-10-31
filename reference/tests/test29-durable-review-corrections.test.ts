@@ -1,6 +1,24 @@
-import { test } from "node:test";
+import { after, test } from "node:test";
 import assert from "node:assert/strict";
-import { mkdtempSync } from "node:fs";
+import { mkdtempSync, rmSync } from "node:fs";
+
+// ---------------------------------------------------------------------------
+// Temp-dir cleanup (test infrastructure): every directory handed out via
+// trackTempDir is removed when this file's tests finish — pass or fail —
+// so repeated suite runs do not accumulate scq-* litter in the OS temp
+// dir. Cleanup runs only after the owning tests complete; durable-store
+// tests that reopen a store across simulated restarts within one test
+// are unaffected.
+// ---------------------------------------------------------------------------
+const tempDirs: string[] = [];
+function trackTempDir(dir: string): string {
+  tempDirs.push(dir);
+  return dir;
+}
+after(() => {
+  for (const dir of tempDirs.splice(0)) rmSync(dir, { recursive: true, force: true });
+});
+
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { SCQError, type SubscriptionChangeReceipt } from "../src/core/types.js";
@@ -23,7 +41,7 @@ import { makeObservation, makeReceipt, makeStoredQuote, makeUnverifiedReceipt } 
 // traffic is the pilot mocked transport — SIMULATED_PASS at best.
 
 function tmpDb(name = "scq.db"): string {
-  const dir = mkdtempSync(join(tmpdir(), "scq-pr8-review-"));
+  const dir = trackTempDir(mkdtempSync(join(tmpdir(), "scq-pr8-review-")));
   return join(dir, name);
 }
 function openStore(path: string, opts: Record<string, unknown> = {}): DurableQuoteStore {

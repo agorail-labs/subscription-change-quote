@@ -63,9 +63,27 @@
  * injected mocked transport. No network, no credentials,
  * SCQ_LIVE_COMMIT_ENABLED never set. Evidence class: SIMULATED.
  */
-import { test } from "node:test";
+import { after, test } from "node:test";
 import assert from "node:assert/strict";
-import { mkdtempSync } from "node:fs";
+import { mkdtempSync, rmSync } from "node:fs";
+
+// ---------------------------------------------------------------------------
+// Temp-dir cleanup (test infrastructure): every directory handed out via
+// trackTempDir is removed when this file's tests finish — pass or fail —
+// so repeated suite runs do not accumulate scq-* litter in the OS temp
+// dir. Cleanup runs only after the owning tests complete; durable-store
+// tests that reopen a store across simulated restarts within one test
+// are unaffected.
+// ---------------------------------------------------------------------------
+const tempDirs: string[] = [];
+function trackTempDir(dir: string): string {
+  tempDirs.push(dir);
+  return dir;
+}
+after(() => {
+  for (const dir of tempDirs.splice(0)) rmSync(dir, { recursive: true, force: true });
+});
+
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { QuoteStore } from "../src/store/quote-store.js";
@@ -761,7 +779,7 @@ test("Test 48.16: tampered stored financial fields refuse at commit before dispa
     { label: "stored proposal guaranteeMode typo", tamper: (s) => { s.proposal = { ...s.proposal, guaranteeMode: "EXACTLY" }; } },
   ];
   for (const { label, tamper } of cases) {
-    const path = join(mkdtempSync(join(tmpdir(), "scq-pr15-")), "scq.db");
+    const path = join(trackTempDir(mkdtempSync(join(tmpdir(), "scq-pr15-"))), "scq.db");
     const durable = new DurableQuoteStore(path, { recoveryGraceMs: 0 });
     const h = liveHarness(durable);
     const adapter = new ChargebeeLiveAdapter(

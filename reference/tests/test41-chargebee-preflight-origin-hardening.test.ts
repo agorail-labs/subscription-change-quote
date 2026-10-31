@@ -1,6 +1,24 @@
-import { test } from "node:test";
+import { after, test } from "node:test";
 import assert from "node:assert/strict";
-import { appendFileSync, mkdtempSync, readFileSync, writeFileSync } from "node:fs";
+import { appendFileSync, mkdtempSync, readFileSync, writeFileSync, rmSync } from "node:fs";
+
+// ---------------------------------------------------------------------------
+// Temp-dir cleanup (test infrastructure): every directory handed out via
+// trackTempDir is removed when this file's tests finish — pass or fail —
+// so repeated suite runs do not accumulate scq-* litter in the OS temp
+// dir. Cleanup runs only after the owning tests complete; durable-store
+// tests that reopen a store across simulated restarts within one test
+// are unaffected.
+// ---------------------------------------------------------------------------
+const tempDirs: string[] = [];
+function trackTempDir(dir: string): string {
+  tempDirs.push(dir);
+  return dir;
+}
+after(() => {
+  for (const dir of tempDirs.splice(0)) rmSync(dir, { recursive: true, force: true });
+});
+
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { ChargebeeClient, type HttpTransport } from "../src/live/chargebee-http.js";
@@ -44,7 +62,7 @@ const PROPOSAL = (qty: number) => ({
 });
 
 function tmpDir(): string {
-  return mkdtempSync(join(tmpdir(), "scq-pr20-origin-hardening-"));
+  return trackTempDir(mkdtempSync(join(tmpdir(), "scq-pr20-origin-hardening-")));
 }
 
 type Fixture = { path: string; quoteId: string; mock: PilotMockChargebee; manifest: QuoteOriginManifest };
