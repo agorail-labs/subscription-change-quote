@@ -35,6 +35,7 @@ import {
   determinacyOf,
 } from "../core/scq-engine.js";
 import { QuoteStore, establishVerification, type StoredQuote } from "../store/quote-store.js";
+import { verifyPostCommitState } from "../core/state-verification.js";
 import {
   StripeSim,
   StripeSimError,
@@ -789,24 +790,28 @@ export class StripeAdapter implements SubscriptionProvider {
     let snap: SubscriptionSnapshot;
 
     if (isCancel || effectiveMode === "EXACT") {
-      // Defined equality (CORE-2): EXACT commits reproduce the
-      // quoted effect BY PROTOCOL DEFINITION (proration_date replay
-      // pins the basis; CANCEL has no proration component), so the
-      // committed figures ARE the quoted figures, honestly labeled
-      // defined_equal_exact — not a preview passed off as an actual.
-      committedEffect = {
-        ...validated.quoted_effect,
-        provenance: { ...validated.quoted_effect.provenance, committedSource: "defined_equal_exact" },
-      };
-      // v0.6.1 post-commit reconciliation, retained for this path:
-      // re-check the committed effect against the same envelope used
-      // pre-mutation. It cannot undo the mutation; it exists so a
-      // violation is never silent.
-      reconciliation = reconcileCommittedEffect(validated.quoted_effect, committedEffect, proposal.acceptanceEnvelope, proposal);
-      receiptStatus = "COMMITTED";
-      receiptOutcome = "COMMITTED_AND_VERIFIED";
-      snap = snapshotFrom(resultingSub);
-      snap.version = this.sim.fingerprint(validated.subscription_id);
+      // Issue #44 (G-21 item 1): this branch used to record
+      // COMMITTED_AND_VERIFIED from the mutation RETURN alone —
+      // committed figures were the quoted figures relabelled
+      // defined_equal_exact, reconciliation compared the quote
+      // against its own copy, and the receipt snapshot was built
+      // from the returned object, with no independent read of
+      // persisted state and no §6.12 state verification. A
+      // mutation landing the wrong state behind a success
+      // response therefore verified (test60.1–60.6, failing-first).
+      // The defined_equal_exact construction is retained — it is
+      // the contract-defined equality of the FIGURES (§3.9/§3.11)
+      // — but only once an independent post-commit read has
+      // VERIFIED the landed state under §6.12, as §6.15 requires
+      // before a verified receipt is recorded. The establishment
+      // itself lives in establishExactOrCancelEffect below and
+      // mirrors the REVALIDATE arm's discipline.
+      const established = this.establishExactOrCancelEffect(validated, resultingSub, mutationInvoice);
+      committedEffect = established.effect;
+      reconciliation = established.reconciliation;
+      receiptStatus = established.status;
+      receiptOutcome = established.outcome;
+      snap = established.snapshot;
     } else {
       // REVALIDATE: committed actuals are established from
       // post-commit state read back after the mutation — never from
@@ -838,6 +843,330 @@ export class StripeAdapter implements SubscriptionProvider {
     // it finds status === "COMMITTED" (see checkIdempotentReplay).
     this.store.recordCommitReceipt(quoteId, receipt);
     return receipt;
+  }
+
+  /**
+   * Issue #44 (G-21 item 1): establishes an EXACT / CANCEL commit's
+   * outcome from an INDEPENDENT post-commit read of persisted
+   * simulator state — never from the mutation return — as §6.12
+   * and §6.15 require before a verified receipt is recorded.
+   *
+   * The state verdict is COMPUTED by the shared core hook
+   * `verifyPostCommitState` over a snapshot built from a fresh
+   * `retrieve`, against the folded intent; for a TERM_END CANCEL
+   * the authorized boundary comes from the expectation side (the
+   * quoted effect's effectiveAt) and the schedule evidence from
+   * the persisted record itself (`cancel_at_period_end` +
+   * `current_period_end`, or `canceled_at`) — the fields the sim's
+   * subscription record carries, read back after the mutation.
+   *
+   * Outcomes:
+   *  - state VERIFIED (+ attribution intact for EXACT updates):
+   *    the historical construction — committed figures ARE the
+   *    quoted figures, labelled defined_equal_exact (contract-
+   *    defined equality of FIGURES, §3.9/§3.11; the G-01 trust
+   *    limitation stands: the label is a classification, not
+   *    authentication of provider origin) — COMMITTED /
+   *    COMMITTED_AND_VERIFIED with the envelope reconciliation.
+   *  - state MISMATCH: the landing is ESTABLISHED and contradicts
+   *    intent — a determined negative verification (Decision D3):
+   *    COMMITTED / COMMITTED_AND_VERIFIED with a VIOLATED
+   *    reconciliation and the OBSERVED actuals recorded
+   *    (provider_actual; for EXACT, the immediate is this
+   *    mutation's bound-invoice actual where readable, else that
+   *    dimension stays UNKNOWN — the state violation is
+   *    established either way and is never downgraded by an
+   *    unestablished financial dimension, §6.14 precedence).
+   *    Never non-execution, never INDETERMINATE: the response was
+   *    received and the state was read.
+   *  - state UNVERIFIABLE, the read unavailable (including the
+   *    persisted record missing), or — for EXACT updates — an
+   *    intervening invoice breaking attribution (the M3 rule the
+   *    REVALIDATE arm applies): COMMITTED_UNVERIFIED with an
+   *    UNVERIFIED reconciliation; the recorded figures are the
+   *    mutation response's candidates, labelled unestablished
+   *    under UNKNOWN determinacy (or, in the attribution case
+   *    where the bound invoice IS readable, this commit's own
+   *    bound-invoice actuals — never the intervening invoice's).
+   */
+  private establishExactOrCancelEffect(
+    validated: StoredQuote,
+    mutationSub: StripeSubscription,
+    mutationInvoice: StripeInvoice | undefined
+  ): {
+    effect: CommercialEffect;
+    reconciliation: ReconciliationResult;
+    status: SubscriptionChangeReceipt["status"];
+    outcome: MutationOutcome;
+    snapshot: SubscriptionSnapshot;
+  } {
+    const subscriptionId = validated.subscription_id;
+    const quoted = validated.quoted_effect;
+    const proposal = validated.proposal;
+    const isCancelCommit = proposal.changes.length === 1 && proposal.changes[0].action === "CANCEL";
+    const recurringFrom = (sub: StripeSubscription): CommercialEffect["recurring"] => ({
+      previousAmount: quoted.recurring?.previousAmount,
+      resultingAmount: sub.items.reduce((s, i) => s + i.price.unitAmount * i.quantity, 0),
+      currency: sub.items[0]?.price.currency ?? quoted.recurring?.currency ?? "usd",
+      cadence: quoted.recurring?.cadence ?? (sub.items[0]?.price.interval === "year" ? "ANNUAL" : "MONTHLY"),
+    });
+    const snapshotOf = (sub: StripeSubscription): SubscriptionSnapshot => {
+      const s = snapshotFrom(sub);
+      try {
+        s.version = this.sim.fingerprint(subscriptionId);
+      } catch {
+        // The persisted record itself is gone (the missing-state
+        // case): no fingerprint can be computed over it. The
+        // snapshot still reports the mutation response's state,
+        // with the version left empty rather than fabricated.
+        s.version = "";
+      }
+      return s;
+    };
+    const candidateFromResponse = (): CommercialEffect => ({
+      ...(!isCancelCommit && typeof mutationInvoice?.incurred_amount === "number"
+        ? { immediate: immediateParts(mutationInvoice.incurred_amount) }
+        : {}),
+      recurring: recurringFrom(mutationSub),
+      ...(quoted.term ? { term: quoted.term } : {}),
+      effectiveAt: quoted.effectiveAt,
+      determinacy: { immediateFinancialEffect: "UNKNOWN", recurringFinancialEffect: "UNKNOWN" },
+      provenance: {
+        immediate:
+          "candidate figure reported by the mutating call's own response; the independent post-commit read could not establish it, so this is NOT an established actual",
+        recurring:
+          "candidate figure from the mutating call's returned subscription; not independently re-read — NOT an established actual",
+        committedSource: "unestablished",
+      },
+    });
+
+    // Independent post-commit read of persisted simulator state.
+    let readSub: StripeSubscription | undefined;
+    try {
+      readSub = this.sim.retrieve(subscriptionId);
+    } catch {
+      readSub = undefined;
+    }
+
+    if (!readSub) {
+      return {
+        effect: candidateFromResponse(),
+        reconciliation: {
+          status: "UNVERIFIED",
+          reason:
+            "the mutation landed (its response was received) but the independent post-commit read was unavailable — " +
+            "the persisted post-commit state is missing or unreadable — so the landed state could not be verified " +
+            "under §6.12 and the committed figures could not be established; the recorded figures are the mutation " +
+            "response's candidates, pending a later verification",
+          undeterminedDimensions: ["immediateFinancialEffect", "recurringFinancialEffect"],
+        },
+        status: "COMMITTED_UNVERIFIED",
+        outcome: "COMMITTED_UNVERIFIED",
+        snapshot: snapshotOf(mutationSub),
+      };
+    }
+
+    const snap = snapshotOf(readSub);
+    // Schedule evidence for a CANCEL, from the persisted record
+    // the read returned — never from the mutation return, and
+    // never invented when the record carries none.
+    const cancellationSchedule: { kind?: "TERM_END"; effectiveAt?: string } | undefined = !isCancelCommit
+      ? undefined
+      : readSub.cancel_at_period_end
+        ? { kind: "TERM_END", effectiveAt: new Date(readSub.current_period_end * 1000).toISOString() }
+        : typeof readSub.canceled_at === "number"
+          ? { effectiveAt: new Date(readSub.canceled_at * 1000).toISOString() }
+          : undefined;
+    const state = verifyPostCommitState(
+      {
+        proposal: foldedProposal(proposal),
+        expectedSubscriptionRef: subscriptionId,
+        ...(isCancelCommit && proposal.effectiveIntent.type === "TERM_END" ? { termBoundaryAt: quoted.effectiveAt } : {}),
+      },
+      {
+        snapshot: snap,
+        source:
+          "stripe-adapter post-commit read: simulator retrieve(subscription) after an EXACT/CANCEL commit — " +
+          "independent of the mutation return (synthetic simulator observation)",
+        observedAt: new Date().toISOString(),
+        ...(cancellationSchedule ? { cancellationSchedule } : {}),
+      }
+    );
+
+    if (state.verdict === "MISMATCH") {
+      let effect: CommercialEffect;
+      if (isCancelCommit) {
+        effect = {
+          recurring: recurringFrom(readSub),
+          term: {
+            createsCommitment: false,
+            autoRenew: readSub.status === "canceled" ? false : !readSub.cancel_at_period_end,
+          },
+          effectiveAt: quoted.effectiveAt,
+          determinacy: { immediateFinancialEffect: "NOT_APPLICABLE", recurringFinancialEffect: "DETERMINED" },
+          provenance: {
+            recurring: "post-commit actual: sum over the re-read post-commit subscription's items (unitAmount x quantity) — the observed state after a mismatched cancellation",
+            applicabilityCitations: quoted.provenance?.applicabilityCitations,
+            committedSource: "provider_actual",
+          },
+        };
+      } else {
+        let readIncurred: number | undefined;
+        if (mutationInvoice) {
+          try {
+            const readInvoice = this.sim.retrieveInvoice(mutationInvoice.id);
+            if (typeof readInvoice.incurred_amount === "number" && Number.isFinite(readInvoice.incurred_amount)) {
+              readIncurred = readInvoice.incurred_amount;
+            }
+          } catch {
+            readIncurred = undefined;
+          }
+        }
+        effect =
+          readIncurred !== undefined && mutationInvoice
+            ? {
+                immediate: immediateParts(readIncurred),
+                recurring: recurringFrom(readSub),
+                ...(quoted.term ? { term: quoted.term } : {}),
+                effectiveAt: quoted.effectiveAt,
+                determinacy: { immediateFinancialEffect: "DETERMINED", recurringFinancialEffect: "DETERMINED" },
+                provenance: {
+                  immediate: provImmediateCommitted(mutationInvoice.id),
+                  recurring: PROV_RECURRING_COMMITTED,
+                  committedSource: "provider_actual",
+                },
+              }
+            : {
+                recurring: recurringFrom(readSub),
+                ...(quoted.term ? { term: quoted.term } : {}),
+                effectiveAt: quoted.effectiveAt,
+                determinacy: { immediateFinancialEffect: "UNKNOWN", recurringFinancialEffect: "DETERMINED" },
+                provenance: {
+                  immediate:
+                    "UNESTABLISHED: this mutation's bound invoice could not be read back, so the incurred obligation of the mismatched landing is not established — the state violation is established independently of this dimension",
+                  recurring: PROV_RECURRING_COMMITTED,
+                  committedSource: "provider_actual",
+                },
+              };
+      }
+      return {
+        effect,
+        reconciliation: {
+          status: "VIOLATED",
+          reason:
+            `Post-commit state verification MISMATCH — a determined negative verification (Decision D3): ` +
+            `${describeStateMismatch(foldedProposal(proposal), snap)} The committed figures recorded are the ` +
+            `observed post-commit actuals; the mutation has already occurred and cannot be rolled back by ` +
+            `this reconciliation.`,
+        },
+        status: "COMMITTED",
+        outcome: "COMMITTED_AND_VERIFIED",
+        snapshot: snap,
+      };
+    }
+
+    if (state.verdict === "UNVERIFIABLE") {
+      return {
+        effect: candidateFromResponse(),
+        reconciliation: {
+          status: "UNVERIFIED",
+          reason:
+            "the mutation landed (its response was received) and the post-commit state was read back, but the " +
+            "§6.12 state verification could not be completed from the observed state " +
+            `(unverifiable dimensions: ${state.unverifiableDimensions.join(", ") || "none named"}), so the commit ` +
+            "is not reported as verified; the recorded figures are the mutation response's candidates, pending " +
+            "a later verification",
+          undeterminedDimensions: [],
+        },
+        status: "COMMITTED_UNVERIFIED",
+        outcome: "COMMITTED_UNVERIFIED",
+        snapshot: snap,
+      };
+    }
+
+    // State VERIFIED. For EXACT updates, attribution (M3, as on
+    // the REVALIDATE arm): if the subscription's latest_invoice
+    // no longer points at THIS mutation's invoice, a later
+    // mutation intervened — the matching state was not produced
+    // by this commit alone, so the commit is capped at
+    // COMMITTED_UNVERIFIED with this commit's own bound-invoice
+    // actuals.
+    if (!isCancelCommit && mutationInvoice && readSub.latest_invoice !== mutationInvoice.id) {
+      let readIncurred: number | undefined;
+      try {
+        const readInvoice = this.sim.retrieveInvoice(mutationInvoice.id);
+        if (typeof readInvoice.incurred_amount === "number" && Number.isFinite(readInvoice.incurred_amount)) {
+          readIncurred = readInvoice.incurred_amount;
+        }
+      } catch {
+        readIncurred = undefined;
+      }
+      if (readIncurred !== undefined) {
+        return {
+          effect: {
+            immediate: immediateParts(readIncurred),
+            recurring: recurringFrom(readSub),
+            ...(quoted.term ? { term: quoted.term } : {}),
+            effectiveAt: quoted.effectiveAt,
+            determinacy: { immediateFinancialEffect: "DETERMINED", recurringFinancialEffect: "DETERMINED" },
+            provenance: {
+              immediate: provImmediateCommitted(mutationInvoice.id),
+              recurring: PROV_RECURRING_COMMITTED,
+              committedSource: "provider_actual",
+            },
+          },
+          reconciliation: {
+            status: "UNVERIFIED",
+            reason:
+              `a concurrent mutation intervened between this commit's mutation and its verification read: the ` +
+              `subscription's latest_invoice is ${readSub.latest_invoice}, not this commit's bound invoice ` +
+              `${mutationInvoice.id}, so the observed post-commit state was not produced by this commit alone ` +
+              `and cannot be attributed to it. The recorded financial figures are this commit's own ` +
+              `bound-invoice actuals, read by id; no figure was taken from the intervening invoice.`,
+            undeterminedDimensions: [],
+          },
+          status: "COMMITTED_UNVERIFIED",
+          outcome: "COMMITTED_UNVERIFIED",
+          snapshot: snap,
+        };
+      }
+      return {
+        effect: candidateFromResponse(),
+        reconciliation: {
+          status: "UNVERIFIED",
+          reason:
+            "the observed post-commit state matches this commit's intent, but a concurrent mutation superseded " +
+            "this commit's invoice before the verification read and the bound invoice itself could not be read " +
+            "back, so neither attribution nor the committed figures are established",
+          undeterminedDimensions: ["immediateFinancialEffect", "recurringFinancialEffect"],
+        },
+        status: "COMMITTED_UNVERIFIED",
+        outcome: "COMMITTED_UNVERIFIED",
+        snapshot: snap,
+      };
+    }
+
+    // Defined equality (CORE-2), now gated on the independently
+    // verified state: EXACT commits reproduce the quoted effect BY
+    // PROTOCOL DEFINITION (proration_date replay pins the basis;
+    // CANCEL has no proration component), so the committed figures
+    // ARE the quoted figures, honestly labeled defined_equal_exact
+    // — not a preview passed off as an actual.
+    const committedEffect: CommercialEffect = {
+      ...quoted,
+      provenance: { ...quoted.provenance, committedSource: "defined_equal_exact" },
+    };
+    // Post-commit reconciliation over the committed figures
+    // against the same envelope used pre-mutation. It cannot undo
+    // the mutation; it exists so a violation is never silent.
+    const reconciliation = reconcileCommittedEffect(quoted, committedEffect, proposal.acceptanceEnvelope, proposal);
+    return {
+      effect: committedEffect,
+      reconciliation,
+      status: "COMMITTED",
+      outcome: "COMMITTED_AND_VERIFIED",
+      snapshot: snap,
+    };
   }
 
   /**
@@ -1107,7 +1436,28 @@ function describeStateMismatch(proposal: SubscriptionChangeProposal, snap: Subsc
       }
       case "CANCEL": {
         const terminal = ["cancelled", "canceled", "terminated"].includes(snap.status.toLowerCase());
-        if (!terminal) fragments.push(`subscription status is ${snap.status}, intended a terminal state`);
+        const intentType = proposal.effectiveIntent?.type;
+        if (!terminal && intentType === "TERM_END") {
+          // Issue #44: a TERM_END mismatch with a live subscription
+          // is about the SCHEDULE — either none was established, or
+          // the established one's effective date (the snapshot's
+          // next billing boundary, reported here as observed data,
+          // never as the authorized boundary) is not the authorized
+          // term end.
+          if (snap.term?.autoRenew === false) {
+            fragments.push(
+              `a cancellation schedule is established effective ${snap.billing.nextBillingAt}, which is not the authorized term boundary`
+            );
+          } else {
+            fragments.push(`no cancellation schedule is established in the post-commit state (the subscription remains "${snap.status}")`);
+          }
+        } else if (terminal && intentType === "TERM_END") {
+          fragments.push(
+            `subscription status is ${snap.status} (terminal) — a premature termination, not the authorized term-end cancellation`
+          );
+        } else if (!terminal) {
+          fragments.push(`subscription status is ${snap.status}, intended a terminal state`);
+        }
         break;
       }
     }
