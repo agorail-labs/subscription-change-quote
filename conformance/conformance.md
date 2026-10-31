@@ -277,9 +277,16 @@ review are CLOSED this cycle (see above); their entries are kept below, marked c
 continuity with the prior cycle's record.
 
 - **G-1 (CLOSED, v0.6.1)**: Test 7c's no-adapter-lock source scan now covers all four adapters.
-- **G-2 (open, unchanged)**: No test exercises `EffectiveIntent.TERM_END` being refused, because
-  no reference provider currently refuses it. Still a suite-coverage gap caused by the reference
-  set, not a spec ambiguity.
+- **G-2 (CLOSED, v0.6.2 conformance closure)**: `EffectiveIntent.TERM_END` refusal under an
+  overall EXACT request is now exercised: test9e2 (Zuora CANCEL/TERM_END/EXACT against a
+  committed-term subscription ⇒ `UNSUPPORTED_CHANGE` naming `termEffect`, the only dimension
+  not EXACT for that combination) pins the refusal, and test52.1 proves it occurs BEFORE any
+  provider mutation (zero simulator orders, subscription state unchanged), with test52.2
+  (evergreen accepted, exactly one order on commit) and test52.3 (REVALIDATE not refused) as
+  controls. The original entry read: "No test exercises `EffectiveIntent.TERM_END` being
+  refused, because no reference provider currently refuses it" — the combination that
+  exercises it is Zuora's quote-level term coverage (UNKNOWN for a committed term), not a
+  provider refusing the TERM_END intent itself.
 - **G-3 (CLOSED, v0.6.1, = spec U-6)**: `enforceNoPartialExecutionRisk`'s `UNSUPPORTED_CHANGE_SET`
   path now has a direct unit test (Test 12h) validating the engine-level primitive in isolation.
   The absence of an END-TO-END adapter test remains (see §6.8 above) — that part of the original
@@ -287,20 +294,27 @@ continuity with the prior cycle's record.
   a fifth, synthetic provider.
 - **G-4 (CLOSED, v0.6.1)**: Paddle now has dedicated multi-change positive (Test 12i) and
   negative (Test 12j) tests, matching Stripe/Zuora/Chargebee.
-- **G-5 (NEW, v0.6.1; partially narrowed since)**: Idempotent commit replay (§6.10) is exercised
-  end-to-end through Stripe and Paddle, and through the live-shaped Chargebee adapter
-  (test13 T06, mocked transport; test13 merged as PR #4 and is executed by the suite on
-  main) — but not through Zuora or
-  the simulator-backed Chargebee adapter. The underlying mechanism is shared engine/store
-  code identical across all adapters,
-  so this remains analogous in shape to the now-closed G-4, not a known per-provider behavioral
-  difference. Separately, replay's durability limit (in-memory store; restart fails closed)
-  is exercised by test13 T13 (merged as PR #4).
-- **G-6 (NEW, v0.6.1)**: No test drives an actual `reconciliation: {status:"VIOLATED"}` result
-  through a real adapter's end-to-end `commitChangeQuote` call (only through the isolated engine
-  function, Test 12b). Doing so requires a TOCTOU-style concurrent-write injection targeting the
-  specific window the reconciliation check covers, distinct from the existing TOCTOU tests
-  (Test 7/9i/11j), which target the fingerprint/staleness check instead.
+- **G-5 (CLOSED for adapter replay, v0.6.2 conformance closure)**: Idempotent commit replay
+  (§6.10) is exercised end-to-end through Stripe and Paddle, through the live-shaped
+  Chargebee adapter (test13 T06, mocked transport; test13 merged as PR #4), and — the part
+  this gap held open — through the Zuora and simulator-backed Chargebee adapters' public
+  APIs (test51.1/51.2, PR #33: replay returns the original recorded receipt, no second
+  order/update is dispatched, and subscription state is unchanged). Separately, replay's
+  durability limit (in-memory store; restart fails closed) remains exercised by test13 T13
+  (merged as PR #4).
+- **G-6 (CLOSED, v0.6.2 conformance closure)**: An actual `reconciliation: {status:"VIOLATED"}`
+  result is now driven through a real adapter's end-to-end `commitChangeQuote` call:
+  test25.8 (Chargebee simulator adapter) lands the operation at quantity 130 against a quote
+  of 120, and the committed effect is established from the bound mutation artifact and the
+  re-read state (provenance `provider_actual`; committed recurring 130000, not the quoted
+  120000), so the VIOLATED verdict is computed against independently established actuals
+  attributable to the operation itself — not a manufactured verdict and not the adapter's
+  revalidated preview (test25.7 separately proves the committed figures do not follow a
+  corrupted preview). test25.17b (a TERM_END cancel landing TERMINAL immediately) and the
+  test25.22 (quoted zero vs the bound artifact's established 5000 cancel actual) are further
+  end-to-end VIOLATED instances through the same public API. The original entry noted the
+  only prior coverage was the isolated engine function (Test 12b); that remains as
+  unit-level evidence alongside the adapter-level cases.
 
 None of G-1 through G-6 represent a known FAILING behavior in any adapter — each closed gap
 was an absence of a test that has now been added, and each still-open gap is an absence of a
