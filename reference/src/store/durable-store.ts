@@ -45,7 +45,15 @@ import {
   type StoredQuote,
 } from "./quote-store.js";
 
-export const DURABLE_SCHEMA_VERSION = 1;
+export const DURABLE_SCHEMA_VERSION = 2;
+
+/**
+ * Maximum age, at resolution time, of the provider observation a
+ * terminal (block-lifting) resolution may rest on (P0, issue #43).
+ * Older observations are stale: they cannot establish what the
+ * provider holds for THIS attempt now.
+ */
+export const RESOLUTION_EVIDENCE_MAX_AGE_MS = 24 * 3600 * 1000;
 
 export class DurableStoreError extends Error {
   readonly code: string = "DURABLE_STORE_ERROR";
@@ -70,6 +78,21 @@ export class DispatchBlockedError extends Error {
   constructor(message: string, readonly details?: Record<string, unknown>) {
     super(message);
     this.name = "DispatchBlockedError";
+  }
+}
+
+/**
+ * A resolution of an INDETERMINATE attempt was refused because the
+ * structured recovery evidence was missing, insufficient, stale,
+ * replayed, or not bound to the attempt (P0, issue #43). A refusal
+ * persists NOTHING: no resolution row, no flag change — the attempt
+ * remains blocked exactly as it was.
+ */
+export class ResolutionEvidenceError extends DurableStoreError {
+  override readonly code = "RESOLUTION_EVIDENCE_REFUSED";
+  constructor(message: string, details?: Record<string, unknown>) {
+    super(message, details);
+    this.name = "ResolutionEvidenceError";
   }
 }
 
@@ -192,6 +215,91 @@ export type StoredAttempt = {
   updatedAt: string;
 };
 
+/**
+ * How an INDETERMINATE attempt's recovery is classified by the
+ * structured evidence an operator supplies (P0, issue #43):
+ *  - CONFIRMED_NON_EXECUTION: independently obtained, operation-bound
+ *    provider evidence establishes the attempted operation did NOT
+ *    execute. Only this classification (and CONFIRMED_LANDING, for
+ *    other quotes) lifts the dispatch block.
+ *  - CONFIRMED_LANDING: operation-bound evidence establishes the
+ *    operation DID land (with its provider operation id). The landed
+ *    state is reconciled; the attempt's own quote never re-dispatches.
+ *  - UNRESOLVED: evidence is absent, ambiguous, stale, or not bound
+ *    to the attempt. Recorded for audit only; lifts nothing.
+ * A provider-state snapshot that merely MATCHES the intended state
+ * is none of these: matching state is not operation attribution.
+ */
+export type ResolutionClassification = "CONFIRMED_NON_EXECUTION" | "CONFIRMED_LANDING" | "UNRESOLVED";
+
+/**
+ * Caller-supplied resolution evidence. The attempt binding
+ * (quote / subscription / provider / site / request hash /
+ * idempotency key) is NEVER taken from this input — it is copied
+ * from the attempt row. The optional binding fields below may be
+ * supplied as an assertion; if any is present and disagrees with
+ * the attempt row, the resolution refuses.
+ */
+export type ResolutionEvidenceInput = {
+  classification: ResolutionClassification;
+  operatorId: string;
+  justification: string;
+  evidenceSource?: string;
+  evidenceKind?: string;
+  evidenceReference?: string;
+  observedAt?: string;
+  observedProviderStateDigest?: string;
+  providerOperationId?: string;
+  reconciliationDecision?: string;
+  note?: string;
+  attemptId?: string;
+  quoteId?: string;
+  subscriptionId?: string;
+  provider?: string;
+  site?: string;
+  requestHash?: string;
+  idempotencyKey?: string;
+};
+
+/** A persisted, append-only resolution record, bound to its attempt row in every identity field. */
+export type StoredResolution = {
+  resolutionId: string;
+  attemptId: string;
+  quoteId: string;
+  subscriptionId: string;
+  provider: string;
+  site: string | null;
+  requestHash: string;
+  idempotencyKey: string;
+  classification: ResolutionClassification;
+  operatorId: string;
+  resolvedAt: string;
+  evidenceSource: string;
+  evidenceKind: string;
+  evidenceReference: string;
+  observedAt: string;
+  observedProviderStateDigest: string;
+  providerOperationId: string | null;
+  reconciliationDecision: string;
+  justification: string;
+  evidenceHash: string;
+};
+
+/** Evidence sources that are operation-bound provider records. Operator assertions, free text, and state snapshots are NOT evidence sources. */
+const RESOLUTION_EVIDENCE_SOURCES = new Set([
+  "PROVIDER_OPERATION_LOG",
+  "PROVIDER_IDEMPOTENCY_REGISTRY",
+  "PROVIDER_AUDIT_EXPORT",
+]);
+const NON_EXECUTION_EVIDENCE_KINDS = new Set([
+  "OPERATION_LOG_NO_RECORD_FOR_KEY",
+  "IDEMPOTENCY_REGISTRY_NO_RECORD_FOR_KEY",
+]);
+const LANDING_EVIDENCE_KINDS = new Set([
+  "OPERATION_LOG_RECORD_FOR_KEY",
+  "PROVIDER_OPERATION_RECEIPT_FOR_KEY",
+]);
+
 export type DurableStoreOptions = {
   busyTimeoutMs?: number;
   /**
@@ -277,6 +385,45 @@ const SCHEMA_STATEMENTS = [
   `CREATE INDEX IF NOT EXISTS idx_attempts_subscription ON attempts(subscription_id)`,
 ];
 
+/**
+ * Schema v2 addition (P0, issue #43): the append-only resolution
+ * evidence table. No code path updates or deletes from this table;
+ * a record, once persisted, is immutable, and on open every row is
+ * re-verified (payload hash + attempt binding) before adoption.
+ * The (evidence_source, evidence_reference) uniqueness is a PARTIAL
+ * unique index over terminal (block-lifting) records: one provider
+ * evidence reference may establish exactly one attempt's terminal
+ * resolution, while UNRESOLVED audit records (which may carry no
+ * evidence reference at all) are not forced to mint one.
+ */
+const RESOLUTION_SCHEMA_STATEMENTS = [
+  `CREATE TABLE IF NOT EXISTS attempt_resolutions (
+     resolution_id TEXT PRIMARY KEY,
+     attempt_id TEXT NOT NULL,
+     quote_id TEXT NOT NULL,
+     subscription_id TEXT NOT NULL,
+     provider TEXT NOT NULL,
+     site TEXT,
+     request_hash TEXT NOT NULL,
+     idempotency_key TEXT NOT NULL,
+     classification TEXT NOT NULL,
+     operator_id TEXT NOT NULL,
+     resolved_at TEXT NOT NULL,
+     evidence_source TEXT NOT NULL,
+     evidence_kind TEXT NOT NULL,
+     evidence_reference TEXT NOT NULL,
+     observed_at TEXT NOT NULL,
+     observed_provider_state_digest TEXT NOT NULL,
+     provider_operation_id TEXT,
+     reconciliation_decision TEXT NOT NULL,
+     justification TEXT NOT NULL,
+     evidence_payload_json TEXT NOT NULL,
+     evidence_hash TEXT NOT NULL UNIQUE
+   )`,
+  `CREATE INDEX IF NOT EXISTS idx_attempt_resolutions_attempt ON attempt_resolutions(attempt_id)`,
+  `CREATE UNIQUE INDEX IF NOT EXISTS idx_attempt_resolutions_evidence_ref ON attempt_resolutions(evidence_source, evidence_reference) WHERE classification != 'UNRESOLVED'`,
+];
+
 export class DurableQuoteStore extends QuoteStore {
   private db: Db;
   private versions = new Map<string, number>();
@@ -285,6 +432,7 @@ export class DurableQuoteStore extends QuoteStore {
   private readonly faults: DurableStoreOptions["faults"];
   private readonly nowFn: () => Date;
   private attemptSeq = 0;
+  private resolutionSeq = 0;
 
   constructor(
     private readonly dbPath: string,
@@ -325,16 +473,31 @@ export class DurableQuoteStore extends QuoteStore {
     if (hasMeta) {
       const row = this.db.prepare(`SELECT value FROM meta WHERE key='schema_version'`).get() as { value: string } | undefined;
       const version = row ? Number(row.value) : NaN;
-      if (!Number.isInteger(version) || version !== DURABLE_SCHEMA_VERSION) {
-        throw new DurableRecoveryError(
-          `Recovery refused: unsupported durable schema version ${row?.value ?? "(missing)"}; this build supports ${DURABLE_SCHEMA_VERSION}. Nothing was adopted.`,
-          { schemaVersion: row?.value ?? null },
-        );
+      if (Number.isInteger(version) && version === DURABLE_SCHEMA_VERSION) return;
+      if (Number.isInteger(version) && version === 1) {
+        // v1 → v2 (P0, issue #43): ONE transaction creates the
+        // append-only attempt_resolutions table and its indexes and
+        // advances the version marker. No existing row is touched:
+        // v1 attempts keep their state and their operator_review_state
+        // flag verbatim — in particular a legacy flag-only 'RESOLVED'
+        // attempt gains NO resolution record here and therefore
+        // remains blocking under the evidence-derived rules (it is
+        // never silently upgraded).
+        const tx = this.db.transaction(() => {
+          for (const stmt of RESOLUTION_SCHEMA_STATEMENTS) this.db.exec(stmt);
+          this.db.prepare(`UPDATE meta SET value = ? WHERE key = 'schema_version'`).run(String(DURABLE_SCHEMA_VERSION));
+        });
+        tx.immediate();
+        return;
       }
-      return;
+      throw new DurableRecoveryError(
+        `Recovery refused: unsupported durable schema version ${row?.value ?? "(missing)"}; this build supports ${DURABLE_SCHEMA_VERSION} (with an in-place migration from version 1). Nothing was adopted.`,
+        { schemaVersion: row?.value ?? null },
+      );
     }
     const tx = this.db.transaction(() => {
       for (const stmt of SCHEMA_STATEMENTS) this.db.exec(stmt);
+      for (const stmt of RESOLUTION_SCHEMA_STATEMENTS) this.db.exec(stmt);
       this.db.prepare(`INSERT INTO meta (key, value) VALUES ('schema_version', ?)`).run(String(DURABLE_SCHEMA_VERSION));
       this.db.prepare(`INSERT INTO meta (key, value) VALUES ('created_at', ?)`).run(this.nowFn().toISOString());
     });
@@ -433,7 +596,65 @@ export class DurableQuoteStore extends QuoteStore {
         QuoteStore.prototype.adoptDerivedView.call(this, rec.quote_id);
       }
     }
+    this.verifyResolutionsOnOpen();
     this.recoverAttempts();
+  }
+
+  /**
+   * P0 (issue #43): persisted resolution evidence is adopted ONLY
+   * after every row re-verifies — the evidence hash recomputes from
+   * the stored payload, the payload's binding fields equal the row
+   * columns, and the referenced attempt exists with the SAME
+   * quote / subscription / provider / site / request hash /
+   * idempotency key the payload claims. Any mismatch refuses the
+   * whole open (fail closed, exactly like receipt corruption): a
+   * tampered or transplanted resolution record must never lift a
+   * dispatch block.
+   */
+  private verifyResolutionsOnOpen(): void {
+    const rows = this.db.prepare(`SELECT * FROM attempt_resolutions ORDER BY rowid`).all() as Array<Record<string, unknown>>;
+    for (const row of rows) {
+      const refuse = (problem: string): never => {
+        throw new DurableRecoveryError(
+          `Recovery refused: the persisted resolution record ${row.resolution_id} for attempt ${row.attempt_id} ${problem}; nothing is adopted.`,
+          { resolutionId: row.resolution_id, attemptId: row.attempt_id },
+        );
+      };
+      let payload: StoredResolution & { evidenceHash?: unknown };
+      try {
+        payload = decodeRecordJson<StoredResolution>(row.evidence_payload_json as string);
+      } catch (e) {
+        refuse(`is not decodable (${(e as Error).message})`);
+      }
+      const { evidenceHash: _payloadHash, ...payloadFields } = payload!;
+      if (sha256(canonicalStringify(payloadFields)) !== row.evidence_hash) {
+        refuse("fails its evidence-hash verification — the record was tampered with or transplanted");
+      }
+      const columnBinding: Record<string, unknown> = {
+        resolutionId: row.resolution_id, attemptId: row.attempt_id, quoteId: row.quote_id,
+        subscriptionId: row.subscription_id, provider: row.provider, site: row.site ?? null,
+        requestHash: row.request_hash, idempotencyKey: row.idempotency_key,
+        classification: row.classification, operatorId: row.operator_id, resolvedAt: row.resolved_at,
+        evidenceSource: row.evidence_source, evidenceKind: row.evidence_kind, evidenceReference: row.evidence_reference,
+        observedAt: row.observed_at, observedProviderStateDigest: row.observed_provider_state_digest,
+        providerOperationId: row.provider_operation_id ?? null, reconciliationDecision: row.reconciliation_decision,
+        justification: row.justification,
+      };
+      for (const [k, v] of Object.entries(columnBinding)) {
+        if ((payloadFields as Record<string, unknown>)[k] !== v) refuse(`has a payload binding that disagrees with its record columns (${k})`);
+      }
+      const attemptRow = this.db.prepare(`SELECT * FROM attempts WHERE attempt_id = ?`).get(row.attempt_id) as Record<string, unknown> | undefined;
+      if (!attemptRow) refuse("references an attempt that does not exist");
+      const attempt = this.rowToAttempt(attemptRow!);
+      if (
+        payloadFields.attemptId !== attempt.attemptId || payloadFields.quoteId !== attempt.quoteId ||
+        payloadFields.subscriptionId !== attempt.subscriptionId || payloadFields.provider !== attempt.provider ||
+        payloadFields.site !== attempt.site || payloadFields.requestHash !== attempt.requestHash ||
+        payloadFields.idempotencyKey !== attempt.idempotencyKey
+      ) {
+        refuse("is bound to different attempt identity fields than the attempt it resolves");
+      }
+    }
   }
 
   /**
@@ -711,20 +932,83 @@ export class DurableQuoteStore extends QuoteStore {
     return (this.db.prepare(`SELECT * FROM attempts ORDER BY created_at, attempt_id`).all() as Array<Record<string, unknown>>).map((r) => this.rowToAttempt(r));
   }
 
+  // -- resolution evidence (P0, issue #43) ------------------------------------
+
+  private rowToResolution(row: Record<string, unknown>): StoredResolution {
+    return {
+      resolutionId: row.resolution_id as string,
+      attemptId: row.attempt_id as string,
+      quoteId: row.quote_id as string,
+      subscriptionId: row.subscription_id as string,
+      provider: row.provider as string,
+      site: (row.site as string | null) ?? null,
+      requestHash: row.request_hash as string,
+      idempotencyKey: row.idempotency_key as string,
+      classification: row.classification as ResolutionClassification,
+      operatorId: row.operator_id as string,
+      resolvedAt: row.resolved_at as string,
+      evidenceSource: row.evidence_source as string,
+      evidenceKind: row.evidence_kind as string,
+      evidenceReference: row.evidence_reference as string,
+      observedAt: row.observed_at as string,
+      observedProviderStateDigest: row.observed_provider_state_digest as string,
+      providerOperationId: (row.provider_operation_id as string | null) ?? null,
+      reconciliationDecision: row.reconciliation_decision as string,
+      justification: row.justification as string,
+      evidenceHash: row.evidence_hash as string,
+    };
+  }
+
+  /** Every resolution record for an attempt, in append order (terminal and UNRESOLVED records alike). */
+  resolutionsForAttempt(attemptId: string): StoredResolution[] {
+    return (this.db.prepare(`SELECT * FROM attempt_resolutions WHERE attempt_id = ? ORDER BY rowid`).all(attemptId) as Array<Record<string, unknown>>).map((r) => this.rowToResolution(r));
+  }
+
+  /** The attempt's terminal (CONFIRMED_*) resolution if one exists, otherwise its latest record, otherwise undefined. */
+  getResolution(attemptId: string): StoredResolution | undefined {
+    const all = this.resolutionsForAttempt(attemptId);
+    return all.find((r) => r.classification !== "UNRESOLVED") ?? all[all.length - 1];
+  }
+
+  /** The terminal (block-relevant) resolution for an attempt, if structured evidence established one. */
+  private terminalResolutionFor(attemptId: string): StoredResolution | undefined {
+    return this.resolutionsForAttempt(attemptId).find((r) => r.classification !== "UNRESOLVED");
+  }
+
   /**
    * A blocking attempt is one that forbids a new dispatch for the
    * same quote or the same subscription: a non-terminal attempt
    * (PREPARED is NOT blocking — dispatch provably never occurred;
-   * DISPATCHING is), or an INDETERMINATE terminal attempt that an
-   * operator has not explicitly resolved.
+   * DISPATCHING is), or an INDETERMINATE terminal attempt with no
+   * terminal structured-evidence resolution.
+   *
+   * P0 (issue #43): blocking is derived from the resolution EVIDENCE
+   * TABLE, never from the operator_review_state flag alone —
+   *  - CONFIRMED_NON_EXECUTION evidence: the attempt never blocks
+   *    again (non-execution was established for THIS operation; any
+   *    later dispatch still passes every other gate);
+   *  - CONFIRMED_LANDING evidence: the landed operation blocks only
+   *    re-dispatch against its OWN quote (that would duplicate it);
+   *    a different quote on the subscription is a new, separately
+   *    authorized change on the reconciled state;
+   *  - no record, only UNRESOLVED records, or a legacy v1
+   *    operator_review_state='RESOLVED' flag with NO record: the
+   *    attempt BLOCKS. A legacy flag is never silently upgraded.
    */
   findBlockingAttempt(quoteId: string, subscriptionId: string, excludeAttemptId?: string): StoredAttempt | undefined {
     const rows = this.db.prepare(
-      `SELECT * FROM attempts WHERE (quote_id = ? OR subscription_id = ?) AND (
-         state = 'DISPATCHING' OR (state = 'INDETERMINATE' AND operator_review_state != 'RESOLVED')
-       )${excludeAttemptId !== undefined ? " AND attempt_id != ?" : ""} ORDER BY created_at LIMIT 1`,
-    ).get(...(excludeAttemptId !== undefined ? [quoteId, subscriptionId, excludeAttemptId] : [quoteId, subscriptionId])) as Record<string, unknown> | undefined;
-    return rows ? this.rowToAttempt(rows) : undefined;
+      `SELECT * FROM attempts WHERE (quote_id = ? OR subscription_id = ?) AND state IN ('DISPATCHING','INDETERMINATE')${excludeAttemptId !== undefined ? " AND attempt_id != ?" : ""} ORDER BY created_at, attempt_id`,
+    ).all(...(excludeAttemptId !== undefined ? [quoteId, subscriptionId, excludeAttemptId] : [quoteId, subscriptionId])) as Array<Record<string, unknown>>;
+    for (const row of rows) {
+      const attempt = this.rowToAttempt(row);
+      if (attempt.state === "DISPATCHING") return attempt;
+      const terminal = this.terminalResolutionFor(attempt.attemptId);
+      if (!terminal) return attempt;
+      if (terminal.classification === "CONFIRMED_LANDING" && attempt.quoteId === quoteId) return attempt;
+      // CONFIRMED_NON_EXECUTION never blocks; CONFIRMED_LANDING
+      // blocks only its own quote (handled above).
+    }
+    return undefined;
   }
 
   /**
@@ -819,7 +1103,7 @@ export class DurableQuoteStore extends QuoteStore {
               { attemptId: existing.attemptId, quoteId: existing.quoteId, subscriptionId: existing.subscriptionId, provider: existing.provider, site: existing.site },
             );
           }
-          if (existing.state === "DISPATCHING" || (existing.state === "INDETERMINATE" && existing.operatorReviewState !== "RESOLVED")) {
+          if (existing.state === "DISPATCHING" || (existing.state === "INDETERMINATE" && !this.terminalResolutionFor(existing.attemptId))) {
             throw new DispatchBlockedError(
               `Dispatch blocked: the attempt bound to this idempotency key (${existing.attemptId}) is ${existing.state} and unresolved — blind retry is prohibited.`,
               { attemptId: existing.attemptId, state: existing.state },
@@ -982,16 +1266,219 @@ export class DurableQuoteStore extends QuoteStore {
     return this.getAttempt(attemptId)!;
   }
 
-  /** Explicit operator action: mark an INDETERMINATE attempt resolved after manual reconciliation. Never called by any recovery or reconciliation-report path. */
-  resolveAttempt(attemptId: string, note: string): StoredAttempt {
+  /**
+   * Explicit operator action: resolve an INDETERMINATE attempt from
+   * STRUCTURED, operation-bound recovery evidence (P0, issue #43).
+   * Never called by any recovery or reconciliation-report path.
+   *
+   * The pre-fix signature was (attemptId, note: string): a free-text
+   * note flipped operator_review_state to 'RESOLVED' and that flag
+   * alone lifted the dispatch block — an operator assertion became
+   * dispatch eligibility for a different idempotency key, with no
+   * persisted evidence of what happened at the provider. That is
+   * now impossible:
+   *
+   *  - a non-object (e.g. string) argument refuses outright;
+   *  - the attempt must be INDETERMINATE and carry no terminal
+   *    resolution yet (both checked INSIDE the immediate
+   *    transaction — the concurrency rule);
+   *  - the record's binding is copied FROM THE ATTEMPT ROW, never
+   *    from the caller; a caller-supplied binding field that
+   *    disagrees with the attempt refuses;
+   *  - a terminal classification (CONFIRMED_NON_EXECUTION /
+   *    CONFIRMED_LANDING) requires an operation-bound evidence
+   *    source and kind, a fresh observation bound to the attempt's
+   *    lifetime, a sha256 state digest, the classification's exact
+   *    reconciliation decision, and (for LANDING) the provider
+   *    operation id — a matching state snapshot is NOT operation
+   *    proof and refuses as a source;
+   *  - one (evidenceSource, evidenceReference) pair may establish
+   *    exactly ONE attempt's terminal resolution (replay refuses);
+   *  - UNRESOLVED records are appended for audit and lift nothing.
+   *
+   * Every refusal persists ZERO resolution rows and leaves the
+   * attempt blocked. A successful terminal resolution inserts the
+   * immutable record, flips operator_review_state, and appends the
+   * history entry atomically in the same transaction.
+   */
+  resolveAttempt(attemptId: string, evidence: ResolutionEvidenceInput): StoredAttempt {
     this.assertHealthy();
-    const attempt = this.getAttempt(attemptId);
-    if (!attempt) throw new DurableStoreError(`Cannot resolve unknown attempt ${attemptId}.`);
-    const tx = this.db.transaction(() => {
-      this.db.prepare(`UPDATE attempts SET operator_review_state='RESOLVED', version=version+1, updated_at=? WHERE attempt_id=?`).run(this.nowFn().toISOString(), attemptId);
-      this.db.prepare(`INSERT INTO attempt_history (attempt_id, state, at, note) VALUES (?,?,?,?)`).run(attemptId, attempt.state, this.nowFn().toISOString(), `operator resolved: ${note}`);
-    });
-    tx.immediate();
+    if (!evidence || typeof evidence !== "object" || Array.isArray(evidence)) {
+      throw new ResolutionEvidenceError(
+        `Resolution refused for attempt ${attemptId}: structured recovery evidence is required — a free-text operator note is not evidence and can no longer resolve an INDETERMINATE attempt.`,
+        { attemptId },
+      );
+    }
+    const known = this.getAttempt(attemptId);
+    if (!known) throw new DurableStoreError(`Cannot resolve unknown attempt ${attemptId}.`);
+    if (this.faults?.beforePersist) {
+      try { this.faults.beforePersist("resolveAttempt"); } catch (e) { this.failPoison("resolveAttempt", e); }
+    }
+    const resolvedAt = this.nowFn().toISOString();
+    const resolvedMs = Date.parse(resolvedAt);
+    try {
+      const tx = this.db.transaction(() => {
+        const attempt = this.getAttempt(attemptId)!;
+        const refuse = (problem: string): never => {
+          throw new ResolutionEvidenceError(`Resolution refused for attempt ${attemptId}: ${problem}`, { attemptId });
+        };
+        if (attempt.state !== "INDETERMINATE") {
+          refuse(`the attempt is ${attempt.state}; only an INDETERMINATE attempt can be resolved`);
+        }
+        if (this.terminalResolutionFor(attemptId)) {
+          refuse(`ALREADY_RESOLVED: the attempt already carries a terminal resolution record; resolution evidence is append-only and a terminal resolution cannot be replaced`);
+        }
+        // Caller-supplied binding assertions must agree with the
+        // attempt row; the persisted binding is copied from the row.
+        const bindingAssertions: Array<[string, unknown, unknown]> = [
+          ["attemptId", evidence.attemptId, attempt.attemptId],
+          ["quoteId", evidence.quoteId, attempt.quoteId],
+          ["subscriptionId", evidence.subscriptionId, attempt.subscriptionId],
+          ["provider", evidence.provider, attempt.provider],
+          ["site", evidence.site, attempt.site ?? undefined],
+          ["requestHash", evidence.requestHash, attempt.requestHash],
+          ["idempotencyKey", evidence.idempotencyKey, attempt.idempotencyKey],
+        ];
+        for (const [field, supplied, actual] of bindingAssertions) {
+          if (supplied !== undefined && supplied !== actual) {
+            refuse(`the supplied ${field} (${String(supplied)}) does not match the attempt's ${field} (${String(actual)}); resolution evidence must be bound to THIS attempt`);
+          }
+        }
+        const classification = evidence.classification;
+        if (classification !== "CONFIRMED_NON_EXECUTION" && classification !== "CONFIRMED_LANDING" && classification !== "UNRESOLVED") {
+          refuse(`unknown resolution classification ${String(classification)}`);
+        }
+        const operatorId = typeof evidence.operatorId === "string" ? evidence.operatorId.trim() : "";
+        if (!operatorId) refuse("a non-empty operatorId is required — an unattributed resolution is not auditable");
+        const justification = typeof evidence.justification === "string" ? evidence.justification.trim() : "";
+        if (!justification) refuse("a non-empty justification is required");
+
+        const isTerminal = classification !== "UNRESOLVED";
+        let evidenceSource = "";
+        let evidenceKind = "";
+        let evidenceReference = "";
+        let observedAt = resolvedAt;
+        let observedProviderStateDigest = "";
+        let providerOperationId: string | null = null;
+        let reconciliationDecision = "";
+
+        if (!isTerminal) {
+          // UNRESOLVED: evidence fields are optional audit context;
+          // validate their shape when present, require none.
+          for (const [field, value] of [["evidenceSource", evidence.evidenceSource], ["evidenceKind", evidence.evidenceKind], ["evidenceReference", evidence.evidenceReference], ["reconciliationDecision", evidence.reconciliationDecision]] as Array<[string, unknown]>) {
+            if (value !== undefined && typeof value !== "string") refuse(`${field} must be a string when present`);
+          }
+          if (evidence.observedProviderStateDigest !== undefined && !/^[0-9a-f]{64}$/.test(evidence.observedProviderStateDigest)) {
+            refuse("observedProviderStateDigest must be a 64-character lowercase hex sha256 when present");
+          }
+          if (evidence.observedAt !== undefined && Number.isNaN(Date.parse(evidence.observedAt))) {
+            refuse("observedAt must be a parseable ISO timestamp when present");
+          }
+          evidenceSource = evidence.evidenceSource ?? "";
+          evidenceKind = evidence.evidenceKind ?? "";
+          evidenceReference = evidence.evidenceReference ?? "";
+          observedAt = evidence.observedAt ?? resolvedAt;
+          observedProviderStateDigest = evidence.observedProviderStateDigest ?? "";
+          providerOperationId = evidence.providerOperationId ?? null;
+          reconciliationDecision = evidence.reconciliationDecision ?? "";
+        } else {
+          evidenceSource = typeof evidence.evidenceSource === "string" ? evidence.evidenceSource : "";
+          if (!RESOLUTION_EVIDENCE_SOURCES.has(evidenceSource)) {
+            refuse(
+              evidenceSource === "PROVIDER_STATE_SNAPSHOT"
+                ? "a provider-state snapshot is not operation-bound evidence: a state that merely matches the intended outcome does not establish whether THIS operation executed"
+                : `evidenceSource ${JSON.stringify(evidence.evidenceSource ?? null)} is not an operation-bound provider evidence source (one of ${[...RESOLUTION_EVIDENCE_SOURCES].join(", ")}); operator assertions and free text are not evidence`,
+            );
+          }
+          evidenceKind = typeof evidence.evidenceKind === "string" ? evidence.evidenceKind : "";
+          const kinds = classification === "CONFIRMED_NON_EXECUTION" ? NON_EXECUTION_EVIDENCE_KINDS : LANDING_EVIDENCE_KINDS;
+          if (!kinds.has(evidenceKind)) {
+            refuse(`evidenceKind ${JSON.stringify(evidence.evidenceKind ?? null)} does not establish ${classification} (one of ${[...kinds].join(", ")})`);
+          }
+          evidenceReference = typeof evidence.evidenceReference === "string" ? evidence.evidenceReference.trim() : "";
+          if (!evidenceReference) refuse("a non-empty evidenceReference identifying the provider evidence record is required");
+          const replay = this.db.prepare(
+            `SELECT resolution_id FROM attempt_resolutions WHERE evidence_source = ? AND evidence_reference = ? AND classification != 'UNRESOLVED' LIMIT 1`,
+          ).get(evidenceSource, evidenceReference) as { resolution_id: string } | undefined;
+          if (replay) {
+            refuse(`evidence (${evidenceSource}, ${evidenceReference}) was already used by resolution ${replay.resolution_id}; one provider evidence record establishes one attempt's resolution — replay is refused`);
+          }
+          observedProviderStateDigest = typeof evidence.observedProviderStateDigest === "string" ? evidence.observedProviderStateDigest : "";
+          if (!/^[0-9a-f]{64}$/.test(observedProviderStateDigest)) {
+            refuse("observedProviderStateDigest must be a 64-character lowercase hex sha256 of the observed provider state");
+          }
+          observedAt = typeof evidence.observedAt === "string" ? evidence.observedAt : "";
+          const observedMs = Date.parse(observedAt);
+          if (Number.isNaN(observedMs)) refuse("observedAt must be a parseable ISO timestamp");
+          if (observedMs < Date.parse(attempt.createdAt)) refuse("observedAt predates the attempt's creation; an earlier observation cannot describe this attempt");
+          if (observedMs > resolvedMs) refuse("observedAt is after the resolution time; a future observation cannot be resolved from");
+          if (resolvedMs - observedMs > RESOLUTION_EVIDENCE_MAX_AGE_MS) {
+            refuse(`the provider observation is stale: observed ${Math.round((resolvedMs - observedMs) / 1000)}s before resolution, beyond the ${RESOLUTION_EVIDENCE_MAX_AGE_MS / 1000}s freshness window`);
+          }
+          reconciliationDecision = typeof evidence.reconciliationDecision === "string" ? evidence.reconciliationDecision : "";
+          if (classification === "CONFIRMED_NON_EXECUTION") {
+            if (evidence.providerOperationId !== undefined && evidence.providerOperationId !== null && evidence.providerOperationId !== "") {
+              refuse("CONFIRMED_NON_EXECUTION must not carry a providerOperationId — an operation id would be evidence the operation exists");
+            }
+            if (reconciliationDecision !== "PERMIT_NEW_DISPATCH") {
+              refuse(`CONFIRMED_NON_EXECUTION requires reconciliationDecision "PERMIT_NEW_DISPATCH" (got ${JSON.stringify(evidence.reconciliationDecision ?? null)})`);
+            }
+          } else {
+            providerOperationId = typeof evidence.providerOperationId === "string" ? evidence.providerOperationId.trim() : "";
+            if (!providerOperationId) refuse("CONFIRMED_LANDING requires the non-empty providerOperationId of the landed operation");
+            if (reconciliationDecision !== "RECONCILE_LANDED_STATE_NO_REDISPATCH") {
+              refuse(`CONFIRMED_LANDING requires reconciliationDecision "RECONCILE_LANDED_STATE_NO_REDISPATCH" (got ${JSON.stringify(evidence.reconciliationDecision ?? null)})`);
+            }
+          }
+        }
+
+        const payloadFields = {
+          resolutionId: `res_${sha256(`${attemptId}|${resolvedAt}|${classification}|${evidenceReference}`).slice(0, 24)}_${++this.resolutionSeq}`,
+          attemptId: attempt.attemptId,
+          quoteId: attempt.quoteId,
+          subscriptionId: attempt.subscriptionId,
+          provider: attempt.provider,
+          site: attempt.site,
+          requestHash: attempt.requestHash,
+          idempotencyKey: attempt.idempotencyKey,
+          classification,
+          operatorId,
+          resolvedAt,
+          evidenceSource,
+          evidenceKind,
+          evidenceReference,
+          observedAt,
+          observedProviderStateDigest,
+          providerOperationId,
+          reconciliationDecision,
+          justification,
+        };
+        const evidenceHash = sha256(canonicalStringify(payloadFields));
+        const record: StoredResolution = { ...payloadFields, evidenceHash };
+        this.db.prepare(
+          `INSERT INTO attempt_resolutions (resolution_id, attempt_id, quote_id, subscription_id, provider, site, request_hash, idempotency_key, classification, operator_id, resolved_at, evidence_source, evidence_kind, evidence_reference, observed_at, observed_provider_state_digest, provider_operation_id, reconciliation_decision, justification, evidence_payload_json, evidence_hash)
+           VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
+        ).run(
+          record.resolutionId, record.attemptId, record.quoteId, record.subscriptionId, record.provider, record.site,
+          record.requestHash, record.idempotencyKey, record.classification, record.operatorId, record.resolvedAt,
+          record.evidenceSource, record.evidenceKind, record.evidenceReference, record.observedAt,
+          record.observedProviderStateDigest, record.providerOperationId, record.reconciliationDecision,
+          record.justification, encodeRecordJson(payloadFields), record.evidenceHash,
+        );
+        this.faults?.insidePersistTx?.("resolveAttempt");
+        if (isTerminal) {
+          this.db.prepare(`UPDATE attempts SET operator_review_state='RESOLVED', version=version+1, updated_at=? WHERE attempt_id=?`).run(resolvedAt, attemptId);
+        }
+        this.db.prepare(`INSERT INTO attempt_history (attempt_id, state, at, note) VALUES (?,?,?,?)`).run(
+          attemptId, attempt.state, resolvedAt,
+          `operator resolution recorded (${classification}; evidence ${evidenceSource || "(none)"} ${evidenceReference || "(no reference)"}; hash ${evidenceHash.slice(0, 12)}…): ${justification}${evidence.note ? ` — note: ${evidence.note}` : ""}`,
+        );
+      });
+      tx.immediate();
+    } catch (e) {
+      if (e instanceof ResolutionEvidenceError || e instanceof DispatchBlockedError) throw e;
+      this.failPoison("resolveAttempt", e);
+    }
     return this.getAttempt(attemptId)!;
   }
 
@@ -1086,9 +1573,21 @@ export class DurableQuoteStore extends QuoteStore {
           stateAttributableToThisMutation: committedClass ? attributionFromReceipt(quote?.commit_receipt ?? recorded) : false,
         },
         operatorInterventionRequired: a.state === "INDETERMINATE" || a.state === "DISPATCHING",
+        ...(a.state === "INDETERMINATE"
+          ? {
+              resolution: (() => {
+                const records = this.resolutionsForAttempt(a.attemptId);
+                const terminal = records.find((r) => r.classification !== "UNRESOLVED");
+                return {
+                  classification: terminal?.classification ?? "UNRESOLVED",
+                  evidenceHash: terminal?.evidenceHash ?? records[records.length - 1]?.evidenceHash ?? null,
+                };
+              })(),
+            }
+          : {}),
         nextPermittedAction:
           a.state === "INDETERMINATE"
-            ? "Reconcile manually from provider records; only after reconciliation may an operator explicitly resolve this attempt (resolveAttempt). No automatic re-dispatch is permitted."
+            ? "Reconcile manually from provider records; only after reconciliation establishes the outcome from structured, operation-bound provider evidence may an operator explicitly resolve this attempt (resolveAttempt) — a free-text note or a matching provider-state snapshot is not sufficient evidence. No automatic re-dispatch is permitted."
             : a.state === "DISPATCHING"
               ? "Treat as potentially dispatched: reconcile from provider records before any further action. No re-dispatch."
               : "None.",
