@@ -131,6 +131,7 @@ const TERMINAL_SUBSCRIPTION_STATES: ReadonlySet<string> = new Set(["cancelled", 
 const DIM_ITEM_SET = "state:itemSet";
 const DIM_CADENCE = "state:cadence";
 const DIM_CANCELLATION = "state:cancellation";
+const DIM_SUBSCRIPTION_IDENTITY = "state:subscriptionIdentity";
 
 type CheckOutcome = StateVerificationCheck["outcome"];
 
@@ -972,6 +973,54 @@ export function verifyPostCommitState(
   }
   if (observation?.itemsComplete === false) {
     limitations.push("The item collection was reported as a partial return (itemsComplete: false): absence-based contradictions were not established from it.");
+  }
+
+  // PR-16 (Issue #22, Finding 3): subscription-identity binding.
+  // When the expectation names the bound subscription, the
+  // observed snapshot must name it too: state read from a
+  // DIFFERENT subscription is not evidence about this one,
+  // however well its items match the intent — an item-set match
+  // on another subscription's record would otherwise verify this
+  // quote (the pre-PR-16 hook never compared the snapshot's id
+  // to anything). A snapshot carrying no usable id leaves the
+  // identity dimension UNVERIFIABLE; a contradicting id is a
+  // determined negative (MISMATCH). When the expectation omits
+  // the field, no identity check is added and the result is
+  // exactly the historical one.
+  const expectedSubscriptionRef = expectation?.expectedSubscriptionRef;
+  if (typeof expectedSubscriptionRef === "string" && expectedSubscriptionRef.length > 0) {
+    if (!snapshot) {
+      col.add(
+        "subscription-identity",
+        DIM_SUBSCRIPTION_IDENTITY,
+        "UNVERIFIABLE",
+        `no post-commit snapshot was observed; the observed subscription's identity cannot be verified against the expected subscription "${expectedSubscriptionRef}"`
+      );
+    } else {
+      const observedId = typeof snapshot.id === "string" && snapshot.id.length > 0 ? snapshot.id : undefined;
+      if (observedId === undefined) {
+        col.add(
+          "subscription-identity",
+          DIM_SUBSCRIPTION_IDENTITY,
+          "UNVERIFIABLE",
+          `the observed snapshot carries no subscription id; its identity cannot be verified against the expected subscription "${expectedSubscriptionRef}"`
+        );
+      } else if (observedId !== expectedSubscriptionRef) {
+        col.add(
+          "subscription-identity",
+          DIM_SUBSCRIPTION_IDENTITY,
+          "CONTRADICTED",
+          `the observed snapshot names subscription "${observedId}", not the expected subscription "${expectedSubscriptionRef}" — state read from a different subscription is not evidence about this quote's subscription`
+        );
+      } else {
+        col.add(
+          "subscription-identity",
+          DIM_SUBSCRIPTION_IDENTITY,
+          "VERIFIED",
+          `the observed snapshot names the expected subscription "${expectedSubscriptionRef}"`
+        );
+      }
+    }
   }
 
   if (!snapshot) {

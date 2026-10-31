@@ -244,12 +244,28 @@ test("Test 37.6: SCQ_LIVE_COMMIT_ENABLED=true in the preflight environment refus
 });
 
 test("Test 37.7: a subscription id without synthetic designation is rejected before reads", async () => {
-  // Build a quote against a production-shaped subscription id (the
-  // mocked transport serves the fixture regardless of the id asked).
+  // Build a quote against a production-shaped subscription id.
+  // PR-16 fixture correction (disclosed in the PR-16 note): the
+  // single-subscription double now answers AS the addressed
+  // subscription — its served record is re-labeled with the
+  // requested id — because PR-16's identity binding refuses a
+  // creation read that names a different subscription than the
+  // one addressed. The original fixture encoded the cross-
+  // identity assumption PR-16 removes (a read addressed to
+  // "cust_9f8e7d6c5b" answered with pilot-sub-001's record). The
+  // stored quote binds to the undesignated id exactly as before,
+  // and every assertion below is unchanged.
   const path = tmpDb();
   const mock = new PilotMockChargebee();
   const store0 = new DurableQuoteStore(path, { recoveryGraceMs: 0 });
-  const client = new ChargebeeClient({ site: SITE, apiKey: "pilot-mock-key" }, mock.transport as HttpTransport);
+  const creationTransport: HttpTransport = async (req) => {
+    const res = await mock.transport(req);
+    if (req.method === "GET" && (res.json as any)?.subscription) {
+      return { ...res, json: { subscription: { ...(res.json as any).subscription, id: "cust_9f8e7d6c5b" } } };
+    }
+    return res;
+  };
+  const client = new ChargebeeClient({ site: SITE, apiKey: "pilot-mock-key" }, creationTransport);
   const adapter = new ChargebeeLiveAdapter(client, store0, { liveCommitEnabled: false, providerSite: SITE });
   const quote = await adapter.createChangeQuote("cust_9f8e7d6c5b", PROPOSAL(21));
   store0.close();
