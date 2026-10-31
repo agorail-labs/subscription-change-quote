@@ -246,3 +246,98 @@ the durable store with the same poison-on-failure semantics.
   Admissible-but-partial, admissible-but-state-unverifiable, and
   admissi
 ...[truncated]
+
+## 8. Independent-review correction: cross-observation coherence
+
+**The question (independent review of `4cad3c4`).** Composition
+composes financial dimensions per dimension across entries, and
+the promotion rule required only that SOME entry carry a
+VERIFIED state. Can dimensions established by mutually
+incompatible provider observations — different post-commit
+states — compose into a promoted COMMITTED_AND_VERIFIED/OK
+view, using a VERIFIED state from only one of them?
+
+**What the implementation retained (the gap).** An evidence
+entry retained the minted token (figures, committedSource, the
+computed state-verdict string, the computed reconciliation) —
+but NOT the identity of the observation's resulting snapshot
+that the verdict and figures were computed from. The snapshot
+was consumed inside `establishVerification` and discarded.
+`analyzeEvidenceTrail` compared entries only on the SAME
+dimension (the conflict rule); cross-dimension, cross-state
+coherence was never examined, and `stateVerified` was
+`entries.some(VERIFIED)`. No invariant bound the VERIFIED
+entry's observation to the establishing entries' observations.
+
+**The attack (failing-first, test50.28/50.29/50.30).** Seed a
+COMMITTED_UNVERIFIED receipt. Entry A establishes the immediate
+actual from an observation of state revision v2 (its read omits
+the item collection; the state verdict for v2 is UNVERIFIABLE).
+Entry B establishes the recurring actual from an observation of
+state revision v3 — a different, later state (an extra item has
+landed) — and carries the VERIFIED verdict FOR v3. Each entry
+is individually admissible (branded, bound, establishing
+provenance, internally consistent). On unmodified `4cad3c4`
+the composed view promoted: outcome COMMITTED_AND_VERIFIED,
+reconciliation OK — although no single observation ever
+supported the composed figures together with the verified
+state. The variant (50.29) is stronger: the VERIFIED entry
+establishes NO dimension, and the two financial entries come
+from two further distinct revisions (v2, v3, verdict from v4).
+The false promotion reproduced in both forms (test50 on
+`4cad3c4`: 28 pass / 3 fail, the three new coherence tests
+failing with the view at COMMITTED_AND_VERIFIED).
+
+**The correction (smallest fail-closed rule).** Promotion now
+requires CROSS-OBSERVATION COHERENCE of its basis:
+
+- At minting, `establishVerification` stamps the token's
+  binding with the observed-state identity of its observation:
+  a digest of the resulting snapshot's (subscription id, state
+  revision `version`) pair — the state identity the protocol's
+  own staleness semantics already use. Two reads of the same
+  revision share the identity however much of the state each
+  presented; different revisions never share it. An observation
+  with no resulting snapshot stamps no identity.
+- `buildEvidenceEntry` carries the identity onto the entry as
+  `observedStateDigest`, bound into the entry's content-derived
+  `evidenceId` (so the live and recovery derivations agree, and
+  an inconsistently altered identity fails the same id checks
+  as any other entry content). It is a coherence key, not an
+  authenticity proof — recovery's trust posture is unchanged.
+- `analyzeEvidenceTrail` computes the PROMOTION BASIS: the
+  accepted establisher of each dimension, plus the first
+  VERIFIED entry when no establisher carries the verdict. The
+  basis is coherent iff it is a single entry, or every basis
+  entry carries the SAME observed-state identity. A basis entry
+  with no identity cannot take part in a cross-entry promotion.
+- `deriveCurrentView` (the one derivation shared by the live
+  paths and both recovery paths) refuses promotion on an
+  incoherent basis: the view stays COMMITTED_UNVERIFIED with an
+  UNVERIFIED reconciliation naming the incoherence. Recording
+  and display are unaffected — the actuals are still appended
+  and shown; only the verified claim is withheld.
+
+Legitimate composition is preserved: partial entries observing
+the SAME state revision compose and promote (50.16 unmodified;
+50.31 pins the three-read form — two financial reads of one
+revision whose collections were omitted, plus a state-only
+read of the same revision carrying the verdict). Single-entry
+promotions (the `verifyCommitReceipt` transition, legacy
+one-transition trails) are coherent by construction.
+
+**Accounting.** test50 grows 27 → 31 (append-only: 50.28 attack,
+50.29 variant, 50.30 recovery — the incoherent trail stays
+unpromoted after restart and a forged promoted view over it
+refuses the whole restore set, 50.31 same-revision control).
+No pre-existing test was modified. Full suite 710 → 714;
+research suite unchanged (11 pass / 7 fail; repro46 still 0/3
+at the PR-14 gate, unaffected).
+
+**Documentation note on this file.** As committed at `4cad3c4`
+this note ended mid-sentence in §7 (the file literally ended
+with a truncation marker) and the paste-ready PR #21 amendment
+list summarized in the PR body was not present in the file.
+This section is appended after that point; the missing §7
+completion and amendment texts remain to be restored by the
+PR author — they are NOT reconstructed here.

@@ -709,6 +709,214 @@ test("Test 50.26: durable store — appended evidence and the promoted view surv
   b.close();
 });
 
+// ---------------------------------------------------------------------------
+// Cross-observation coherence (PR-17 independent review): can
+// dimensions established by MUTUALLY INCOMPATIBLE observations
+// compose into a promoted COMMITTED_AND_VERIFIED/OK view, using
+// a VERIFIED state carried by only one of them?
+//
+// Fixture states of the SAME subscription at different revisions:
+//   S_v2 — revision v2; the read omits the item collection, so
+//          the §6.12 checks are UNVERIFIABLE against it;
+//   S_v3 — revision v3, a LATER, different post-commit state (an
+//          additional item has landed since v2); the targeted
+//          ACTION_LEVEL check passes against it (VERIFIED);
+//   S_v4 — revision v4, a third distinct revision.
+// Figures are derived from mock provider records exactly as in
+// the fixtures above (immediate from the operation-bound charge,
+// recurring from the record's item amounts, summed).
+// ---------------------------------------------------------------------------
+
+function snapshotV2CollectionOmitted(): SubscriptionSnapshot {
+  return {
+    id: SUB,
+    version: "v2",
+    status: "active",
+    billing: { currency: "USD", cadence: "MONTHLY", recurringAmount: QUOTED.recurring },
+  } as unknown as SubscriptionSnapshot;
+}
+
+function snapshotV3ExtraItem(): SubscriptionSnapshot {
+  return {
+    id: SUB,
+    version: "v3",
+    status: "active",
+    items: [
+      { id: "item_1", offeringRef: "plan", quantity: 2 },
+      { id: "item_2", offeringRef: "addon", quantity: 1 },
+    ],
+    billing: { currency: "USD", cadence: "MONTHLY", recurringAmount: QUOTED.recurring },
+  };
+}
+
+function snapshotV4TargetOnly(): SubscriptionSnapshot {
+  return {
+    id: SUB,
+    version: "v4",
+    status: "active",
+    items: [{ id: "item_1", offeringRef: "plan", quantity: 2 }],
+    billing: { currency: "USD", cadence: "MONTHLY", recurringAmount: QUOTED.recurring },
+  };
+}
+
+test("Test 50.28 (cross-observation coherence): dimensions established against DIFFERENT post-commit states must not compose into a promoted verified view", () => {
+  const { store } = seededStore("q50_28", candidates({ immediate: QUOTED.immediate, recurring: QUOTED.recurring }));
+
+  // Entry A: establishes the IMMEDIATE actual (the S_v2 record's
+  // operation-bound charge) from an observation of state S_v2,
+  // against which the post-commit state is UNVERIFIABLE (the
+  // read omitted the item collection).
+  const obsA = observationFromRecord(makeProviderRecord(), { omit: ["recurring"], source: "test50.28: read of state v2 (immediate)" });
+  obsA.resultingSnapshot = snapshotV2CollectionOmitted();
+  const tokenA = mint(store, "q50_28", obsA);
+  assert.equal(tokenA.stateVerification, "UNVERIFIABLE", "fixture check: state v2 does not verify");
+  const viewA = store.recordReceiptEvidence("q50_28", tokenA);
+  assert.equal(viewA.outcome, "COMMITTED_UNVERIFIED");
+  assert.equal(viewA.committedEffect.immediate?.net, QUOTED.immediate, "the immediate actual is displayed");
+
+  // Entry B: establishes the RECURRING actual (the S_v3 record's
+  // item amounts, summed) from an observation of state S_v3 — a
+  // DIFFERENT, later post-commit state — and carries the
+  // VERIFIED state verdict FOR S_v3.
+  const obsB = observationFromRecord(makeProviderRecord(), { omit: ["immediate"], source: "test50.28: read of state v3 (recurring)" });
+  obsB.resultingSnapshot = snapshotV3ExtraItem();
+  const tokenB = mint(store, "q50_28", obsB);
+  assert.equal(tokenB.stateVerification, "VERIFIED", "fixture check: the targeted check passes against state v3");
+  const viewB = store.recordReceiptEvidence("q50_28", tokenB);
+
+  // Truthful outcome: the composed figures and the verified
+  // state were never supported by one coherent observation —
+  // the immediate actual was established against S_v2 (state
+  // unverified) and the state verdict describes S_v3. The
+  // entries are individually admissible and both actuals may be
+  // RECORDED and displayed, but the record must NOT promote.
+  assert.equal(viewB.committedEffect.immediate?.net, QUOTED.immediate, "the composed immediate actual is still displayed");
+  assert.equal(viewB.committedEffect.recurring?.resultingAmount, QUOTED.recurring, "the composed recurring actual is still displayed");
+  assert.equal(viewB.committedEffect.determinacy?.immediateFinancialEffect, "DETERMINED");
+  assert.equal(viewB.committedEffect.determinacy?.recurringFinancialEffect, "DETERMINED");
+  assert.equal(
+    viewB.outcome,
+    "COMMITTED_UNVERIFIED",
+    "a VERIFIED verdict for state v3 must not promote figures established against state v2"
+  );
+  assert.equal(viewB.reconciliation.status, "UNVERIFIED");
+  assert.match(
+    viewB.reconciliation.status === "UNVERIFIED" ? viewB.reconciliation.reason : "",
+    /different observed|incoheren|coheren/i,
+    "the blocker names the cross-observation incoherence"
+  );
+});
+
+test("Test 50.29 (cross-observation coherence, variant): a VERIFIED entry establishing NO dimension cannot lend its state verdict to financials established against two other states", () => {
+  const { store } = seededStore("q50_29", candidates({ immediate: QUOTED.immediate, recurring: QUOTED.recurring }));
+
+  // Financial entries from states v2 and v3 (both state-
+  // UNVERIFIABLE: their reads omit the item collection).
+  const obsA = observationFromRecord(makeProviderRecord(), { omit: ["recurring"], source: "test50.29: read of state v2 (immediate)" });
+  obsA.resultingSnapshot = snapshotV2CollectionOmitted();
+  const tokenA = mint(store, "q50_29", obsA);
+  assert.equal(tokenA.stateVerification, "UNVERIFIABLE");
+  store.recordReceiptEvidence("q50_29", tokenA);
+
+  const obsB = observationFromRecord(makeProviderRecord(), { omit: ["immediate"], source: "test50.29: read of state v3 (recurring)" });
+  obsB.resultingSnapshot = {
+    id: SUB,
+    version: "v3",
+    status: "active",
+    billing: { currency: "USD", cadence: "MONTHLY", recurringAmount: QUOTED.recurring },
+  } as unknown as SubscriptionSnapshot;
+  const tokenB = mint(store, "q50_29", obsB);
+  assert.equal(tokenB.stateVerification, "UNVERIFIABLE");
+  store.recordReceiptEvidence("q50_29", tokenB);
+
+  // A third observation, of a THIRD state (v4), establishes no
+  // financial dimension at all — but its state verdict is
+  // VERIFIED for v4.
+  const obsC = observationFromRecord(makeProviderRecord(), { omit: ["immediate", "recurring"], source: "test50.29: read of state v4 (state only)" });
+  obsC.resultingSnapshot = snapshotV4TargetOnly();
+  const tokenC = mint(store, "q50_29", obsC);
+  assert.equal(tokenC.stateVerification, "VERIFIED", "fixture check: state v4 verifies");
+  const view = store.recordReceiptEvidence("q50_29", tokenC);
+
+  assert.equal(view.committedEffect.immediate?.net, QUOTED.immediate);
+  assert.equal(view.committedEffect.recurring?.resultingAmount, QUOTED.recurring);
+  assert.equal(
+    view.outcome,
+    "COMMITTED_UNVERIFIED",
+    "a state verdict for v4 must not promote actuals established against v2 and v3"
+  );
+  assert.equal(view.reconciliation.status, "UNVERIFIED");
+  assert.match(view.reconciliation.status === "UNVERIFIED" ? view.reconciliation.reason : "", /different observed|incoheren|coheren/i);
+});
+
+test("Test 50.30 (cross-observation coherence at recovery): an incoherent trail stays unpromoted after restart, and a forged promoted view over it refuses restore", () => {
+  const { store } = seededStore("q50_30", candidates({ immediate: QUOTED.immediate, recurring: QUOTED.recurring }));
+  const obsA = observationFromRecord(makeProviderRecord(), { omit: ["recurring"] });
+  obsA.resultingSnapshot = snapshotV2CollectionOmitted();
+  store.recordReceiptEvidence("q50_30", mint(store, "q50_30", obsA));
+  const obsB = observationFromRecord(makeProviderRecord(), { omit: ["immediate"] });
+  obsB.resultingSnapshot = snapshotV3ExtraItem();
+  const liveView = store.recordReceiptEvidence("q50_30", mint(store, "q50_30", obsB));
+  assert.equal(liveView.outcome, "COMMITTED_UNVERIFIED", "the live view does not promote on incoherent composition");
+
+  const persisted = store.serializeReceiptRecords();
+  const restored = new QuoteStore();
+  restored.put(makeQuote50("q50_30"));
+  restored.restoreReceiptRecords(persisted);
+  const q = restored.get("q50_30")!;
+  assert.deepEqual(q.commit_receipt, liveView, "the restored view is the same unpromoted derivation");
+  assert.equal(q.commit_receipt?.outcome, "COMMITTED_UNVERIFIED");
+
+  // Forge the persisted current view into the promoted shape
+  // the incoherent trail cannot support: restore must refuse
+  // the whole set (the view is derived, never trusted).
+  const forged = JSON.parse(persisted);
+  forged.records[0].current_receipt = {
+    ...forged.records[0].current_receipt,
+    status: "COMMITTED",
+    outcome: "COMMITTED_AND_VERIFIED",
+    reconciliation: { status: "OK" },
+  };
+  const r2 = new QuoteStore();
+  r2.put(makeQuote50("q50_30"));
+  assert.throws(() => r2.restoreReceiptRecords(JSON.stringify(forged)), /coheren|derived|current view/i);
+  assert.equal(r2.get("q50_30")!.commit_receipt, undefined, "no partial adoption");
+});
+
+test("Test 50.31 (coherence control): partial entries and a state verdict drawn from reads of the SAME state revision compose and promote", () => {
+  const { store } = seededStore("q50_31", candidates({ immediate: QUOTED.immediate, recurring: QUOTED.recurring }));
+  // All three observations are of state revision v3: the two
+  // financial reads omit the item collection (state
+  // UNVERIFIABLE from those reads alone); the third read of
+  // the SAME revision carries the collection and verifies it.
+  const v3NoItems = (): SubscriptionSnapshot =>
+    ({
+      id: SUB,
+      version: "v3",
+      status: "active",
+      billing: { currency: "USD", cadence: "MONTHLY", recurringAmount: QUOTED.recurring },
+    }) as unknown as SubscriptionSnapshot;
+
+  const obsA = observationFromRecord(makeProviderRecord(), { omit: ["recurring"], source: "test50.31: read of state v3 (immediate)" });
+  obsA.resultingSnapshot = v3NoItems();
+  store.recordReceiptEvidence("q50_31", mint(store, "q50_31", obsA));
+
+  const obsB = observationFromRecord(makeProviderRecord(), { omit: ["immediate"], source: "test50.31: read of state v3 (recurring)" });
+  obsB.resultingSnapshot = v3NoItems();
+  store.recordReceiptEvidence("q50_31", mint(store, "q50_31", obsB));
+
+  const obsC = observationFromRecord(makeProviderRecord(), { omit: ["immediate", "recurring"], source: "test50.31: read of state v3 (state only)" });
+  obsC.resultingSnapshot = snapshotV3ExtraItem();
+  const tokenC = mint(store, "q50_31", obsC);
+  assert.equal(tokenC.stateVerification, "VERIFIED");
+  const view = store.recordReceiptEvidence("q50_31", tokenC);
+
+  assert.equal(view.outcome, "COMMITTED_AND_VERIFIED", "reads of ONE state revision compose coherently and may promote");
+  assert.equal(view.reconciliation.status, "OK");
+  assert.equal(view.committedEffect.immediate?.net, QUOTED.immediate);
+  assert.equal(view.committedEffect.recurring?.resultingAmount, QUOTED.recurring);
+});
+
 test("Test 50.27: durable store — an interrupted evidence append cannot persist a phantom verified view (fault injection, both fault points)", () => {
   for (const faultPoint of ["beforePersist", "insidePersistTx"] as const) {
     const path = tmpDbPath(`durable-fault-${faultPoint}`);

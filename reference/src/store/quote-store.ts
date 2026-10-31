@@ -177,6 +177,23 @@ export type ReceiptEvidenceEntry = {
   evidence: VerificationEvidence;
   /** PR-17: content-derived evidence identity (sha-256 over the bound identity digest + canonical evidence contents). */
   evidenceId?: string;
+  /**
+   * PR-17 review correction (cross-observation coherence): the
+   * identity of the post-commit state this entry's evidence was
+   * established AGAINST — a digest of the originating
+   * observation's resulting-snapshot identity (its subscription
+   * id + state revision `version`, the state identity the
+   * protocol's own staleness semantics already use). Stamped at
+   * minting from the observation itself and bound into the
+   * entry's `evidenceId`; absent when the observation carried
+   * no resulting snapshot (and on legacy entries). It is a
+   * COHERENCE KEY for composition, not an authenticity proof:
+   * it lets the promotion rule require that the entries a
+   * promoted view rests on were established against ONE observed
+   * state revision, instead of silently composing actuals and a
+   * state verdict that were observed against different states.
+   */
+  observedStateDigest?: string;
   /** PR-17: per-dimension disposition toward the recorded candidates. */
   disposition?: {
     immediateFinancialEffect: ReceiptEvidenceDimensionDisposition;
@@ -198,8 +215,34 @@ export type ReceiptEvidenceEntry = {
  * entry whose stated id differs from its contents has been
  * altered.
  */
-export function evidenceEntryId(identityDigest: string, evidence: VerificationEvidence): string {
-  return createHash("sha256").update(canonical({ identityDigest, evidence }), "utf8").digest("hex");
+export function evidenceEntryId(
+  identityDigest: string,
+  evidence: VerificationEvidence,
+  observedStateDigest?: string
+): string {
+  return createHash("sha256")
+    .update(canonical({ identityDigest, evidence, observedStateDigest: observedStateDigest ?? null }), "utf8")
+    .digest("hex");
+}
+
+/**
+ * PR-17 review correction: the observed-state identity of one
+ * provider observation — the (subscription, state-revision)
+ * pair of its resulting snapshot, digested. Two observations of
+ * the SAME state revision share this identity however much of
+ * the state each read presented (a read omitting the item
+ * collection and a full read of that revision are observations
+ * of one state); observations of different revisions never do.
+ * An observation carrying no resulting snapshot has NO observed
+ * state identity (undefined): its figures may be recorded, but
+ * they cannot take part in a cross-entry promotion (see the
+ * coherence rule in `analyzeEvidenceTrail`).
+ */
+export function observedStateDigestOf(snapshot: { id: string; version: string } | undefined): string | undefined {
+  if (!snapshot) return undefined;
+  return createHash("sha256")
+    .update(canonical({ subscriptionId: snapshot.id, version: snapshot.version }), "utf8")
+    .digest("hex");
 }
 
 type FinancialDimensionKey = "immediateFinancialEffect" | "recurringFinancialEffect";
@@ -245,6 +288,28 @@ function dimensionEstablished(effect: CommercialEffect, dim: FinancialDimensionK
  * confirms it; a later entry establishing a DIFFERENT value is a
  * conflict — flagged on that entry, never substituted.
  *
+ * Cross-observation coherence (PR-17 review correction):
+ * composition composes FIGURES per dimension, but a promotion
+ * also claims the post-commit STATE was verified — and that
+ * verdict was computed inside ONE entry's originating
+ * observation, against the state THAT observation read. The
+ * PROMOTION BASIS is the set of entries the promoted view's
+ * claims rest on: the accepted establisher of each dimension,
+ * plus — when none of them carries the VERIFIED verdict — the
+ * first VERIFIED entry. The basis is COHERENT only when it is a
+ * single entry (one observation is coherent with itself by
+ * construction), or when every basis entry carries the SAME
+ * observed-state identity (the same state revision; see
+ * `observedStateDigestOf`). A basis entry with NO observed-state
+ * identity cannot take part in a cross-entry promotion: its
+ * figures are recordable and displayable, but a promotion that
+ * would rest on composing it with other entries' observations
+ * is not available. Without this rule, actuals established
+ * against one post-commit state and a VERIFIED verdict
+ * established against a different, incompatible state composed
+ * into a COMMITTED_AND_VERIFIED view no single observation
+ * ever supported.
+ *
  * The composed effect's whole-effect `committedSource` claims an
  * establishing source ONLY when every participating dimension
  * (one not resolved NOT_APPLICABLE) is established; otherwise it
@@ -263,6 +328,9 @@ function analyzeEvidenceTrail(
   anyConflict: boolean;
   conflictDimensions: FinancialDimensionKey[];
   stateVerified: boolean;
+  /** PR-17 review correction: the entries a promotion would rest on, and whether they share one observed-state identity. */
+  promotionBasis: number[];
+  promotionCoherent: boolean;
 } {
   const fields = receiptIdentityFields(recorded);
   const candidateFigure: Record<FinancialDimensionKey, number | null> = {
@@ -335,12 +403,29 @@ function analyzeEvidenceTrail(
   const conflictDimensions = FINANCIAL_DIMENSIONS.filter((dim) =>
     perEntry.some((p) => p.conflicts[dim] !== undefined)
   );
+  const stateVerified = entries.some((e) => e.evidence.stateVerification === "VERIFIED");
+  // The promotion basis: the accepted establisher of each
+  // dimension, plus the first VERIFIED entry when no establisher
+  // carries the verdict itself.
+  const promotionBasis: number[] = [];
+  for (const acc of accepted.values()) {
+    if (!promotionBasis.includes(acc.entryIndex)) promotionBasis.push(acc.entryIndex);
+  }
+  if (stateVerified && !promotionBasis.some((i) => entries[i].evidence.stateVerification === "VERIFIED")) {
+    promotionBasis.push(entries.findIndex((e) => e.evidence.stateVerification === "VERIFIED"));
+  }
+  const basisDigests = promotionBasis.map((i) => entries[i].observedStateDigest);
+  const promotionCoherent =
+    promotionBasis.length <= 1 ||
+    (basisDigests.every((d) => d !== undefined) && basisDigests.every((d) => d === basisDigests[0]));
   return {
     perEntry,
     composedEffect: composed,
     anyConflict: conflictDimensions.length > 0,
     conflictDimensions,
-    stateVerified: entries.some((e) => e.evidence.stateVerification === "VERIFIED"),
+    stateVerified,
+    promotionBasis,
+    promotionCoherent,
   };
 }
 
@@ -903,7 +988,12 @@ export class QuoteStore {
       identityDigest: q.commit_receipt_identity_digest!,
       evidence: deepCopy(evidence),
     };
-    entry.evidenceId = evidenceEntryId(entry.identityDigest, entry.evidence);
+    // PR-17 review correction: carry the observed-state
+    // identity stamped at minting (module-private binding) into
+    // the entry, bound by its content-derived evidence id.
+    const binding = establishedTokenBindings.get(evidence);
+    if (binding?.observedStateDigest !== undefined) entry.observedStateDigest = binding.observedStateDigest;
+    entry.evidenceId = evidenceEntryId(entry.identityDigest, entry.evidence, entry.observedStateDigest);
     const analysis = analyzeEvidenceTrail(recorded, [...trailSoFar, entry]);
     const mine = analysis.perEntry[analysis.perEntry.length - 1];
     entry.disposition = mine.disposition;
@@ -924,12 +1014,19 @@ export class QuoteStore {
    *    candidates' figures and labels verbatim);
    *  - PROMOTION to COMMITTED_AND_VERIFIED requires ALL of: no
    *    unresolved evidence conflict; at least one accepted entry
-   *    whose state verification is VERIFIED; and a reconciliation
+   *    whose state verification is VERIFIED; a reconciliation
    *    — recomputed here from the recorded QUOTED effect, the
    *    composed actuals, and the envelope (never from the
    *    candidates as a baseline) — that is determined (OK, or
-   *    VIOLATED: verified-with-violation). The promoted view's
-   *    reconciliation is that recomputation.
+   *    VIOLATED: verified-with-violation); and CROSS-OBSERVATION
+   *    COHERENCE (PR-17 review correction): the entries the
+   *    promotion rests on (the accepted establishers, plus the
+   *    VERIFIED entry when no establisher carries the verdict)
+   *    share ONE observed-state identity — actuals established
+   *    against one post-commit state and a verdict established
+   *    against a different state never compose into a verified
+   *    view. The promoted view's reconciliation is that
+   *    recomputation.
    *  - a non-promoted view keeps outcome COMMITTED_UNVERIFIED
    *    and reports an UNVERIFIED reconciliation naming the
    *    blocker (the conflict, the still-undetermined dimensions,
@@ -971,6 +1068,16 @@ export class QuoteStore {
         reason:
           `the financial actuals are established, but no accepted evidence establishes the post-commit state ` +
           `as VERIFIED (§6.12); the record remains COMMITTED_UNVERIFIED`,
+        undeterminedDimensions: [],
+      };
+    } else if (!analysis.promotionCoherent) {
+      reconciliation = {
+        status: "UNVERIFIED",
+        reason:
+          `the accepted actuals and the VERIFIED post-commit state were established against different observed ` +
+          `post-commit states (evidence entries ${analysis.promotionBasis.map((i) => i + 1).join(", ")} do not share ` +
+          `one observed-state identity): no single coherent observation supports the composed figures together ` +
+          `with the verified state, so the record remains COMMITTED_UNVERIFIED while the composition is incoherent`,
         undeterminedDimensions: [],
       };
     } else {
@@ -1054,7 +1161,7 @@ export class QuoteStore {
     }
     const trail = q.commit_receipt_verifications ?? [];
     const entry = this.buildEvidenceEntry(q, recorded, evidence, at, trail);
-    if (trail.some((e) => (e.evidenceId ?? evidenceEntryId(e.identityDigest, e.evidence)) === entry.evidenceId)) {
+    if (trail.some((e) => (e.evidenceId ?? evidenceEntryId(e.identityDigest, e.evidence, e.observedStateDigest)) === entry.evidenceId)) {
       // Idempotent resubmission of the same evidence: nothing is
       // appended, nothing is re-derived, the current view stands.
       return deepCopy(q.commit_receipt);
@@ -1156,7 +1263,7 @@ export class QuoteStore {
     const trail = q.commit_receipt_verifications ?? [];
     const entry = this.buildEvidenceEntry(q, recorded, evidence, at, trail);
     const alreadyRecorded = trail.some(
-      (e) => (e.evidenceId ?? evidenceEntryId(e.identityDigest, e.evidence)) === entry.evidenceId
+      (e) => (e.evidenceId ?? evidenceEntryId(e.identityDigest, e.evidence, e.observedStateDigest)) === entry.evidenceId
     );
     const candidateTrail = alreadyRecorded ? trail : [...trail, entry];
     const derived = this.deriveCurrentView(q, recorded, candidateTrail);
@@ -1191,7 +1298,7 @@ export class QuoteStore {
     if (entries.length > 0) {
       const analysis = analyzeEvidenceTrail(recorded, entries);
       entries.forEach((entry, i) => {
-        entry.evidenceId = evidenceEntryId(entry.identityDigest, entry.evidence);
+        entry.evidenceId = evidenceEntryId(entry.identityDigest, entry.evidence, entry.observedStateDigest);
         entry.disposition = analysis.perEntry[i].disposition;
         if (Object.keys(analysis.perEntry[i].conflicts).length > 0) {
           entry.conflicts = analysis.perEntry[i].conflicts;
@@ -1310,7 +1417,7 @@ export class QuoteStore {
       if (!deepEqualCanonical(entry.reconciliation, entry.evidence.reconciliation)) {
         throw incoherent(`the trail entry's reconciliation differs from its own evidence's reconciliation`);
       }
-      const derivedId = evidenceEntryId(entry.identityDigest, entry.evidence);
+      const derivedId = evidenceEntryId(entry.identityDigest, entry.evidence, entry.observedStateDigest);
       if (entry.evidenceId !== undefined && entry.evidenceId !== derivedId) {
         throw incoherent(
           `the trail entry's stated evidenceId does not match its contents — the entry has been altered`
@@ -1526,7 +1633,7 @@ const establishedEvidenceTokens = new WeakSet<object>();
  */
 const establishedTokenBindings = new WeakMap<
   object,
-  { quoteId: string; subscriptionId: string; contentDigest: string }
+  { quoteId: string; subscriptionId: string; contentDigest: string; observedStateDigest?: string }
 >();
 
 /**
@@ -1649,6 +1756,16 @@ export function establishVerification(quote: StoredQuote, observation: ProviderO
     quoteId: quote.quote_id,
     subscriptionId: quote.subscription_id,
     contentDigest: canonical(token),
+    // PR-17 review correction: the identity of the state THIS
+    // observation read — stamped beside the binding so the
+    // evidence entry built from this token can carry it into
+    // the trail, where the promotion rule's cross-observation
+    // coherence check compares it across entries. (An
+    // observation with no resulting snapshot stamps nothing:
+    // no observed-state identity was established.)
+    ...(observation.resultingSnapshot
+      ? { observedStateDigest: observedStateDigestOf(observation.resultingSnapshot) }
+      : {}),
   });
   return token;
 }

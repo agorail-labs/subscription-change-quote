@@ -11,7 +11,7 @@
  */
 export * from "./core/types.js";
 export { verifyPostCommitState } from "./core/state-verification.js";
-export { QuoteStore, establishVerification, evidenceEntryId, type ReceiptEvidenceEntry, type ReceiptEvidenceDimensionDisposition } from "./store/quote-store.js";
+export { QuoteStore, establishVerification, evidenceEntryId, observedStateDigestOf, type ReceiptEvidenceEntry, type ReceiptEvidenceDimensionDisposition } from "./store/quote-store.js";
 export {
   DurableQuoteStore,
   DurableStoreError,
