@@ -1,6 +1,6 @@
 # SCQ developer quickstart (simulator only)
 
-This guide exercises the **SCQ v0.6.1 contract** with an in-memory, Stripe-shaped billing simulator. It does not call Stripe or any other live provider and is not an installable or production-certified SDK.
+This guide exercises the **SCQ v0.6.2 contract** with an in-memory, Stripe-shaped billing simulator. It does not call Stripe or any other live provider and is not an installable or production-certified SDK.
 
 ## Requirements
 
@@ -43,4 +43,4 @@ The commit demo operates **only** on the in-memory fixture. Its flag is a teachi
 - No reference adapter claims a provider-enforced atomic compare-and-swap for the commit precondition.
 - Conformance tests verify the model and selected rules. They do not prove production interoperability.
 
-For the contract, read [the SCQ v0.6.1 specification](../spec/scq-v0.6.1-spec.md) and [security considerations](../spec/security-considerations.md).
+For the contract, read [the SCQ v0.6.2 specification](../spec/scq-v0.6.2-spec.md) and [security considerations](../spec/security-considerations.md). (The previous specification, [SCQ v0.6.1](../spec/scq-v0.6.1-spec.md), is retained unchanged.)

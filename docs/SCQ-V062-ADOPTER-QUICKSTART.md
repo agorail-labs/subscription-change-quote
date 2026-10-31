@@ -1,6 +1,6 @@
-# SCQ developer quick start — v0.6.2 candidate (simulator only)
+# SCQ developer quick start — v0.6.2 (simulator only)
 
-Status: **unreleased adopter-preview documentation.** SCQ v0.6.1 remains the current published specification. The v0.6.2 specification candidate is ratified and merged but has **not** been published; this document does not authorize that transition. The reference package is `private: true` and **not published on npm**.
+Status: **adopter documentation for SCQ v0.6.2, published as an experimental specification.** The v0.6.2 specification was ratified and merged (PR #21) and is published as the project's current experimental specification by the publication change carrying this header; the `spec-v0.6.2` tag and GitHub Release are created by the maintainer at activation. SCQ v0.6.1 is the previous specification. The reference package is `private: true` and **not published on npm**; no live commit is authorized.
 
 ## Run without real billing credentials
 
@@ -56,14 +56,14 @@ The recorded receipt remains immutable. Later verification is an **append-only e
 
 ## Upgrade/migration documentation
 
-- [v0.6.2 candidate specification](../spec/scq-v0.6.2-spec.md)
+- [v0.6.2 specification](../spec/scq-v0.6.2-spec.md)
 - [BC-1…BC-6 migration guide](../research/v0.6.2-migration-guide.md)
 - [75-rule traceability and PARTIAL rows](../conformance/v0.6.2-traceability.md)
 - [Release gaps and limitations](../research/v0.6.2-release-gaps.md)
 - [Publication and package decision gates](../research/v0.6.2-publication-decision.md)
 - [Reference package README](../reference/README.md)
 
-Existing v0.6.1 serialized quotes with absent determinacy are read as UNKNOWN for enforcement and must not be converted to DETERMINED by default. Do not treat the current 719 simulated tests as provider-backed conformance certification.
+Existing v0.6.1 serialized quotes with absent determinacy are read as UNKNOWN for enforcement and must not be converted to DETERMINED by default. Do not treat the current 803 simulated tests as provider-backed conformance certification.
 
 ## Provider safety is separate
 

@@ -1,14 +1,15 @@
-# SCQ v0.6.2 — Normative Specification Candidate (Fail-Closed Financial Semantics)
+# SCQ v0.6.2 — Normative Specification (Fail-Closed Financial Semantics)
 
-Status: DRAFT — proposed v0.6.2 specification; not approved, published, or released. v0.6.1 remains the current specification.
+Status: PUBLISHED — experimental specification. Ratified by the maintainer (PR #21, Oct 31, 2026) and published <DATE>. v0.6.1 is the previous specification. Publication asserts this text as the project's experimental normative semantics; it is not a conformance certification, not a package release, and not an authorization for live provider mutation. Open items and disclosed limitations are recorded in §9 and in `research/v0.6.2-release-gaps.md`.
 
-This document is a specification **candidate** prepared for independent review under the
-repository's `protocol-change-approved` process (design: issue #7; pilot readiness: issue #12).
-It changes nothing by existing. Until a maintainer reviews this candidate and applies the
-approval process, `spec/scq-v0.6.1-spec.md` is the only normative SCQ specification, and no
-implementation, release note, or evidence report may cite v0.6.2 as an approved standard.
+This document is the project's current experimental normative specification, ratified by the
+maintainer under the repository's `protocol-change-approved` process (PR #21; design:
+issue #7; pilot readiness: issue #12) and published as an **experimental** specification.
+`spec/scq-v0.6.1-spec.md` is the previous specification. Publication asserts this text's
+semantics as the project's experimental standard; the limits of that assertion are stated in
+the status block above and in §9.
 
-**What this candidate is.** v0.6.2 is a semantics cycle, not a scope cycle. It adds no
+**What this specification is.** v0.6.2 is a semantics cycle, not a scope cycle. It adds no
 providers, no actions, and no guarantee modes. It corrects three defects that live validation
 of the experimental Chargebee adapter exposed in v0.6.1's *financial semantics* — what the
 protocol allowed an adapter to claim, not any adapter's arithmetic:
@@ -35,10 +36,14 @@ current views that replaces every candidate-equals-actual requirement (§3.10, �
 merged implementation on `main` (PRs #8, #10–#11, #13–#20, and — after the PR #21
 reconciliation round — PRs #23–#27, at `main` 82cbd1d) and agrees with it, except where a
 discrepancy is recorded inline with a `DISCREPANCY` marker and entered in
-`research/v0.6.2-release-gaps.md`. Where this candidate and the code disagree silently, the
+`research/v0.6.2-release-gaps.md`. Where this specification and the code disagree silently, the
 code is not thereby conformed and this text is not thereby correct — the gap register is the
 authoritative list of known disagreements and open decisions. Conformance evidence is mapped
 clause-by-clause in `conformance/v0.6.2-traceability.md`.
+
+**Migration from v0.6.1.** Adopters moving from v0.6.1 follow
+`research/v0.6.2-migration-guide.md` (BC-1…BC-6), which states each breaking change, its
+fail-closed behaviour, and its verified implementation status; §8 summarizes the same delta.
 
 **Conventions.** "§n" references without a version qualifier are to this document. Sections
 carried over from v0.6.1 unchanged are marked *(v0.6.1, unchanged)*; sections new or modified
