@@ -414,13 +414,23 @@ export class DurableQuoteStore extends QuoteStore {
       // record map directly because the parent exposes no setter
       // for an already-validated record; it changes nothing the
       // validation decided.
+      //
+      // PR-17: the current view is NOT copied from the persisted
+      // current_json — the view is a derived value (recorded
+      // receipt + evidence trail), so after the verbatim recorded
+      // receipt and trail are substituted, the view and the
+      // entries' derived fields are re-derived from those verbatim
+      // inputs via the parent's adoptDerivedView. A persisted
+      // legacy (pre-PR-17) current view therefore recovers as the
+      // truthful derived view, exactly as the parent's restore
+      // coherence approved.
       const internal = (this as unknown as { quotes: Map<string, StoredQuote> }).quotes;
       for (const rec of records) {
         const q = internal.get(rec.quote_id);
         if (!q) continue;
         q.commit_receipt_recorded = deepFreezeLocal(deepCopyLocal(rec.recorded_receipt));
-        q.commit_receipt = deepCopyLocal(rec.current_receipt);
         q.commit_receipt_verifications = deepCopyLocal(rec.verifications) as StoredQuote["commit_receipt_verifications"];
+        QuoteStore.prototype.adoptDerivedView.call(this, rec.quote_id);
       }
     }
     this.recoverAttempts();
@@ -578,6 +588,28 @@ export class DurableQuoteStore extends QuoteStore {
     this.assertHealthy();
     const current = QuoteStore.prototype.verifyCommitReceipt.call(this, quoteId, evidence, presentedReceipt, at);
     this.persistQuote(quoteId, "verifyCommitReceipt");
+    return current;
+  }
+
+  /**
+   * PR-17: evidence appends are write-through like every other
+   * receipt mutation — the in-memory append + view re-derivation
+   * and the SQLite transaction (quote row + receipt record, ONE
+   * transaction in persistQuote) are the atomicity boundary: a
+   * persistence failure poisons the instance (D1), so an append
+   * that did not reach disk is never served as durable, and a
+   * restart recovers exactly the pre- or post-append record,
+   * never a promoted view without its supporting evidence.
+   */
+  override recordReceiptEvidence(
+    quoteId: string,
+    evidence: VerificationEvidence,
+    presentedReceipt?: SubscriptionChangeReceipt,
+    at?: string,
+  ): SubscriptionChangeReceipt {
+    this.assertHealthy();
+    const current = QuoteStore.prototype.recordReceiptEvidence.call(this, quoteId, evidence, presentedReceipt, at);
+    this.persistQuote(quoteId, "recordReceiptEvidence");
     return current;
   }
 

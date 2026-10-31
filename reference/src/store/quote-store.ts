@@ -17,6 +17,7 @@
 // relying on replay semantics; see
 // research/chargebee-live-v1/LIMITATIONS-AND-GAPS.md D-3.
 
+import { createHash } from "node:crypto";
 import { SCQError, type AuthorizationScope, type CommercialEffect, type GuaranteeCoverage, type GuaranteeMode, type MultiChangeConsistency, type MutationCapability, type MutationOutcome, type ProviderObservation, type ReconciliationResult, type SubscriptionChangeProposal, type SubscriptionChangeReceipt, type VerificationEvidence } from "../core/types.js";
 import { reconcileCommittedEffect } from "../core/scq-engine.js";
 import { verifyPostCommitState } from "../core/state-verification.js";
@@ -117,6 +118,232 @@ function deepEqualCanonical(a: unknown, b: unknown): boolean {
 
 export type QuoteStatus = "ACTIVE" | "COMMITTED" | "EXPIRED" | "STALE" | "SUPERSEDED";
 
+/**
+ * PR-17 (Issue #22, Finding 5): the disposition of one evidence
+ * entry toward the RECORDED CANDIDATE of one financial dimension:
+ *  - "ESTABLISHES": the dimension had no recorded candidate; this
+ *    entry independently establishes its actual (F5a);
+ *  - "CONFIRMS": the entry establishes the same actual the
+ *    candidate recorded;
+ *  - "CONTRADICTS_CANDIDATE": the entry establishes a DIFFERENT
+ *    actual than the candidate recorded (F5b) — a statement about
+ *    the candidate, never an identity conflict: the recorded
+ *    receipt and its identity digest do not move;
+ *  - "UNRESOLVED": this entry does not establish the dimension
+ *    (its determinacy there is not DETERMINED/NOT_APPLICABLE, or
+ *    it carries no figure).
+ */
+export type ReceiptEvidenceDimensionDisposition =
+  | "ESTABLISHES"
+  | "CONFIRMS"
+  | "CONTRADICTS_CANDIDATE"
+  | "UNRESOLVED";
+
+/**
+ * PR-17 (Issue #22, Finding 5): one entry of a receipt's
+ * append-only EVIDENCE RECORD — the second layer of the receipt
+ * model, between the immutable recorded receipt (layer 1) and the
+ * derived current view (layer 3, `commit_receipt`).
+ *
+ * Entries are appended by `recordReceiptEvidence` /
+ * `verifyCommitReceipt` and never edited or removed afterwards.
+ * An entry is bound to the recorded receipt by `identityDigest`
+ * (the receipt's canonical recorded identity, candidates
+ * included) and carries its own content-derived `evidenceId`:
+ * resubmitting the same evidence is an idempotent no-op, and a
+ * persisted trail whose stated ids do not match their contents
+ * is refused at recovery.
+ *
+ * `disposition` records, per financial dimension, what this entry
+ * does to the recorded candidate. `conflicts` records, per
+ * dimension, that this entry's established actual contradicts an
+ * ALREADY-ACCEPTED established actual from an earlier entry: the
+ * deterministic conflict rule is first-established stands — the
+ * conflicting entry is appended and flagged, the accepted actual
+ * is never silently replaced, and the derived view carries an
+ * unresolved evidence conflict (never an unqualified OK) while
+ * any conflict stands.
+ *
+ * Entries persisted before PR-17 (the legacy one-transition
+ * trail) carry only {at, reconciliation, identityDigest,
+ * evidence}; the PR-17 fields are derived deterministically from
+ * their contents at recovery and filled in on adoption.
+ */
+export type ReceiptEvidenceEntry = {
+  at: string;
+  reconciliation: ReconciliationResult;
+  /** The recorded identity digest this entry is bound to (see C1/C2). */
+  identityDigest: string;
+  evidence: VerificationEvidence;
+  /** PR-17: content-derived evidence identity (sha-256 over the bound identity digest + canonical evidence contents). */
+  evidenceId?: string;
+  /** PR-17: per-dimension disposition toward the recorded candidates. */
+  disposition?: {
+    immediateFinancialEffect: ReceiptEvidenceDimensionDisposition;
+    recurringFinancialEffect: ReceiptEvidenceDimensionDisposition;
+  };
+  /** PR-17: per-dimension conflict notes — present only for dimensions where this entry contradicts an earlier accepted established actual. */
+  conflicts?: {
+    immediateFinancialEffect?: string;
+    recurringFinancialEffect?: string;
+  };
+};
+
+/**
+ * PR-17: the canonical identity of one evidence entry — a digest
+ * of the receipt identity it is bound to and its own contents.
+ * Derived, never asserted: two entries with the same id have the
+ * same bound identity and the same evidence contents, so a
+ * resubmission is detectable as a duplicate, and a persisted
+ * entry whose stated id differs from its contents has been
+ * altered.
+ */
+export function evidenceEntryId(identityDigest: string, evidence: VerificationEvidence): string {
+  return createHash("sha256").update(canonical({ identityDigest, evidence }), "utf8").digest("hex");
+}
+
+type FinancialDimensionKey = "immediateFinancialEffect" | "recurringFinancialEffect";
+const FINANCIAL_DIMENSIONS: FinancialDimensionKey[] = ["immediateFinancialEffect", "recurringFinancialEffect"];
+
+function dimensionFigure(effect: CommercialEffect, dim: FinancialDimensionKey): number | null {
+  return dim === "immediateFinancialEffect"
+    ? effect.immediate?.net ?? null
+    : effect.recurring?.resultingAmount ?? null;
+}
+
+/**
+ * PR-17: whether an evidence effect INDEPENDENTLY ESTABLISHES a
+ * dimension: its determinacy there is DETERMINED with a figure,
+ * or NOT_APPLICABLE (the dimension is resolved as not arising).
+ * A figure riding under UNKNOWN determinacy is candidate-grade —
+ * it establishes nothing, exactly the F5 distinction between a
+ * recorded candidate and an established actual.
+ */
+function dimensionEstablished(effect: CommercialEffect, dim: FinancialDimensionKey): boolean {
+  const state = effect.determinacy?.[dim];
+  if (state === "DETERMINED") return dimensionFigure(effect, dim) !== null;
+  return state === "NOT_APPLICABLE";
+}
+
+/**
+ * PR-17: the pure trail analysis behind every derived view and
+ * every recovery coherence check. Given the recorded receipt and
+ * its evidence trail IN ORDER, it computes:
+ *  - each entry's disposition toward the recorded candidates and
+ *    its conflicts against earlier accepted actuals;
+ *  - the COMPOSED committed effect: per dimension, the
+ *    establishing entry's figures, determinacy, and provenance
+ *    replace the recorded candidate's; unestablished dimensions
+ *    keep the candidate's slice and labels verbatim;
+ *  - whether any entry established the post-commit state as
+ *    VERIFIED, and whether any unresolved actuals conflict
+ *    stands.
+ *
+ * Composition rule (explicit, per the PR-17 design): per
+ * dimension, the FIRST entry that establishes the dimension sets
+ * the accepted actual; a later entry establishing the SAME value
+ * confirms it; a later entry establishing a DIFFERENT value is a
+ * conflict — flagged on that entry, never substituted.
+ *
+ * The composed effect's whole-effect `committedSource` claims an
+ * establishing source ONLY when every participating dimension
+ * (one not resolved NOT_APPLICABLE) is established; otherwise it
+ * reads "unestablished" — a verified label never rides on
+ * partially unestablished figures (F5c).
+ */
+function analyzeEvidenceTrail(
+  recorded: SubscriptionChangeReceipt,
+  entries: ReceiptEvidenceEntry[]
+): {
+  perEntry: Array<{
+    disposition: NonNullable<ReceiptEvidenceEntry["disposition"]>;
+    conflicts: NonNullable<ReceiptEvidenceEntry["conflicts"]>;
+  }>;
+  composedEffect: CommercialEffect;
+  anyConflict: boolean;
+  conflictDimensions: FinancialDimensionKey[];
+  stateVerified: boolean;
+} {
+  const fields = receiptIdentityFields(recorded);
+  const candidateFigure: Record<FinancialDimensionKey, number | null> = {
+    immediateFinancialEffect: fields.immediateNet,
+    recurringFinancialEffect: fields.recurringAmount,
+  };
+  const accepted = new Map<FinancialDimensionKey, { figure: number | null; entryIndex: number }>();
+  const perEntry = entries.map((entry, entryIndex) => {
+    const effect = entry.evidence.committedEffect;
+    const disposition = {} as NonNullable<ReceiptEvidenceEntry["disposition"]>;
+    const conflicts = {} as NonNullable<ReceiptEvidenceEntry["conflicts"]>;
+    for (const dim of FINANCIAL_DIMENSIONS) {
+      if (!dimensionEstablished(effect, dim)) {
+        disposition[dim] = "UNRESOLVED";
+        continue;
+      }
+      const figure = dimensionFigure(effect, dim);
+      disposition[dim] =
+        candidateFigure[dim] === null ? "ESTABLISHES" : candidateFigure[dim] === figure ? "CONFIRMS" : "CONTRADICTS_CANDIDATE";
+      const prior = accepted.get(dim);
+      if (!prior) {
+        accepted.set(dim, { figure, entryIndex });
+      } else if (prior.figure !== figure) {
+        conflicts[dim] =
+          `this entry establishes ${dim} = ${figure}, contradicting the already-accepted established actual ` +
+          `${prior.figure} from evidence entry ${prior.entryIndex + 1}; the first-established actual stands ` +
+          `and this conflict is recorded for investigation`;
+      }
+    }
+    return { disposition, conflicts };
+  });
+
+  const composed = deepCopy(recorded.committedEffect);
+  composed.determinacy = {
+    immediateFinancialEffect: recorded.committedEffect.determinacy?.immediateFinancialEffect ?? "UNKNOWN",
+    recurringFinancialEffect: recorded.committedEffect.determinacy?.recurringFinancialEffect ?? "UNKNOWN",
+  };
+  composed.provenance = { ...(recorded.committedEffect.provenance ?? {}) };
+  let anyEstablished = false;
+  let allParticipatingEstablished = true;
+  let sawProviderActual = false;
+  for (const dim of FINANCIAL_DIMENSIONS) {
+    const acc = accepted.get(dim);
+    if (!acc) {
+      if (composed.determinacy[dim] !== "NOT_APPLICABLE") allParticipatingEstablished = false;
+      continue;
+    }
+    anyEstablished = true;
+    const src = entries[acc.entryIndex].evidence.committedEffect;
+    if (entries[acc.entryIndex].evidence.committedSource === "provider_actual") sawProviderActual = true;
+    if (dim === "immediateFinancialEffect") {
+      if (src.immediate !== undefined) composed.immediate = deepCopy(src.immediate);
+      else delete composed.immediate;
+      if (src.provenance?.immediate !== undefined) composed.provenance.immediate = src.provenance.immediate;
+    } else {
+      if (src.recurring !== undefined) composed.recurring = deepCopy(src.recurring);
+      else delete composed.recurring;
+      if (src.provenance?.recurring !== undefined) composed.provenance.recurring = src.provenance.recurring;
+    }
+    composed.determinacy[dim] = src.determinacy?.[dim] ?? "DETERMINED";
+  }
+  composed.provenance.committedSource = !anyEstablished
+    ? recorded.committedEffect.provenance?.committedSource ?? "unestablished"
+    : allParticipatingEstablished
+      ? sawProviderActual
+        ? "provider_actual"
+        : "defined_equal_exact"
+      : "unestablished";
+
+  const conflictDimensions = FINANCIAL_DIMENSIONS.filter((dim) =>
+    perEntry.some((p) => p.conflicts[dim] !== undefined)
+  );
+  return {
+    perEntry,
+    composedEffect: composed,
+    anyConflict: conflictDimensions.length > 0,
+    conflictDimensions,
+    stateVerified: entries.some((e) => e.evidence.stateVerification === "VERIFIED"),
+  };
+}
+
 export type StoredQuote<TPreviewInput = unknown> = {
   quote_id: string;
   provider: "stripe" | "paddle" | "zuora" | "chargebee";
@@ -192,25 +419,20 @@ export type StoredQuote<TPreviewInput = unknown> = {
    */
   commit_receipt_identity_digest?: string;
   /**
-   * v0.6.2 (CORE-8 / F4): the verification append-trail — one entry
-   * per verification transition applied to this record (at most one
-   * can ever succeed). Recording a verification APPENDS here; it
-   * never rewrites the recorded receipt or its digest.
+   * v0.6.2 (CORE-8 / F4): the verification append-trail.
+   *
+   * PR-17 (Finding 5) re-founds this field as the receipt's
+   * append-only EVIDENCE RECORD (see `ReceiptEvidenceEntry`):
+   * entries are appended by `recordReceiptEvidence` and by the
+   * `verifyCommitReceipt` transition; an entry is never edited or
+   * removed, and appending never rewrites the recorded receipt or
+   * its digest. Multiple entries are expected — partial evidence
+   * first, completing or conflicting evidence later. The current
+   * view (`commit_receipt`) is DERIVED from the recorded receipt
+   * plus this trail (see `deriveCurrentView`); it is never an
+   * independently stored fact.
    */
-  commit_receipt_verifications?: Array<{
-    at: string;
-    reconciliation: ReconciliationResult;
-    /**
-     * PR #8 review correction C1/C2: the recorded identity digest
-     * this transition was bound to, and the evidence it was granted
-     * on. Recovery validates the trail as part of the record's
-     * coherence: a verified current view is coherent ONLY with
-     * exactly one trail entry, bound to the same identity, whose
-     * evidence itself validates against the recorded receipt.
-     */
-    identityDigest: string;
-    evidence: VerificationEvidence;
-  }>;
+  commit_receipt_verifications?: ReceiptEvidenceEntry[];
   /**
    * v0.6.2 (CORE-8): the terminal outcome of the LAST commit attempt
    * against this quote — recorded for EVERY terminal attempt,
@@ -429,30 +651,54 @@ export class QuoteStore {
   }
 
   /**
-   * PR #8 review correction C1: validates VerificationEvidence
-   * against a recorded receipt and its quote. Shared by
-   * `verifyCommitReceipt` (the live transition) and
+   * PR-17 (Finding 5): the ADMISSIBILITY validation for evidence —
+   * the first of the three questions the receipt model keeps
+   * separate. Is this evidence recordable against this recorded
+   * receipt at all? Shape, establishing provenance, internal
+   * consistency, and agreement between the evidence's claimed
+   * reconciliation and the store's own recomputation from the
+   * recorded quote, the evidence's figures, and the envelope.
+   *
+   * PR #8 review correction C1 originally validated evidence here
+   * for the single verification transition, including a
+   * requirement that the evidence's figures EQUAL the recorded
+   * candidates. PR-17 removes that equality requirement — it was
+   * Finding 5's root defect: candidate equality is not identity
+   * preservation. The recorded identity (digest, candidates
+   * included) is preserved by never rewriting the recorded
+   * receipt, not by refusing later actuals. What an entry
+   * establishes, and whether the record may be promoted, are
+   * separate questions answered by the trail analysis and the
+   * promotion rule — not by admissibility.
+   *
+   * Shared by `recordReceiptEvidence`, `verifyCommitReceipt`
+   * (which adds the promotion requirements), and
    * `restoreReceiptRecords` (recovery coherence: a persisted
-   * trail entry's evidence must validate the same way). Throws on
-   * the first failed requirement; returns nothing on success.
+   * trail entry's evidence must validate the same way).
    *
    * Round 2 (R3) note: this is the CONTENT validation. The live
-   * transition additionally requires the establishment brand
-   * (checked in `verifyCommitReceipt` before this runs). Recovery
-   * deliberately does NOT require the brand: it is a runtime
-   * property that serialization cannot carry, so a restored
-   * record's trust rests on this content validation plus the
-   * identity-digest binding and whole-set coherence (C2) — a
+   * paths additionally require the establishment brand (checked
+   * before this runs). Recovery deliberately does NOT require the
+   * brand: it is a runtime property that serialization cannot
+   * carry, so a restored record's trust rests on this content
+   * validation plus the identity-digest binding, the derived-view
+   * coherence (C2), and the per-entry content identities — a
    * persisted trail entry whose evidence was self-asserted before
    * persistence is indistinguishable from an established one
    * after the fact, which is one more reason the live path must
    * refuse self-assertion at issuance time.
    */
-  private assertEvidenceValid(
+  private assertEvidenceAdmissible(
     q: StoredQuote,
     recorded: SubscriptionChangeReceipt,
     evidence: VerificationEvidence
   ): void {
+    this.assertEvidenceShape(q, evidence);
+    this.assertEvidenceRecomputation(q, recorded, evidence);
+  }
+
+  /** The shape / provenance / internal-consistency limb of admissibility. */
+  private assertEvidenceShape(q: StoredQuote, evidence: VerificationEvidence): void {
     const quoteId = q.quote_id;
     if (
       !evidence ||
@@ -484,41 +730,24 @@ export class QuoteStore {
           `declares committedSource "${effectSource}" but the evidence presents "${evidence.committedSource}".`
       );
     }
-    if (evidence.stateVerification !== "VERIFIED") {
-      throw new Error(
-        `Verification refused: the post-commit state verification is ${evidence.stateVerification}; ` +
-          `only an established VERIFIED state (§6.12) can support a verification transition.`
-      );
-    }
-    if (evidence.reconciliation.status === "UNVERIFIED") {
-      throw new Error(
-        `Verification refused: a verification transition must carry a determined reconciliation ` +
-          `(OK or VIOLATED), not UNVERIFIED.`
-      );
-    }
-    // The evidence's figures must be the figures ON THE RECORD:
-    // the recorded actuals are what is being verified. (Where the
-    // honest outcome is VIOLATED, the actuals differ from the
-    // QUOTE — the reconciliation says so — never from the record
-    // of themselves.)
-    const recordedFields = receiptIdentityFields(recorded);
-    const evidenceImmediate = evidence.committedEffect.immediate?.net ?? null;
-    const evidenceRecurring = evidence.committedEffect.recurring?.resultingAmount ?? null;
-    if (evidenceImmediate !== recordedFields.immediateNet || evidenceRecurring !== recordedFields.recurringAmount) {
-      throw new SCQError(
-        "CONFLICTING_RECEIPT_IDENTITY",
-        `Verification refused: the evidence's committed figures (immediate.net=${evidenceImmediate}, ` +
-          `recurring.resultingAmount=${evidenceRecurring}) contradict the figures recorded on the ` +
-          `receipt for quote ${quoteId} (immediate.net=${recordedFields.immediateNet}, ` +
-          `recurring.resultingAmount=${recordedFields.recurringAmount}); evidence about different ` +
-          `figures cannot verify this record.`,
-        { quoteId, receiptId: recorded.receiptId }
-      );
-    }
-    // The claimed outcome must be the outcome the inputs actually
-    // compute: the store recomputes the reconciliation from the
-    // recorded quoted effect, the evidence's committed figures,
-    // and the quote's acceptance envelope.
+  }
+
+  /**
+   * The recomputation limb of admissibility: the claimed outcome
+   * must be the outcome the inputs actually compute — the store
+   * recomputes the reconciliation from the recorded quoted
+   * effect, the evidence's committed figures, and the quote's
+   * acceptance envelope. (This is also a mutation detector for
+   * caller-held tokens: a token whose figures or verdict were
+   * altered after minting often no longer recomputes to its
+   * claimed reconciliation; the minting-time content digest in
+   * `assertTokenUnaltered` covers the alterations it cannot see.)
+   */
+  private assertEvidenceRecomputation(
+    q: StoredQuote,
+    recorded: SubscriptionChangeReceipt,
+    evidence: VerificationEvidence
+  ): void {
     const recomputed = reconcileCommittedEffect(
       recorded.quotedEffect,
       evidence.committedEffect,
@@ -545,6 +774,298 @@ export class QuoteStore {
   }
 
   /**
+   * PR-17: the PROMOTION requirements, layered on admissibility —
+   * the third question. The `verifyCommitReceipt` transition
+   * additionally requires the presented evidence itself to carry
+   * an established VERIFIED post-commit state and a DETERMINED
+   * reconciliation: the transition is the single-shot promotion,
+   * and a partial or state-unestablished token cannot perform it
+   * (it remains recordable via `recordReceiptEvidence`, where it
+   * contributes its established dimensions to the derived view
+   * without promoting the record).
+   */
+  private assertEvidencePromotable(
+    q: StoredQuote,
+    recorded: SubscriptionChangeReceipt,
+    evidence: VerificationEvidence
+  ): void {
+    // Check order preserves the pre-PR-17 refusal semantics: the
+    // state and determined-reconciliation requirements are named
+    // before the recomputation consistency check, exactly as the
+    // single fused validator ordered them.
+    this.assertEvidenceShape(q, evidence);
+    if (evidence.stateVerification !== "VERIFIED") {
+      throw new Error(
+        `Verification refused: the post-commit state verification is ${evidence.stateVerification}; ` +
+          `only an established VERIFIED state (§6.12) can support a verification transition.`
+      );
+    }
+    if (evidence.reconciliation.status === "UNVERIFIED") {
+      throw new Error(
+        `Verification refused: a verification transition must carry a determined reconciliation ` +
+          `(OK or VIOLATED), not UNVERIFIED.`
+      );
+    }
+    this.assertEvidenceRecomputation(q, recorded, evidence);
+  }
+
+  /**
+   * PR-17: the issuance checks shared by both evidence entry
+   * points — the establishment brand (R3) and the token's quote
+   * binding. `establishVerification` stamps every token it mints
+   * with the quote and subscription it was minted for (a
+   * module-private WeakMap, exactly as unforgeable as the brand
+   * itself); a token minted for one quote presented against
+   * another is refused here, before content validation. Tokens
+   * adopted at recovery carry no runtime binding — recovery's
+   * trust rests on content validation and coherence instead, as
+   * with the brand (see the R3 note on `assertEvidenceAdmissible`).
+   */
+  private assertEvidenceIssuance(
+    quoteId: string,
+    q: StoredQuote,
+    evidence: VerificationEvidence,
+    presentedReceipt?: SubscriptionChangeReceipt
+  ): void {
+    if (!evidence || !establishedEvidenceTokens.has(evidence)) {
+      throw new Error(
+        `Verification refused: the presented evidence is not an established evidence token. Evidence is ` +
+          `accepted only as minted by establishVerification from an independent provider observation; a ` +
+          `caller-constructed evidence object is self-asserted, and self-asserted evidence cannot verify ` +
+          `the record for quote ${quoteId}.`
+      );
+    }
+    const binding = establishedTokenBindings.get(evidence);
+    if (binding && (binding.quoteId !== quoteId || binding.subscriptionId !== q.subscription_id)) {
+      throw new SCQError(
+        "CONFLICTING_RECEIPT_IDENTITY",
+        `Verification refused: the evidence token was established for quote ${binding.quoteId} / ` +
+          `subscription ${binding.subscriptionId}, but it was presented for quote ${quoteId} / subscription ` +
+          `${q.subscription_id}; evidence is bound to the quote and subscription it was established from.`,
+        { quoteId }
+      );
+    }
+    if (presentedReceipt && receiptIdentityDigest(presentedReceipt) !== q.commit_receipt_identity_digest) {
+      throw new SCQError(
+        "CONFLICTING_RECEIPT_IDENTITY",
+        `Verification refused: the presented receipt's identity does not match the recorded identity ` +
+          `for quote ${quoteId}; a verification under a conflicting identity cannot transition the original record.`,
+        { quoteId, receiptId: presentedReceipt.receiptId }
+      );
+    }
+  }
+
+  /**
+   * PR-17: the post-establishment alteration check. The token
+   * object is caller-held and mutable; the brand proves issuance,
+   * not content integrity. The digest stamped beside the binding
+   * at minting detects ANY alteration after establishment —
+   * figures, verdict, or reconciliation — including substitutions
+   * the recomputation check cannot see (a figure change that
+   * happens to recompute to the same reconciliation status, e.g.
+   * under a no-envelope reconciliation). It runs AFTER content
+   * validation in both entry points, so an alteration that the
+   * older, more specific checks name (a replaced reconciliation,
+   * a contradicted recomputation) is still refused under those
+   * names; the digest is the backstop for everything else.
+   */
+  private assertTokenUnaltered(quoteId: string, evidence: VerificationEvidence): void {
+    const binding = establishedTokenBindings.get(evidence);
+    if (binding && binding.contentDigest !== canonical(evidence)) {
+      throw new Error(
+        `Verification refused: the evidence token's contents were altered after establishment — a minted ` +
+          `token is evidence only as established; substituting different figures or a different verdict ` +
+          `after minting is detected and refused for quote ${quoteId}.`
+      );
+    }
+  }
+
+  /**
+   * PR-17: builds the append-only evidence entry for a validated
+   * token: bound to the recorded identity digest, carrying its
+   * content-derived evidence id, its per-dimension disposition
+   * toward the recorded candidates, and any conflict it creates
+   * against the trail-so-far's accepted actuals. The evidence is
+   * deep-copied on ingress (and the store's copies are what every
+   * later read returns): mutating the caller's token after
+   * acceptance cannot rewrite recorded history.
+   */
+  private buildEvidenceEntry(
+    q: StoredQuote,
+    recorded: SubscriptionChangeReceipt,
+    evidence: VerificationEvidence,
+    at: string | undefined,
+    trailSoFar: ReceiptEvidenceEntry[]
+  ): ReceiptEvidenceEntry {
+    const entry: ReceiptEvidenceEntry = {
+      at: at ?? evidence.at ?? new Date().toISOString(),
+      reconciliation: deepCopy(evidence.reconciliation),
+      identityDigest: q.commit_receipt_identity_digest!,
+      evidence: deepCopy(evidence),
+    };
+    entry.evidenceId = evidenceEntryId(entry.identityDigest, entry.evidence);
+    const analysis = analyzeEvidenceTrail(recorded, [...trailSoFar, entry]);
+    const mine = analysis.perEntry[analysis.perEntry.length - 1];
+    entry.disposition = mine.disposition;
+    if (Object.keys(mine.conflicts).length > 0) entry.conflicts = mine.conflicts;
+    return entry;
+  }
+
+  /**
+   * PR-17: THE DERIVED CURRENT VIEW — layer 3 of the receipt
+   * model. Computed deterministically from the recorded receipt
+   * (layer 1) and its evidence trail (layer 2); never an
+   * independently asserted fact. With an empty trail the view IS
+   * the recorded receipt. Otherwise:
+   *
+   *  - the displayed committed effect is the COMPOSED effect
+   *    (established actuals with their establishing determinacy
+   *    and provenance; unestablished dimensions keep the recorded
+   *    candidates' figures and labels verbatim);
+   *  - PROMOTION to COMMITTED_AND_VERIFIED requires ALL of: no
+   *    unresolved evidence conflict; at least one accepted entry
+   *    whose state verification is VERIFIED; and a reconciliation
+   *    — recomputed here from the recorded QUOTED effect, the
+   *    composed actuals, and the envelope (never from the
+   *    candidates as a baseline) — that is determined (OK, or
+   *    VIOLATED: verified-with-violation). The promoted view's
+   *    reconciliation is that recomputation.
+   *  - a non-promoted view keeps outcome COMMITTED_UNVERIFIED
+   *    and reports an UNVERIFIED reconciliation naming the
+   *    blocker (the conflict, the still-undetermined dimensions,
+   *    or the unestablished state, in that precedence).
+   */
+  private deriveCurrentView(
+    q: StoredQuote,
+    recorded: SubscriptionChangeReceipt,
+    entries: ReceiptEvidenceEntry[]
+  ): SubscriptionChangeReceipt {
+    if (entries.length === 0) return deepCopy(recorded);
+    const analysis = analyzeEvidenceTrail(recorded, entries);
+    const recomputed = reconcileCommittedEffect(
+      recorded.quotedEffect,
+      analysis.composedEffect,
+      q.proposal.acceptanceEnvelope,
+      q.proposal,
+      {
+        comparedBillingCurrency: recorded.resultingSnapshot?.billing?.currency,
+        comparedBillingCadence: recorded.resultingSnapshot?.billing?.cadence,
+      }
+    );
+    let reconciliation: ReconciliationResult;
+    let promoted = false;
+    if (analysis.anyConflict) {
+      reconciliation = {
+        status: "UNVERIFIED",
+        reason:
+          `accepted evidence conflicts on ${analysis.conflictDimensions.join(", ")}: a later entry established ` +
+          `different actuals than the accepted established actuals; the first-established actuals stand, the ` +
+          `conflict is recorded on the trail for investigation, and the record is not verified while it stands`,
+        undeterminedDimensions: [...analysis.conflictDimensions],
+      };
+    } else if (recomputed.status === "UNVERIFIED") {
+      reconciliation = recomputed;
+    } else if (!analysis.stateVerified) {
+      reconciliation = {
+        status: "UNVERIFIED",
+        reason:
+          `the financial actuals are established, but no accepted evidence establishes the post-commit state ` +
+          `as VERIFIED (§6.12); the record remains COMMITTED_UNVERIFIED`,
+        undeterminedDimensions: [],
+      };
+    } else {
+      reconciliation = recomputed;
+      promoted = true;
+    }
+    return {
+      ...deepCopy(recorded),
+      status: promoted ? "COMMITTED" : "COMMITTED_UNVERIFIED",
+      outcome: promoted ? "COMMITTED_AND_VERIFIED" : "COMMITTED_UNVERIFIED",
+      committedEffect: analysis.composedEffect,
+      reconciliation,
+    };
+  }
+
+  /**
+   * PR-17 (Issue #22, Finding 5): appends one established
+   * evidence token to a recorded receipt's append-only evidence
+   * record and returns the re-derived current view.
+   *
+   * This is the RECORDING path, deliberately separated from
+   * promotion: admissibility (branded token, minted for THIS
+   * quote/subscription, establishing provenance, internally
+   * consistent, recomputation-consistent) is all that recording
+   * requires. The entry is appended — with its disposition
+   * toward the recorded candidates and any conflict it creates —
+   * and the current view is re-derived: established dimensions
+   * display their actuals, missing dimensions stay UNKNOWN, and
+   * the record promotes only when the derivation's promotion
+   * rule is met by the whole trail. Evidence establishing a
+   * different actual than a recorded candidate is RECORDED
+   * (F5b), as is evidence filling a candidate-less dimension
+   * (F5a); neither is an identity conflict.
+   *
+   * Refusals: no recorded receipt; a receipt recorded already
+   * verified (nothing to establish against — its trail must stay
+   * empty for recovery coherence); unbranded or foreign-bound
+   * tokens; a presented receipt under a conflicting identity;
+   * non-establishing provenance; content that no longer
+   * recomputes to its claimed reconciliation (post-minting
+   * mutation); and evidence whose computed state verification is
+   * MISMATCH — figures observed against a state that contradicts
+   * the operation's intent (including a foreign subscription's
+   * state, PR-16) are not attributable to this operation and
+   * cannot be recorded as its actuals.
+   *
+   * Resubmitting the SAME evidence (same content-derived
+   * evidence id) is idempotent: no duplicate is appended and the
+   * current view is returned unchanged.
+   */
+  recordReceiptEvidence(
+    quoteId: string,
+    evidence: VerificationEvidence,
+    presentedReceipt?: SubscriptionChangeReceipt,
+    at?: string
+  ): SubscriptionChangeReceipt {
+    const q = this.quotes.get(quoteId);
+    if (!q || !q.commit_receipt || !q.commit_receipt_recorded) {
+      throw new Error(
+        `Evidence recording refused: no receipt recorded for quote ${quoteId}; evidence appends to a ` +
+          `recorded receipt, and verification can never create one — an attempt with no recorded receipt ` +
+          `(INDETERMINATE / CONFIRMED_NON_EXECUTION) stays exactly as classified.`
+      );
+    }
+    const recorded = q.commit_receipt_recorded;
+    if (receiptIdentityFields(recorded).recordedOutcome !== "COMMITTED_UNVERIFIED") {
+      throw new Error(
+        `Evidence recording refused: the receipt for quote ${quoteId} was recorded already verified; ` +
+          `there is no unverified record for evidence to establish against.`
+      );
+    }
+    this.assertEvidenceIssuance(quoteId, q, evidence, presentedReceipt);
+    this.assertEvidenceAdmissible(q, recorded, evidence);
+    this.assertTokenUnaltered(quoteId, evidence);
+    if (evidence.stateVerification === "MISMATCH") {
+      throw new Error(
+        `Evidence recording refused: the evidence's post-commit state verification is MISMATCH; figures ` +
+          `observed against a state that contradicts the operation's intent are not attributable to this ` +
+          `operation and cannot be recorded as its actuals.`
+      );
+    }
+    const trail = q.commit_receipt_verifications ?? [];
+    const entry = this.buildEvidenceEntry(q, recorded, evidence, at, trail);
+    if (trail.some((e) => (e.evidenceId ?? evidenceEntryId(e.identityDigest, e.evidence)) === entry.evidenceId)) {
+      // Idempotent resubmission of the same evidence: nothing is
+      // appended, nothing is re-derived, the current view stands.
+      return deepCopy(q.commit_receipt);
+    }
+    const nextTrail = [...trail, entry];
+    q.commit_receipt_verifications = nextTrail;
+    q.commit_receipt = this.deriveCurrentView(q, recorded, nextTrail);
+    return deepCopy(q.commit_receipt);
+  }
+
+  /**
    * v0.6.2 (CORE-8 / findings-closure F4): the single permitted
    * verification transition — reshaped by PR #8 review correction
    * C1. A COMMITTED_UNVERIFIED record becomes verified EXACTLY
@@ -566,15 +1087,28 @@ export class QuoteStore {
    * independent provider observation — and unbranded objects are
    * refused as self-asserted before content validation runs.
    *
-   * On success the record's CURRENT view advances to
-   * status "COMMITTED" / outcome COMMITTED_AND_VERIFIED carrying
-   * the evidence's determined reconciliation — OK (verified
-   * within envelope) or VIOLATED (verified-with-violation:
-   * established actuals outside the envelope, never OK) — and
-   * the verification, bound to the record's identity digest and
-   * carrying the evidence, is appended to the record's trail.
-   * The recorded receipt, its identity fields, and its digest
-   * are NEVER rewritten by the transition.
+   * PR-17 (Finding 5) re-founds the transition on the evidence
+   * record: the presented token must be PROMOTABLE (admissible,
+   * state VERIFIED, determined reconciliation — see
+   * `assertEvidencePromotable`); it is then APPENDED to the
+   * trail like any recorded evidence, and the transition's
+   * result is the DERIVED current view over the whole trail. Two
+   * consequences of the F5 corrections:
+   *  - the evidence's figures need NOT equal the recorded
+   *    candidates: a differing established actual transitions to
+   *    verified-with-violation (or OK, if within the envelope
+   *    against the QUOTE), never to an identity conflict (F5b);
+   *  - the verified view displays the ESTABLISHING evidence's
+   *    committed effect — its determinacy and provenance — not
+   *    the recorded candidates' UNKNOWN / "unestablished" labels
+   *    (F5c).
+   * If the composed trail still does not promote (an earlier
+   * entry's unresolved conflict, or the presented token is a
+   * duplicate of already-recorded non-promoting evidence), the
+   * transition is refused and NOTHING is appended — the
+   * transition is atomic, exactly as before. Partial or
+   * state-unestablished evidence belongs on the recording path
+   * (`recordReceiptEvidence`).
    *
    * The transition remains identity-bound on presentation too:
    * if `presentedReceipt` is given, its identity digest must
@@ -600,25 +1134,13 @@ export class QuoteStore {
     // is refused here, before any content validation, because
     // content checks alone cannot distinguish an assertion from
     // an observation. Branded tokens are STILL fully
-    // content-validated below (assertEvidenceValid): the token
-    // object remains caller-held after minting, so altered
-    // contents are refused on recomputation/identity grounds.
-    if (!evidence || !establishedEvidenceTokens.has(evidence)) {
-      throw new Error(
-        `Verification refused: the presented evidence is not an established evidence token. Evidence is ` +
-          `accepted only as minted by establishVerification from an independent provider observation; a ` +
-          `caller-constructed evidence object is self-asserted, and self-asserted evidence cannot verify ` +
-          `the record for quote ${quoteId}.`
-      );
-    }
-    if (presentedReceipt && receiptIdentityDigest(presentedReceipt) !== q.commit_receipt_identity_digest) {
-      throw new SCQError(
-        "CONFLICTING_RECEIPT_IDENTITY",
-        `Verification refused: the presented receipt's identity does not match the recorded identity ` +
-          `for quote ${quoteId}; a verification under a conflicting identity cannot transition the original record.`,
-        { quoteId, receiptId: presentedReceipt.receiptId }
-      );
-    }
+    // content-validated below: the token object remains
+    // caller-held after minting, so altered contents are refused
+    // on recomputation grounds (see `assertEvidenceAdmissible`),
+    // with the minting-time content digest as the backstop for
+    // alterations recomputation cannot see (see
+    // `assertTokenUnaltered`).
+    this.assertEvidenceIssuance(quoteId, q, evidence, presentedReceipt);
     const currentOutcome =
       q.commit_receipt.outcome ??
       (q.commit_receipt.status === "COMMITTED_UNVERIFIED" ? "COMMITTED_UNVERIFIED" : "COMMITTED_AND_VERIFIED");
@@ -628,19 +1150,58 @@ export class QuoteStore {
           `COMMITTED_UNVERIFIED record can transition to verified, and only once.`
       );
     }
-    this.assertEvidenceValid(q, q.commit_receipt_recorded, evidence);
-    q.commit_receipt = {
-      ...deepCopy(q.commit_receipt_recorded),
-      status: "COMMITTED",
-      outcome: "COMMITTED_AND_VERIFIED",
-      reconciliation: deepCopy(evidence.reconciliation),
-    };
-    (q.commit_receipt_verifications ??= []).push({
-      at: at ?? evidence.at ?? new Date().toISOString(),
-      reconciliation: deepCopy(evidence.reconciliation),
-      identityDigest: q.commit_receipt_identity_digest!,
-      evidence: deepCopy(evidence),
-    });
+    const recorded = q.commit_receipt_recorded;
+    this.assertEvidencePromotable(q, recorded, evidence);
+    this.assertTokenUnaltered(quoteId, evidence);
+    const trail = q.commit_receipt_verifications ?? [];
+    const entry = this.buildEvidenceEntry(q, recorded, evidence, at, trail);
+    const alreadyRecorded = trail.some(
+      (e) => (e.evidenceId ?? evidenceEntryId(e.identityDigest, e.evidence)) === entry.evidenceId
+    );
+    const candidateTrail = alreadyRecorded ? trail : [...trail, entry];
+    const derived = this.deriveCurrentView(q, recorded, candidateTrail);
+    if (derived.outcome !== "COMMITTED_AND_VERIFIED") {
+      throw new Error(
+        `Verification refused: the evidence does not promote the record for quote ${quoteId} — the ` +
+          `derived current view remains COMMITTED_UNVERIFIED (${derived.reconciliation.status}: ` +
+          `${derived.reconciliation.status === "UNVERIFIED" ? derived.reconciliation.reason : "see derived view"}). ` +
+          `Nothing was appended; record partial or blocked evidence via recordReceiptEvidence instead.`
+      );
+    }
+    if (!alreadyRecorded) q.commit_receipt_verifications = candidateTrail;
+    q.commit_receipt = derived;
+    return deepCopy(q.commit_receipt);
+  }
+
+  /**
+   * PR-17: re-derives a stored record's evidence-entry derived
+   * fields (evidenceId, disposition, conflicts) and its current
+   * view from the recorded receipt + trail, installing both.
+   * Recovery paths use this after substituting verbatim-decoded
+   * records (DurableQuoteStore's load path), so the adopted
+   * in-memory state is exactly the state the coherence validation
+   * approved — derived, never the persisted view as asserted.
+   * Returns a copy of the installed current view.
+   */
+  adoptDerivedView(quoteId: string): SubscriptionChangeReceipt | undefined {
+    const q = this.quotes.get(quoteId);
+    if (!q || !q.commit_receipt_recorded) return undefined;
+    const recorded = q.commit_receipt_recorded;
+    const entries = q.commit_receipt_verifications ?? [];
+    if (entries.length > 0) {
+      const analysis = analyzeEvidenceTrail(recorded, entries);
+      entries.forEach((entry, i) => {
+        entry.evidenceId = evidenceEntryId(entry.identityDigest, entry.evidence);
+        entry.disposition = analysis.perEntry[i].disposition;
+        if (Object.keys(analysis.perEntry[i].conflicts).length > 0) {
+          entry.conflicts = analysis.perEntry[i].conflicts;
+        } else {
+          delete entry.conflicts;
+        }
+      });
+      q.commit_receipt_verifications = entries;
+    }
+    q.commit_receipt = this.deriveCurrentView(q, recorded, entries);
     return deepCopy(q.commit_receipt);
   }
 
@@ -658,12 +1219,7 @@ export class QuoteStore {
       recorded_receipt: SubscriptionChangeReceipt;
       current_receipt: SubscriptionChangeReceipt;
       identity_digest: string;
-      verifications?: Array<{
-        at: string;
-        reconciliation: ReconciliationResult;
-        identityDigest: string;
-        evidence: VerificationEvidence;
-      }>;
+      verifications?: ReceiptEvidenceEntry[];
     }
   ): void {
     const recorded = raw.recorded_receipt;
@@ -710,7 +1266,7 @@ export class QuoteStore {
     }
 
     if (trail.length === 0) {
-      // No transition: the current view must BE the record. A
+      // No evidence: the current view must BE the record. A
       // verified (or otherwise altered) current view with an
       // empty trail is a forged verification.
       if (!deepEqualCanonical(current, recorded)) {
@@ -722,50 +1278,97 @@ export class QuoteStore {
       return;
     }
 
-    // A transition exists: exactly one, only from an UNVERIFIED
-    // record, bound to this identity, carrying evidence that
-    // validates against the record, and the current view must be
-    // exactly that transition's result.
+    // Evidence exists: only on a record that was recorded
+    // COMMITTED_UNVERIFIED (a verified-at-record receipt admits
+    // no trail). EVERY entry must be bound to this record's
+    // identity, carry admissible evidence, and carry derived
+    // fields that match its contents; entry identities must be
+    // unique (a duplicated entry — identical, or one id over
+    // different contents — is not a trail the live paths can
+    // produce).
     if (recordedOutcome !== "COMMITTED_UNVERIFIED") {
       throw incoherent(`a verification trail exists on a record that was never COMMITTED_UNVERIFIED`);
     }
-    if (trail.length !== 1) {
-      throw incoherent(
-        `the verification trail records ${trail.length} transitions; a receipt record admits exactly one`
-      );
+    const seenIds = new Set<string>();
+    for (const entry of trail) {
+      if (entry.identityDigest !== raw.identity_digest) {
+        throw new SCQError(
+          "CONFLICTING_RECEIPT_IDENTITY",
+          `Recovery refused: the verification trail entry for quote ${raw.quote_id} is bound to a ` +
+            `different receipt identity than the record it accompanies; the set is not adopted.`,
+          { quoteId: raw.quote_id }
+        );
+      }
+      try {
+        this.assertEvidenceAdmissible(destination, recorded, entry.evidence);
+      } catch (e) {
+        throw incoherent(
+          `the trail entry's verification evidence does not validate against the recorded receipt ` +
+            `(${(e as Error).message})`
+        );
+      }
+      if (!deepEqualCanonical(entry.reconciliation, entry.evidence.reconciliation)) {
+        throw incoherent(`the trail entry's reconciliation differs from its own evidence's reconciliation`);
+      }
+      const derivedId = evidenceEntryId(entry.identityDigest, entry.evidence);
+      if (entry.evidenceId !== undefined && entry.evidenceId !== derivedId) {
+        throw incoherent(
+          `the trail entry's stated evidenceId does not match its contents — the entry has been altered`
+        );
+      }
+      if (seenIds.has(derivedId)) {
+        throw incoherent(`the verification trail records a duplicate evidence identity — entries must be unique`);
+      }
+      seenIds.add(derivedId);
     }
-    const entry = trail[0];
-    if (entry.identityDigest !== raw.identity_digest) {
-      throw new SCQError(
-        "CONFLICTING_RECEIPT_IDENTITY",
-        `Recovery refused: the verification trail entry for quote ${raw.quote_id} is bound to a ` +
-          `different receipt identity than the record it accompanies; the set is not adopted.`,
-        { quoteId: raw.quote_id }
-      );
+    // Only now — every entry's evidence shape-validated — is the
+    // trail safe to analyze for the stated-field comparisons.
+    const analysis = analyzeEvidenceTrail(recorded, trail as ReceiptEvidenceEntry[]);
+    trail.forEach((entry, i) => {
+      if (entry.disposition !== undefined && !deepEqualCanonical(entry.disposition, analysis.perEntry[i].disposition)) {
+        throw incoherent(`the trail entry's stated disposition does not match its contents`);
+      }
+      const statedConflicts = entry.conflicts ?? {};
+      if (!deepEqualCanonical(statedConflicts, analysis.perEntry[i].conflicts)) {
+        throw incoherent(`the trail entry's stated conflicts do not match its contents`);
+      }
+    });
+
+    // The current view must be the DERIVED view of the recorded
+    // receipt + this trail — derivation is the coherence proof:
+    // a persisted view that is not what the validated evidence
+    // derives (a forged promotion, stale candidate labels over a
+    // verified outcome, a view claiming more than the evidence
+    // establishes) is refused, and the adopted in-memory view is
+    // the derivation, not the persisted assertion.
+    const derived = this.deriveCurrentView(destination, recorded, trail as ReceiptEvidenceEntry[]);
+    if (deepEqualCanonical(current, derived)) return;
+    // Legacy acceptance (PR-17 migration): a ONE-entry trail
+    // persisted by pre-PR-17 code carries the old transition
+    // shape — recorded committed effect under the verified
+    // outcome — for an entry that was promotable under the old
+    // rules. Accept the set; adoption installs the derived
+    // (truthful) view in its place.
+    if (trail.length === 1) {
+      const entry = trail[0];
+      const legacyCurrent = {
+        ...recorded,
+        status: "COMMITTED",
+        outcome: "COMMITTED_AND_VERIFIED",
+        reconciliation: entry.reconciliation,
+      };
+      if (
+        entry.evidence.stateVerification === "VERIFIED" &&
+        entry.evidence.reconciliation.status !== "UNVERIFIED" &&
+        deepEqualCanonical(current, legacyCurrent)
+      ) {
+        return;
+      }
     }
-    try {
-      this.assertEvidenceValid(destination, recorded, entry.evidence);
-    } catch (e) {
-      throw incoherent(
-        `the trail entry's verification evidence does not validate against the recorded receipt ` +
-          `(${(e as Error).message})`
-      );
-    }
-    if (!deepEqualCanonical(entry.reconciliation, entry.evidence.reconciliation)) {
-      throw incoherent(`the trail entry's reconciliation differs from its own evidence's reconciliation`);
-    }
-    const expectedCurrent = {
-      ...recorded,
-      status: "COMMITTED",
-      outcome: "COMMITTED_AND_VERIFIED",
-      reconciliation: entry.reconciliation,
-    };
-    if (!deepEqualCanonical(current, expectedCurrent)) {
-      throw incoherent(
-        `the current view is not the legal verification transition of the recorded receipt ` +
-          `(recorded UNVERIFIED + exactly one identity-bound verification)`
-      );
-    }
+    throw incoherent(
+      `the current view is not the derived view of the recorded receipt and its evidence trail — ` +
+        `a current view is derived from validated evidence, never trusted as persisted`
+    );
   }
 
   /**
@@ -805,25 +1408,35 @@ export class QuoteStore {
    *
    * PR #8 review correction C2: digest re-verification alone is
    * NOT sufficient — each record is validated as a COHERENT UNIT
-   * (current view + recorded snapshot + verification trail +
-   * quote association + legal state transitions), because a
-   * forged record can carry a perfectly valid digest over its
-   * recorded half while its current view lies. The legal shapes
-   * are exactly:
-   *   - recorded verified-at-record (OK/VIOLATED reconciliation),
-   *     current view identical to the record, trail empty — no
-   *     transition exists or is possible;
-   *   - recorded COMMITTED_UNVERIFIED, current view identical to
-   *     the record, trail empty — recorded, not yet verified;
-   *   - recorded COMMITTED_UNVERIFIED, current view equal to the
-   *     ONE legal transition of the record, and a trail of
-   *     EXACTLY ONE entry, bound to the record's identity digest,
-   *     whose evidence validates against the record (C1 rules)
-   *     and whose reconciliation is the current view's.
+   * (current view + recorded snapshot + evidence trail + quote
+   * association), because a forged record can carry a perfectly
+   * valid digest over its recorded half while its current view
+   * lies.
+   *
+   * PR-17 (Finding 5) re-founds the coherence proof on
+   * DERIVATION, replacing C2's exactly-one-transition shapes:
+   *   - the trail may hold ANY number of entries (partial,
+   *     completing, and conflicting evidence are all recordable),
+   *     but every entry must be bound to the record's identity
+   *     digest, carry ADMISSIBLE evidence (content-validated,
+   *     recomputation-consistent), carry derived fields
+   *     (evidenceId, disposition, conflicts) matching its
+   *     contents where stated, and have a unique evidence id;
+   *   - the current view must EQUAL the view derived from the
+   *     recorded receipt + validated trail — a persisted view is
+   *     never trusted as asserted; adoption installs the
+   *     derivation. One legacy shape is additionally accepted
+   *     for one-entry trails persisted by pre-PR-17 code (the old
+   *     transition view, recorded effect under a verified
+   *     outcome, on a then-promotable entry) and is normalized to
+   *     the derived view on adoption;
+   *   - a verified-at-record receipt admits no trail; an
+   *     unverified record with an empty trail must have
+   *     current == recorded.
    * Anything else — a verified current view with no trail entry
-   * (a forgery), two trail entries, a trail bound to a different
-   * identity, a current view that is neither the record nor its
-   * legal transition — refuses the WHOLE set.
+   * (a forgery), a trail bound to a different identity, altered
+   * evidence, a duplicate evidence identity, a current view the
+   * evidence does not derive — refuses the WHOLE set.
    */
   restoreReceiptRecords(json: string): void {
     const data = JSON.parse(json) as {
@@ -832,12 +1445,7 @@ export class QuoteStore {
         recorded_receipt: SubscriptionChangeReceipt;
         current_receipt: SubscriptionChangeReceipt;
         identity_digest: string;
-        verifications?: Array<{
-          at: string;
-          reconciliation: ReconciliationResult;
-          identityDigest: string;
-          evidence: VerificationEvidence;
-        }>;
+        verifications?: ReceiptEvidenceEntry[];
       }>;
     };
     const records = data.records ?? [];
@@ -863,10 +1471,15 @@ export class QuoteStore {
     for (const raw of records) {
       const q = this.quotes.get(raw.quote_id)!;
       q.commit_receipt_recorded = deepFreeze(deepCopy(raw.recorded_receipt));
-      q.commit_receipt = deepCopy(raw.current_receipt);
       q.commit_receipt_identity_digest = raw.identity_digest;
+      // PR-17: entries are adopted with their derived fields
+      // filled in (legacy entries gain evidenceId / disposition /
+      // conflicts deterministically), and the current view is
+      // installed as the DERIVATION over the adopted record —
+      // never as the persisted current_receipt assertion.
       q.commit_receipt_verifications = deepCopy(raw.verifications ?? []);
       q.status = "COMMITTED";
+      this.adoptDerivedView(raw.quote_id);
     }
   }
 
@@ -895,6 +1508,26 @@ export class QuoteStore {
  * tokens alive.
  */
 const establishedEvidenceTokens = new WeakSet<object>();
+
+/**
+ * PR-17: the quote binding stamped on every minted token —
+ * which quote and subscription the evidence was established
+ * FOR, plus a digest of the token's contents as minted. Kept in
+ * a module-private WeakMap beside the brand, so it is exactly as
+ * unforgeable: a token minted for one quote presented against
+ * another is refused at ingestion (`assertEvidenceIssuance`),
+ * instead of relying on figure equality to catch the mismatch
+ * (the F5-era proxy), and a token whose contents were altered
+ * after minting — different figures, a different verdict — is
+ * detected against the stamped digest and refused. Like the
+ * brand, the binding is a runtime property and does not survive
+ * serialization; recovery binds entries to their record by the
+ * identity digest instead.
+ */
+const establishedTokenBindings = new WeakMap<
+  object,
+  { quoteId: string; subscriptionId: string; contentDigest: string }
+>();
 
 /**
  * v0.6.2 (PR-9): the §6.12 state verification this module used to
@@ -1012,5 +1645,10 @@ export function establishVerification(quote: StoredQuote, observation: ProviderO
     ...(observation.observedAt ? { at: observation.observedAt } : {}),
   };
   establishedEvidenceTokens.add(token);
+  establishedTokenBindings.set(token, {
+    quoteId: quote.quote_id,
+    subscriptionId: quote.subscription_id,
+    contentDigest: canonical(token),
+  });
   return token;
 }

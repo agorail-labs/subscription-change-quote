@@ -414,7 +414,17 @@ test("Test 16.14 (R3): the state result is computed — a mismatching snapshot m
 
   const tampered = establishVerification(quote, standardObservation());
   tampered.committedEffect.immediate!.net = 2000;
-  assert.throws(() => store.verifyCommitReceipt("q1", tampered), /contradict the figures recorded/);
+  // PR-17 CORRECTION, disclosed: this assertion originally pinned
+  // the refusal message of the candidate-equality check ("…
+  // contradict the figures recorded on the receipt"). PR-17
+  // removes that check — it was Finding 5b's defect (candidate
+  // equality mistaken for identity preservation) — so a figure
+  // altered after minting is now refused by the establishment
+  // content digest instead (the token's contents no longer match
+  // what establishVerification minted). The test's SAFETY
+  // PURPOSE is unchanged and still asserted here and below: a
+  // tampered token is refused and nothing transitions.
+  assert.throws(() => store.verifyCommitReceipt("q1", tampered), /altered after establishment/);
 
   const q = store.get("q1")!;
   assert.equal(q.commit_receipt?.outcome, "COMMITTED_UNVERIFIED", "no refused attempt transitioned the record");
