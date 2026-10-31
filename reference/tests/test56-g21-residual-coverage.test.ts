@@ -28,7 +28,9 @@ import {
   type SubscriptionChangeReceipt,
 } from "../src/core/types.js";
 import { QuoteStore, establishVerification, type StoredQuote } from "../src/store/quote-store.js";
-import { DispatchBlockedError, DurableQuoteStore } from "../src/store/durable-store.js";
+import { DispatchBlockedError, DurableQuoteStore, ResolutionEvidenceError } from "../src/store/durable-store.js";
+import * as durableModule from "../src/store/durable-store.js";
+import { createHash } from "node:crypto";
 import { ChargebeeAdapter } from "../src/adapters/chargebee-adapter.js";
 import { freshChargebeeFixture } from "./fixtures.js";
 import { makeStoredQuote } from "./helpers/durable-fixtures.js";
@@ -45,8 +47,25 @@ import { makeStoredQuote } from "./helpers/durable-fixtures.js";
 //   (3) Exclusion keying — findBlockingAttempt keys on
 //       (quote_id OR subscription_id) with no provider/site
 //       predicate (§6.16 as implemented): 56.1, 56.2.
-//   (2) resolveAttempt attestation — an INDETERMINATE attempt is
+//   (2) resolveAttempt attestation — an INDETERMINATE attempt was
 //       unblocked by an operator's free-text note alone: 56.3–56.5.
+//       That limitation (G-21(2)) is now FIXED by the P0 issue-#43
+//       change: resolution requires structured, operation-bound
+//       evidence (pinned exhaustively by test58), and 56.4/56.5
+//       below pin the fixed semantics at this suite's level. The
+//       PR #50 correction round (R1–R4) tightened the boundary
+//       further: evidence must be ESTABLISHED (branded token from
+//       the establishment procedure over an actual provider record,
+//       with provider finality), and a resolved INDETERMINATE
+//       attempt's own quote stays blocked for any key —
+//       re-authorization proceeds as a new quote (§6.15).
+//       Correction round 3 (second-round review R2'/R4') closed the
+//       remaining trust gap: the establishment procedure is no
+//       longer a public export — tokens are minted only by a
+//       verifier (createProviderEvidenceVerifier) whose source
+//       RETRIEVES the record, and the store accepts only its own
+//       configured verifier's tokens (the public-API counterexample
+//       and the asserted-claim path are pinned in test59).
 //       The CONFIRMED_NON_EXECUTION same-key re-arm itself is
 //       already pinned at the coordinator level by test29.8/29.9,
 //       and key non-reassociation (incl. across sites) by
@@ -167,16 +186,69 @@ test("Test 56.2 (G-21(3), boundary): once the blocking attempt reaches a termina
 
 // ---------------------------------------------------------------------------
 // (2) resolveAttempt attestation (§6.16): the INDETERMINATE block,
-// the flag-only resolution record (LIMITATION PIN), and the
-// post-resolution dispatch semantics.
+// the structured-evidence resolution record (G-21(2) FIXED by the
+// P0 issue-#43 change; the exhaustive evidence matrix is test58),
+// and the post-resolution dispatch semantics.
 // ---------------------------------------------------------------------------
 
-function indeterminateStore(): { store: DurableQuoteStore; attemptId: string } {
-  const store = openStore(tmpDb());
+const createProviderEvidenceVerifier56: any = (durableModule as any).createProviderEvidenceVerifier;
+
+function indeterminateStore() {
+  // Manual clock: dispatch, settlement (attempt.updatedAt), and the
+  // provider observation must be strictly ordered for the finality
+  // rules (PR #50 review R3) to be exercisable deterministically.
+  let nowMs = Date.parse("2026-10-31T12:00:00.000Z");
+  // Round 3: the store's evidence capability is a verifier over an
+  // in-memory record source playing the provider.
+  const operationRecords = new Map<string, unknown>();
+  const source = { fetchOperationRecord: (q: any) => operationRecords.get(q.idempotencyKey as string) };
+  const verifier = typeof createProviderEvidenceVerifier56 === "function" ? createProviderEvidenceVerifier56(source) : undefined;
+  const storeOpts: any = { recoveryGraceMs: 0, now: () => new Date(nowMs) };
+  if (verifier) storeOpts.evidenceVerifier = verifier;
+  const store = new DurableQuoteStore(tmpDb(), storeOpts);
   store.put(makeStoredQuote("q1", "sub_1"));
   const att = store.beginDispatch(INTENT("q1", "sub_1", "site-a", "key-1"));
+  nowMs += 60_000;
   store.recordAttemptOutcome(att.attemptId, "INDETERMINATE");
-  return { store, attemptId: att.attemptId };
+  nowMs += 60_000;
+  return { store, attemptId: att.attemptId, clockNow: () => new Date(nowMs), operationRecords, verifier };
+}
+
+/**
+ * The legitimate resolution path after PR #50 correction round 3:
+ * the simulated provider record is staged at the store's record
+ * source; the store's configured verifier FETCHES and validates it
+ * (binding, operation-bound kind, provider finality) and mints a
+ * branded token; resolveAttempt accepts only that verifier's
+ * tokens. See test58/test59 for the full matrix.
+ */
+function establishedNonExecutionInput(rig: ReturnType<typeof indeterminateStore>) {
+  const { store, attemptId, clockNow } = rig;
+  const attempt = store.getAttempt(attemptId)!;
+  const now = clockNow();
+  rig.operationRecords.set(attempt.idempotencyKey, {
+    source: "PROVIDER_OPERATION_LOG",
+    kind: "OPERATION_LOG_NO_RECORD_FOR_KEY",
+    reference: "oplog-ref-56",
+    provider: attempt.provider,
+    site: attempt.site ?? undefined,
+    subscriptionId: attempt.subscriptionId,
+    quoteId: attempt.quoteId,
+    idempotencyKey: attempt.idempotencyKey,
+    requestHash: attempt.requestHash,
+    operationFound: false,
+    observedState: { lookupResult: "NO_RECORD_FOR_KEY", idempotencyKey: attempt.idempotencyKey },
+    observedAt: now.toISOString(),
+    logFinal: true,
+    completeThrough: now.toISOString(),
+  });
+  const token = rig.verifier.establish(attempt, "CONFIRMED_NON_EXECUTION", now);
+  return {
+    evidence: token,
+    operatorId: "operator-1",
+    reconciliationDecision: "PERMIT_NEW_DISPATCH",
+    justification: "Provider operation log, final through the settlement, records no operation for this attempt's idempotency key.",
+  };
 }
 
 test("Test 56.3 (G-21(2)): an unresolved INDETERMINATE attempt refuses both same-key retry and new-key dispatch until an operator resolves it", () => {
@@ -199,20 +271,48 @@ test("Test 56.3 (G-21(2)): an unresolved INDETERMINATE attempt refuses both same
   store.close();
 });
 
-test("Test 56.4 (G-21(2), LIMITATION PIN): resolution is a flag, not evidence — the resolved attempt record carries only the free-text note's effect (operatorReviewState), and no structured resolution record exists", () => {
-  const { store, attemptId } = indeterminateStore();
+test("Test 56.4 (G-21(2), FIXED by P0 #43): resolution requires established evidence — a free-text note refuses, and a branded-token resolution produces a bound, readable resolution record", () => {
+  const rig = indeterminateStore();
+  const { store, attemptId } = rig;
   const NOTE = "reconciled against the provider console, 2026-10-30";
-  const resolved = store.resolveAttempt(attemptId, NOTE);
 
+  // The pre-fix call shape: a free-text note alone. It now refuses
+  // and persists nothing (the full refusal matrix is test58).
+  assert.throws(
+    () => (store as unknown as { resolveAttempt: (id: string, ev: unknown) => unknown }).resolveAttempt(attemptId, NOTE),
+    (e: unknown) => e instanceof ResolutionEvidenceError && e.code === "RESOLUTION_EVIDENCE_REFUSED",
+    "a free-text operator note is not resolution evidence",
+  );
+  assert.equal(store.getAttempt(attemptId)?.operatorReviewState, "REQUIRED", "the refusal leaves the attempt unresolved");
+  assert.equal(store.resolutionsForAttempt(attemptId).length, 0, "the refusal persists zero resolution rows");
+
+  const resolved = (store as unknown as { resolveAttempt: (id: string, ev: unknown) => ReturnType<DurableQuoteStore["getAttempt"]> }).resolveAttempt(
+    attemptId,
+    establishedNonExecutionInput(rig),
+  )!;
   assert.equal(resolved.operatorReviewState, "RESOLVED");
   assert.equal(resolved.state, "INDETERMINATE", "resolution changes no outcome — the attempt's landing remains unestablished");
   assert.equal(resolved.outcome, "INDETERMINATE");
-  assert.equal(resolved.details, null, "no structured resolution details are recorded");
-  assert.equal(
-    JSON.stringify(resolved).includes(NOTE),
-    false,
-    "the operator's free-text note is not carried anywhere on the attempt record (it exists only as an attempt_history note, for which the store exposes no reader)",
-  );
+
+  // The structured record lives in its own append-only table and is
+  // readable through the store, bound to the attempt in every
+  // identity field.
+  const record = store.getResolution(attemptId);
+  assert.ok(record, "a structured resolution record exists and is readable");
+  assert.equal(record.attemptId, attemptId);
+  assert.equal(record.quoteId, "q1");
+  assert.equal(record.subscriptionId, "sub_1");
+  assert.equal(record.provider, "chargebee");
+  assert.equal(record.site, "site-a");
+  assert.equal(record.requestHash, resolved.requestHash, "the record is bound to the attempt's request hash");
+  assert.equal(record.idempotencyKey, "key-1");
+  assert.equal(record.classification, "CONFIRMED_NON_EXECUTION");
+  assert.equal(record.evidenceSource, "PROVIDER_OPERATION_LOG");
+  assert.equal(record.evidenceReference, "oplog-ref-56");
+  assert.equal((record as any).trustTier, "VERIFIED", "the record persists at the VERIFIED trust tier (round 3)");
+  assert.match(record.evidenceHash, /^[0-9a-f]{64}$/);
+  assert.equal(store.resolutionsForAttempt(attemptId).length, 1);
+
   assert.deepEqual(
     Object.keys(resolved).sort(),
     [
@@ -220,23 +320,38 @@ test("Test 56.4 (G-21(2), LIMITATION PIN): resolution is a flag, not evidence �
       "preDispatchFingerprint", "provider", "quoteId", "recoveryClassification", "request",
       "requestHash", "site", "state", "subscriptionId", "updatedAt", "version",
     ],
-    "the StoredAttempt shape has no field for observed state, a provider reference, or any other structured resolution evidence — the attestation weakness Finding 7 recorded",
+    "the StoredAttempt shape itself is unchanged — resolution evidence is a separate bound record, not a new attempt field",
   );
   store.close();
 });
 
-test("Test 56.5 (G-21(2)): after resolution, the same key returns the standing INDETERMINATE attempt un-re-armed, and a new key may dispatch", () => {
-  const { store, attemptId } = indeterminateStore();
-  store.resolveAttempt(attemptId, "operator reconciled; no execution found");
+test("Test 56.5 (G-21(2)): after an established-evidence resolution, the same key returns the standing INDETERMINATE attempt un-re-armed, the SAME quote stays blocked for a new key (R1 / §6.15 new-quote rule), and a new quote may dispatch", () => {
+  const rig = indeterminateStore();
+  const { store, attemptId } = rig;
+  store.put(makeStoredQuote("q2", "sub_1"));
+  (store as unknown as { resolveAttempt: (id: string, ev: unknown) => unknown }).resolveAttempt(
+    attemptId,
+    establishedNonExecutionInput(rig),
+  );
 
   const standing = store.beginDispatch(INTENT("q1", "sub_1", "site-a", "key-1"));
   assert.equal(standing.attemptId, attemptId, "the original attempt stands under its key");
   assert.equal(standing.state, "INDETERMINATE", "resolution does not convert the attempt into a re-dispatch authorisation for its own key");
   assert.equal(store.attemptsForQuote("q1").length, 1, "no new attempt was created by the re-presentment");
 
-  const fresh = store.beginDispatch(INTENT("q1", "sub_1", "site-a", "key-2"));
-  assert.equal(fresh.state, "DISPATCHING", "with the block lifted, a NEW key dispatches under the usual §6.16 gates");
-  assert.equal(store.attemptsForQuote("q1").length, 2);
+  // PR #50 review R1: retroactive resolution of an INDETERMINATE
+  // attempt is NOT the originally-terminal CONFIRMED_NON_EXECUTION
+  // re-arm exception — the old quote remains blocked for any key,
+  // and re-authorization proceeds as a NEW quote (§6.15).
+  assert.throws(
+    () => store.beginDispatch(INTENT("q1", "sub_1", "site-a", "key-2")),
+    DispatchBlockedError,
+    "a new key on the resolved attempt's own quote is refused",
+  );
+  assert.equal(store.attemptsForQuote("q1").length, 1, "the refusal records no new attempt for the old quote");
+
+  const fresh = store.beginDispatch(INTENT("q2", "sub_1", "site-a", "key-3"));
+  assert.equal(fresh.state, "DISPATCHING", "a genuinely new quote on the same subscription dispatches under the usual §6.16 gates");
   store.close();
 });
 
