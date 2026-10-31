@@ -256,18 +256,41 @@ test("Test 15.2 (C1, round 2 R3): estimate-derived or unestablished figures cann
   }
 });
 
-test("Test 15.3 (C1): established evidence whose figures contradict the stored record is refused", () => {
+test("Test 15.3 (C1, CORRECTED PR-17 / Finding 5b): established evidence whose figures differ from the recorded candidates is recordable and displayed — the identity never moves", () => {
+  // PR-17 CORRECTION, disclosed: as originally written this test
+  // asserted that evidence establishing figures (2000) different
+  // from the recorded candidates (1000) is REFUSED with
+  // CONFLICTING_RECEIPT_IDENTITY. That assertion pinned Finding
+  // 5b itself: candidate equality is not identity preservation —
+  // a recorded candidate is an unverified figure, and later
+  // independently established actuals legitimately differ from
+  // it. The test's SAFETY PURPOSE is preserved in the form the
+  // F5 model gives it: (i) the recorded receipt, its candidates,
+  // and its identity digest are NEVER rewritten by later
+  // evidence; (ii) the derived view displays the ESTABLISHED
+  // actual (2000) with its establishing provenance — it does not
+  // keep presenting the candidate as the committed figure;
+  // (iii) drift judgment runs against the recorded QUOTE under
+  // the envelope contract — this fixture carries no envelope, so
+  // there is no tolerance to violate and established actuals
+  // reconcile OK (the with-envelope judgment of exactly this
+  // shape is 15.5's verified-with-violation). Genuine identity
+  // conflicts (a different receipt, quote, or subscription)
+  // remain CONFLICTING_RECEIPT_IDENTITY — see 15.12/15.13 and
+  // PR-17's test50 binding cases.
   const store = new QuoteStore();
   store.put(makeQuote("q1"));
   const receipt = makeUnverifiedReceipt();
   store.recordCommitReceipt("q1", receipt);
-  // The observation is genuine establishment material — but for
-  // figures (2000) that are NOT this record's recorded actuals
-  // (1000). Establishment mints it; the identity binding refuses
-  // the transition.
+  const digestBefore = store.get("q1")!.commit_receipt_identity_digest;
   const contradicting = mintEvidence(store, { immediate: 2000, recurring: 5000 });
-  assert.throws(() => store.verifyCommitReceipt("q1", contradicting), isConflict);
-  assert.equal(store.get("q1")!.commit_receipt?.outcome, "COMMITTED_UNVERIFIED");
+  const view = store.verifyCommitReceipt("q1", contradicting);
+  assert.equal(view.outcome, "COMMITTED_AND_VERIFIED", "the actuals ARE established — verified means measured");
+  assert.equal(view.committedEffect.immediate?.net, 2000, "the derived view displays the established actual, not the candidate");
+  assert.equal(view.committedEffect.determinacy?.immediateFinancialEffect, "DETERMINED");
+  const q = store.get("q1")!;
+  assert.equal(q.commit_receipt_identity_digest, digestBefore, "the recorded identity never moves");
+  assert.equal(q.commit_receipt_recorded?.committedEffect.immediate?.net, 1000, "the recorded candidate is preserved verbatim");
 });
 
 test("Test 15.4 (C1, round 2 R3): evidence established from an independent observation transitions exactly once; the recorded identity never moves", () => {
