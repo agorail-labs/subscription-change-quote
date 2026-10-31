@@ -25,12 +25,12 @@ import { SCQError } from "../src/core/types.js";
 // that property on an adapter that DOES dispatch — the Chargebee
 // simulator adapter — in the two windows the live repro exercised:
 //
-//   53.1  the quote -> commit window: an unrelated item added after
+//   55.1  the quote -> commit window: an unrelated item added after
 //         the quote refuses the commit QUOTE_STALE (the adapter's
 //         fingerprint is a content hash over the FULL subscription
 //         state, not only the changed items), with zero dispatches
 //         and the concurrent item untouched.
-//   53.2  the validate -> dispatch window: the same addition lands
+//   55.2  the validate -> dispatch window: the same addition lands
 //         after this commit's validation, before its mutation
 //         executes (interleaved with the test25.9 wrapper
 //         technique). The dispatch DOES land — and, because the
@@ -44,7 +44,7 @@ import { SCQError } from "../src/core/types.js";
 //         COMMITTED_UNVERIFIED / UNVERIFIED with NO committed
 //         recurring figure.
 //
-// EVIDENCE LABELS (honest reach): 53.1/53.2 are DIRECT PROOF of the
+// EVIDENCE LABELS (honest reach): 55.1/55.2 are DIRECT PROOF of the
 // simulator adapter's full-state bracket and receipt classification.
 // For the LIVE adapter's race they are ILLUSTRATIVE: the live
 // dispatch is unreachable for OPERATION scope by design (test47),
@@ -56,7 +56,7 @@ import { SCQError } from "../src/core/types.js";
 // unmodified main @ 9bb424b. They are regression pins for existing
 // behavior, NOT failing-first defect reproductions; no
 // implementation change accompanies them. One nuance they surface
-// is recorded, not endorsed: in 53.2 the recorded immediate figure
+// is recorded, not endorsed: in 55.2 the recorded immediate figure
 // (12500) is the bound artifact's own actual, priced by the
 // simulator from the state the operation BEGAN on — which already
 // included the concurrent addition (begin recurring 107500 ->
@@ -97,11 +97,11 @@ const ADD_UNRELATED = (s: ChargebeeSubscription) => {
 };
 
 // ---------------------------------------------------------------------------
-// 53.1 — Unrelated addition in the quote -> commit window:
+// 55.1 — Unrelated addition in the quote -> commit window:
 // QUOTE_STALE refusal, zero dispatches, the addition survives.
 // ---------------------------------------------------------------------------
 
-test("Test 53.1 (G-20, repro43 window 1): an unrelated item added between quote and commit refuses QUOTE_STALE with zero dispatches — the full-state fingerprint covers items the change never names", async () => {
+test("Test 55.1 (G-20, repro43 window 1): an unrelated item added between quote and commit refuses QUOTE_STALE with zero dispatches — the full-state fingerprint covers items the change never names", async () => {
   const { sim, adapter, sub } = fixture();
   const quote = await adapter.createChangeQuote(sub.id, {
     changes: [QTY(120)],
@@ -129,12 +129,12 @@ test("Test 53.1 (G-20, repro43 window 1): an unrelated item added between quote 
 });
 
 // ---------------------------------------------------------------------------
-// 53.2 — Unrelated addition in the validate -> dispatch window:
+// 55.2 — Unrelated addition in the validate -> dispatch window:
 // the dispatch lands (and deletes the addition — mechanics), but
 // the receipt caps at COMMITTED_UNVERIFIED and never verifies.
 // ---------------------------------------------------------------------------
 
-test("Test 53.2 (G-20, repro43 window 2): an unrelated addition landing after validation but before the mutation executes is never reported verified — broken attribution bracket caps the receipt at COMMITTED_UNVERIFIED with no committed recurring figure", async () => {
+test("Test 55.2 (G-20, repro43 window 2): an unrelated addition landing after validation but before the mutation executes is never reported verified — broken attribution bracket caps the receipt at COMMITTED_UNVERIFIED with no committed recurring figure", async () => {
   const { sim, adapter, sub } = fixture();
   const quote = await adapter.createChangeQuote(sub.id, {
     changes: [QTY(120)],

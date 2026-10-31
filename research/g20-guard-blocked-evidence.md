@@ -2,8 +2,8 @@
 
 **Gap:** G-20 (register: `research/v0.6.2-release-gaps.md`). **Program:** Issue #29
 conformance/regression closure. **Base:** `origin/main` @ `9bb424b` (suite 721/721,
-research suite 11 pass / 7 fail, Node 22). **Companion change:** `test53`
-(`reference/tests/test53-g20-guard-blocked-evidence.test.ts`), two simulator-level
+research suite 11 pass / 7 fail, Node 22). **Companion change:** `test55`
+(`reference/tests/test55-g20-guard-blocked-evidence.test.ts`), two simulator-level
 pins. **No repro harness was modified; no guard was weakened; the research suite
 still stands at 11 pass / 7 fail after this change — that is the honest outcome,
 not a defect to be repaired by editing the harnesses.**
@@ -57,10 +57,10 @@ that misrepresents the adapter's capability).
   concurrency-observed), **test47.3** (addition before the commit-phase read →
   QUOTE_STALE, zero dispatches; the research file's own passing control).
 - **Newly pinned here (simulator level):** on an adapter that DOES dispatch
-  (Chargebee simulator adapter) — **test53.1** (quote→commit window: unrelated
+  (Chargebee simulator adapter) — **test55.1** (quote→commit window: unrelated
   addition refuses QUOTE_STALE; the adapter's fingerprint is a content hash over
   the FULL subscription state; zero dispatches; the addition survives) and
-  **test53.2** (validate→dispatch window: the dispatch lands and — mechanics
+  **test55.2** (validate→dispatch window: the dispatch lands and — mechanics
   disclosed — deletes the addition, because the dispatched request is the
   validated state's item list; but the receipt caps at
   `COMMITTED_UNVERIFIED` / UNVERIFIED via the attribution bracket — the
@@ -71,7 +71,7 @@ that misrepresents the adapter's capability).
   future documented conditional write or targeted update ever gives this
   adapter a preservation-enforceable dispatch, repro43.1 becomes reachable and
   this accounting must be redone (the register's standing instruction).
-- **Nuance surfaced by test53.2 (flagged, not fixed):** the recorded immediate
+- **Nuance surfaced by test55.2 (flagged, not fixed):** the recorded immediate
   figure in the broken-bracket receipt (12500) is the bound artifact's own
   actual, priced by the simulator from the state the operation BEGAN on —
   which already included the concurrent addition (begin recurring 107500 →
@@ -200,7 +200,7 @@ that misrepresents the adapter's capability).
 
 | Case | Finding | Property pinned at | New pin | Research outcome (unchanged) |
 |---|---|---|---|---|
-| repro43.1 | F1 | test47.1/47.2/47.3 (live, refusal branch) + test53.1/53.2 (simulator, both windows) | test53.1, test53.2 | still failing at the gate — by design |
+| repro43.1 | F1 | test47.1/47.2/47.3 (live, refusal branch) + test55.1/55.2 (simulator, both windows) | test55.1, test55.2 | still failing at the gate — by design |
 | repro43.2 | F1 control | test47.2 (doctrine conversion: refusal) + clean-verify pins in test25/test50/test26 | — | still failing at the gate — by design |
 | repro45.1 | F3 | test49.1/49.2/49.3/49.5, test50.7; literal layer implemented in `establishLiveCommit`, unreachable | — | still failing at the gate — by design |
 | repro45.2 | F3 control | test49.4/49.6/49.13 + simulator clean commits | — | still failing at the gate — by design |
@@ -208,9 +208,9 @@ that misrepresents the adapter's capability).
 | repro46.2 | F5b | test50.2/50.17/50.4 | — | still failing at the gate — fixture route only |
 | repro46.3 | F5c | test50.3/50.4 | — | still failing at the gate — fixture route only |
 
-**Counts:** main suite 721/721 (base `9bb424b`) → **723/723** with test53
+**Counts:** main suite 721/721 (base `9bb424b`) → **723/723** with test55
 (Node 22; Node 20 via CI). Research suite **11 pass / 7 fail**, unchanged —
-every one of the seven is the preservation refusal above. `test53.1/53.2`
+every one of the seven is the preservation refusal above. `test55.1/55.2`
 passed on first run against unmodified code: they are regression pins for
 existing behavior, disclosed as such, not failing-first defect reproductions.
 No implementation file, no repro harness, and no guarded path was modified by
