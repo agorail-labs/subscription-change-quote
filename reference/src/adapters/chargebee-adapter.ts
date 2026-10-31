@@ -33,6 +33,7 @@ import {
   reconcileCommittedEffect,
   determinacyOf,
 } from "../core/scq-engine.js";
+import { verifyPostCommitState } from "../core/state-verification.js";
 import { QuoteStore, type StoredQuote } from "../store/quote-store.js";
 import {
   ChargebeeSim,
@@ -551,13 +552,6 @@ function buildCancelEffect(
     },
   };
   return effect;
-}
-
-/** Sorted item content for state-vs-intent comparison (item identity in this model is the item_price_id + quantity pair). */
-function sortedItems(items: Array<{ itemPriceId: string; quantity: number }>): Array<{ itemPriceId: string; quantity: number }> {
-  return items
-    .map((i) => ({ itemPriceId: i.itemPriceId, quantity: i.quantity }))
-    .sort((a, b) => (a.itemPriceId === b.itemPriceId ? a.quantity - b.quantity : a.itemPriceId < b.itemPriceId ? -1 : 1));
 }
 
 export class ChargebeeAdapter implements SubscriptionProvider {
@@ -1133,17 +1127,76 @@ export class ChargebeeAdapter implements SubscriptionProvider {
     const snap = snapshotFrom(readSub);
     const committedImmediateNet = readArtifact.netImmediate as number;
 
-    // State-vs-intent verification: the re-read state is compared
-    // against the result the COMPLETE final request implies —
-    // every item in the stored request, changed and unchanged.
-    const expectedItems = sortedItems(input.input.items);
-    const observedItems = sortedItems(readSub.subscriptionItems);
+    // State-vs-intent verification (G-08 / V62-SV-02): the
+    // item-set and subscription-identity dimensions are computed
+    // by the SHARED post-commit state-verification hook
+    // (core/state-verification.ts) at FULL_ITEM_SET coverage —
+    // the re-read item set against the result the COMPLETE final
+    // request implies (every item in the stored request, changed
+    // and unchanged), keyed by item_price_id: the identity the
+    // dispatched request and the persisted artifact both carry.
+    // (The snapshot's own item ids are per-instance ids the sim
+    // preserves positionally across an update, so the observation
+    // is keyed by price id here, not by snapshotFrom's ids.)
+    // The expectation also names the bound subscription
+    // (expectedSubscriptionRef): a re-read record naming a
+    // DIFFERENT subscription is a determined contradiction. The
+    // adapter-owned comparison this replaces never checked the
+    // record's identity, and the attribution fingerprint does not
+    // hash the record id (chargebee-sim computeFingerprint), so a
+    // foreign record carrying exactly the landed items previously
+    // verified — test53.1 is the failing-first regression.
+    //
+    // The proposal's per-change checks are NOT run: at
+    // FULL_ITEM_SET coverage the hook subsumes the item checks,
+    // and this adapter never state-verified cadence on the update
+    // path — feeding a CHANGE_CADENCE change to the hook would
+    // ADD a check whose snapshot cadence derives from the first
+    // item's price period, not from the change, changing outcomes
+    // an equivalence migration must preserve. `changes` is
+    // therefore emptied on the expectation side; the item set,
+    // the identity, and the status-stability check below are the
+    // whole of this path's state verification, exactly as before.
+    const stateVerification = verifyPostCommitState(
+      {
+        proposal: { ...proposal, changes: [] },
+        expectedItems: input.input.items.map((i) => ({ id: i.itemPriceId, quantity: i.quantity })),
+        expectedSubscriptionRef: subscriptionId,
+      },
+      {
+        snapshot: {
+          ...snap,
+          // snap.items is snapshotFrom's positional map of
+          // readSub.subscriptionItems; re-key each entry by its
+          // item_price_id (offering/quantity carried unchanged —
+          // offerings are not compared: the expectation states
+          // none, matching the comparison this replaces).
+          items: snap.items.map((item, idx) => ({ ...item, id: readSub.subscriptionItems[idx].itemPriceId })),
+        },
+        source: "chargebee-sim post-commit subscription re-read (establishCommittedEffect)",
+        observedAt: this.sim.currentTime().toISOString(),
+      }
+    );
     const problems: string[] = [];
-    if (JSON.stringify(expectedItems) !== JSON.stringify(observedItems)) {
+    if (stateVerification.verdict === "MISMATCH") {
+      problems.push(...stateVerification.contradictions);
+    } else if (stateVerification.verdict === "UNVERIFIABLE") {
+      // Defensive: unreachable on the simulator's data model —
+      // item_price_ids are non-empty catalog keys and quantities
+      // are finite numbers by construction, so the item-set and
+      // identity dimensions are always decidable here. If a
+      // future read shape ever made them undecidable, the
+      // establishment must fail closed (a problem), never verify.
       problems.push(
-        `subscription item state differs from the dispatched request's result: expected ${JSON.stringify(expectedItems)}, observed ${JSON.stringify(observedItems)}`
+        ...stateVerification.checks
+          .filter((c) => c.outcome === "UNVERIFIABLE")
+          .map((c) => `post-commit state could not be verified: ${c.detail}`)
       );
     }
+    // Status stability stays ADAPTER-OWNED: the hook has no
+    // update-status check (its status semantics serve CANCEL
+    // intents), and an update operation must leave the
+    // subscription's status exactly as it found it.
     if (readSub.status !== preState.status) {
       problems.push(`subscription status is ${readSub.status}, expected it to remain ${preState.status} across an update operation`);
     }
