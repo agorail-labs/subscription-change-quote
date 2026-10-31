@@ -405,3 +405,151 @@ test("Test 49.14 (F4 rule pin): cadence stated on one side only is not decidable
   const committed = engineEffect({ currency: "USD", source: "provider_actual" });
   assert.equal(reconcileCommittedEffect(quoted, committed, {}, ENGINE_PROPOSAL).status, "OK");
 });
+
+// ---------------------------------------------------------------------------
+// Correction round — P16-1 / P16-2 (independent review of 120f6cc)
+//
+// P16-1: unit comparability is a PRECONDITION for numeric
+// evidence, per dimension. PR-16 as delivered compared numbers
+// first: a numeric difference on a dimension whose currency
+// cannot be established classified VIOLATED, but amounts in
+// unestablished units cannot be meaningfully compared — the
+// difference is not evidence. P16-2: the no-envelope path
+// returned OK without any unit check, so established unit
+// contradictions silently reconciled on envelope-less
+// (cancellation) workflows.
+// ---------------------------------------------------------------------------
+
+function p16Effect(opts: {
+  immediateNet?: number;
+  recurringAmount?: number;
+  currency?: string;
+  cadence?: string;
+  source?: string;
+}): CommercialEffect {
+  return {
+    immediate: { net: opts.immediateNet ?? 20000 },
+    recurring: {
+      resultingAmount: opts.recurringAmount ?? 80900,
+      ...(opts.currency !== undefined ? { currency: opts.currency } : {}),
+      ...(opts.cadence ? { cadence: opts.cadence } : {}),
+    },
+    determinacy: { immediateFinancialEffect: "DETERMINED", recurringFinancialEffect: "DETERMINED" },
+    provenance: {
+      immediate: "test49 correction-round fixture",
+      recurring: "test49 correction-round fixture",
+      ...(opts.source ? { committedSource: opts.source } : {}),
+    } as CommercialEffect["provenance"],
+  } as CommercialEffect;
+}
+
+test("Test 49.15 (P16-1 conversion): quoted USD 80,900 vs committed 90,000 in an unestablishable currency reconciles UNVERIFIED — the numeric difference is not evidence across unknown units", () => {
+  const quoted = p16Effect({ currency: "USD", cadence: "MONTHLY", recurringAmount: 80900 });
+  // Arjun's exact example: the committed amount is larger, but
+  // its currency cannot be established (runtime-absent), so the
+  // +9,100 numeric difference proves nothing.
+  const committed = p16Effect({ cadence: "MONTHLY", recurringAmount: 90000, source: "provider_actual" });
+  const result = reconcileCommittedEffect(quoted, committed, {}, ENGINE_PROPOSAL);
+  assert.equal(result.status, "UNVERIFIED", "unknown-unit numeric drift must not classify VIOLATED");
+  assert.match(result.reason ?? "", /currenc/i);
+});
+
+test("Test 49.16 (P16-1 independence): the masked unknown-currency numeric difference does not mask an independently established violation — a stated cadence contradiction on the same dimension still classifies VIOLATED, on the contradiction's evidence", () => {
+  const quoted = p16Effect({ currency: "USD", cadence: "MONTHLY", recurringAmount: 80900 });
+  const committed = p16Effect({ cadence: "ANNUAL", recurringAmount: 90000, source: "provider_actual" });
+  const result = reconcileCommittedEffect(quoted, committed, {}, ENGINE_PROPOSAL);
+  assert.equal(result.status, "VIOLATED");
+  // The violation rests on the established cadence contradiction,
+  // NOT on the uninterpretable numeric difference: the reason
+  // names the cadences and does not present the +9,100 drift as
+  // an envelope violation.
+  assert.match(result.reason ?? "", /ANNUAL/);
+  assert.doesNotMatch(result.reason ?? "", /increased by 9100/);
+});
+
+test("Test 49.17 (P16-1 contradiction control): established USD vs established EUR at DIFFERING numbers still classifies VIOLATED — on the unit contradiction, not the numeric difference", () => {
+  const quoted = p16Effect({ currency: "USD", cadence: "MONTHLY", recurringAmount: 80900 });
+  const committed = p16Effect({ currency: "EUR", cadence: "MONTHLY", recurringAmount: 90000, source: "provider_actual" });
+  const result = reconcileCommittedEffect(quoted, committed, {}, ENGINE_PROPOSAL);
+  assert.equal(result.status, "VIOLATED");
+  assert.match(result.reason ?? "", /EUR/);
+  assert.doesNotMatch(result.reason ?? "", /increased by 9100/);
+});
+
+test("Test 49.18 (P16-1, pre-dispatch): the envelope gate refuses an unknown-currency revalidation with a truthful unestablishable-units reason — not a proven-drift claim", () => {
+  const quoted = p16Effect({ currency: "USD", cadence: "MONTHLY", recurringAmount: 80900 });
+  const revalidated = p16Effect({ cadence: "MONTHLY", recurringAmount: 90000, source: "revalidated_preview" });
+  const violation = checkAcceptanceEnvelope(quoted, revalidated, {}, ENGINE_PROPOSAL);
+  assert.ok(violation !== null, "the gate still refuses — the classification of the refusal is what changes");
+  assert.match(violation, /cannot be established/);
+  assert.doesNotMatch(violation, /increased by 9100/);
+});
+
+const CANCEL_PROPOSAL = {
+  changes: [{ action: "CANCEL" }],
+  effectiveIntent: { type: "IMMEDIATE" },
+} as unknown as SubscriptionChangeProposal;
+
+/** A valid cancellation shape: immediate dimension justified NOT_APPLICABLE (licensed for CANCEL, field absent, citation present); recurring established on both sides. */
+function cancelEffect(opts: { currency?: string; cadence?: string; source?: string }): CommercialEffect {
+  return {
+    recurring: {
+      resultingAmount: 0,
+      ...(opts.currency !== undefined ? { currency: opts.currency } : {}),
+      ...(opts.cadence ? { cadence: opts.cadence } : {}),
+    },
+    determinacy: { immediateFinancialEffect: "NOT_APPLICABLE", recurringFinancialEffect: "DETERMINED" },
+    provenance: {
+      recurring: "test49 correction-round fixture",
+      ...(opts.source ? { committedSource: opts.source } : {}),
+      applicabilityCitations: {
+        immediateFinancialEffect: { action: "CANCEL", dimension: "immediateFinancialEffect" },
+      },
+    } as CommercialEffect["provenance"],
+  } as CommercialEffect;
+}
+
+test("Test 49.19 (P16-2 conversion): a no-envelope cancellation whose established currencies contradict (USD quoted vs EUR committed) classifies VIOLATED — the contradiction is established evidence, envelope or not", () => {
+  const quoted = cancelEffect({ currency: "USD", cadence: "MONTHLY" });
+  const committed = cancelEffect({ currency: "EUR", cadence: "MONTHLY", source: "provider_actual" });
+  const result = reconcileCommittedEffect(quoted, committed, undefined, CANCEL_PROPOSAL);
+  assert.equal(result.status, "VIOLATED", `an established currency contradiction must not reconcile OK on the no-envelope path, got ${result.status}`);
+  assert.match(result.reason ?? "", /EUR/);
+});
+
+test("Test 49.20 (P16-2 conversion): a no-envelope cancellation whose established cadences contradict (MONTHLY vs ANNUAL) classifies VIOLATED", () => {
+  const quoted = cancelEffect({ currency: "USD", cadence: "MONTHLY" });
+  const committed = cancelEffect({ currency: "USD", cadence: "ANNUAL", source: "provider_actual" });
+  const result = reconcileCommittedEffect(quoted, committed, undefined, CANCEL_PROPOSAL);
+  assert.equal(result.status, "VIOLATED", `an established cadence contradiction must not reconcile OK on the no-envelope path, got ${result.status}`);
+  assert.match(result.reason ?? "", /ANNUAL/);
+});
+
+test("Test 49.21 (P16-2 decision pin): a no-envelope cancellation whose participating currency cannot be established classifies UNVERIFIED — a commit whose units cannot be established cannot be verified as matching", () => {
+  const quoted = cancelEffect({ currency: "USD", cadence: "MONTHLY" });
+  const committed = cancelEffect({ cadence: "MONTHLY", source: "provider_actual" });
+  const result = reconcileCommittedEffect(quoted, committed, undefined, CANCEL_PROPOSAL);
+  assert.equal(result.status, "UNVERIFIED", `unestablishable units must block OK on the no-envelope path, got ${result.status}`);
+  assert.match(result.reason ?? "", /currenc/i);
+});
+
+test("Test 49.22 (P16-2 preservation control): a no-envelope cancellation with the same established currency and cadence reconciles OK exactly as before — the cancellation exception is preserved", () => {
+  const quoted = cancelEffect({ currency: "USD", cadence: "MONTHLY" });
+  const committed = cancelEffect({ currency: "USD", cadence: "MONTHLY", source: "provider_actual" });
+  assert.equal(reconcileCommittedEffect(quoted, committed, undefined, CANCEL_PROPOSAL).status, "OK");
+});
+
+test("Test 49.23 (P16-2 preservation control): an EXACT defined-equal commit on the no-envelope path reconciles OK exactly as before — its units are identical to the quote's by protocol construction, even where a unit is unstated on both sides", () => {
+  const quoted = p16Effect({ cadence: "MONTHLY", recurringAmount: 80900 });
+  const committed: CommercialEffect = {
+    ...quoted,
+    provenance: { ...quoted.provenance, committedSource: "defined_equal_exact" } as CommercialEffect["provenance"],
+  };
+  assert.equal(reconcileCommittedEffect(quoted, committed, undefined, ENGINE_PROPOSAL).status, "OK");
+  const quotedDenominated = p16Effect({ currency: "USD", cadence: "MONTHLY", recurringAmount: 80900 });
+  const committedDenominated: CommercialEffect = {
+    ...quotedDenominated,
+    provenance: { ...quotedDenominated.provenance, committedSource: "defined_equal_exact" } as CommercialEffect["provenance"],
+  };
+  assert.equal(reconcileCommittedEffect(quotedDenominated, committedDenominated, undefined, ENGINE_PROPOSAL).status, "OK");
+});

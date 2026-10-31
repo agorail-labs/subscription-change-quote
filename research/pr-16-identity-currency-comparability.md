@@ -348,3 +348,86 @@ Unresolved schema decisions (for Arjun / PR #21, not decided here):
   be *annotated* (not rewritten) with derived unit context when
   next verified — PR-16 takes no position; recomputation already
   threads the recorded snapshot.
+
+## 10. Correction round — P16-1 / P16-2 (independent review of `120f6cc`)
+
+Arjun's independent review verified 670/670 on both Nodes and
+accepted F3, but withheld approval on two F4 classification-order
+defects. Both are fixed in this round; this section supersedes the
+two §4 statements it names (the original precedence paragraph and
+"the no-envelope path is unchanged").
+
+**P16-1 — unknown currency could produce a false VIOLATED.** As
+delivered, `reconcileCommittedEffect` compared numbers before
+units: quoted USD 80,900 vs committed 90,000 in an unestablishable
+currency classified VIOLATED on the +9,100 difference. Amounts in
+unestablished units cannot be meaningfully compared, so that
+difference is not evidence. **Rule now: unit comparability is a
+per-dimension PRECONDITION for numeric evidence.** Classification
+order in `reconcileCommittedEffect` (well-formed envelope): (1) an
+established unit contradiction ⇒ VIOLATED (the contradiction is
+itself the established evidence, and it is no longer displaced by
+a numeric difference computed across the very units in question);
+(2) a numeric violation on a dimension whose units are
+established-and-compatible ⇒ VIOLATED (unchanged strings);
+(3) unestablishable participating units ⇒ UNVERIFIED (a masked
+numeric difference on such a dimension is reported here, never as
+a violation); (4) BC-1 undetermined ⇒ UNVERIFIED; (5) OK. The
+malformed-envelope (fireable-projection) path applies the same
+per-dimension precondition to its numeric evidence; PR-15's
+classification shape is otherwise unchanged. At
+`checkAcceptanceEnvelope` (pre-dispatch), the gate still refuses
+every one of these cases — nothing dispatches on an unproven
+comparison — but the returned reason is now truthful in kind:
+contradiction ⇒ "unit comparability precondition failed";
+established-units numeric drift ⇒ the drift string;
+unestablishable units ⇒ "unit comparability cannot be
+established", never a proven-drift claim.
+
+One coupling is recorded honestly: in the current schema the
+immediate dimension's currency is sourced from the same two
+inputs as the recurring dimension's (threaded billing context,
+then the side's recurring currency), so currency-unestablishability
+on a participating dimension is correlated across dimensions —
+an unknown-currency dimension cannot coexist with an
+established-currency sibling dimension until the A-16-3 schema
+extension gives the immediate dimension its own currency field.
+Per-dimension independence is therefore pinned where the current
+schema can express it: a masked unknown-currency numeric
+difference does not mask an independently established cadence
+contradiction (test49.16), and an established contradiction at
+differing numbers classifies on the contradiction, not the
+numbers (test49.17).
+
+**P16-2 — the no-envelope path bypassed unit comparisons.** As
+delivered, `reconcileCommittedEffect` returned OK on the
+no-envelope path whenever the committed figures were established,
+without any unit check — so an established USD/EUR or
+MONTHLY/ANNUAL contradiction silently reconciled OK on
+envelope-less workflows (the valid cancellation exception). The
+cancellation exception is preserved (no envelope is required);
+what changes is that unit comparability is now computed before
+any path returns and applies there too. **Per-path unit behavior
+as implemented:**
+
+| Path | Unit behavior |
+|---|---|
+| Envelope present, well-formed | Contradiction ⇒ VIOLATED; numeric violation on established-units dimension ⇒ VIOLATED; unestablishable participating currency ⇒ UNVERIFIED; else BC-1 outcomes / OK. |
+| No envelope (cancellation exception; REVALIDATE CANCEL or any envelope-less call) | Contradiction ⇒ VIOLATED (established evidence is envelope-independent); unestablishable participating currency ⇒ UNVERIFIED (a commit whose units cannot be established cannot be verified as matching); same established units + established figures ⇒ OK exactly as before. Non-participating dimensions (justified NOT_APPLICABLE / unestablished figures) raise no unit question; unestablished committed figures remain UNVERIFIED as before. |
+| No envelope, EXACT defined_equal_exact | Unit checks do not arise: the committed figures ARE the quoted figures by protocol construction, so their units are the quote's units identically — OK exactly as before, including where a unit is unstated on both sides (pinned by test49.23). |
+| Malformed envelope (fireable projection, PR-15) | A violation through interpretable bounds establishes VIOLATED only on an established-units dimension (P16-1 masking); an established contradiction ⇒ VIOLATED (as PR-16 already held); otherwise UNVERIFIED, never OK. PR-15's shape is otherwise unchanged. |
+
+**Failing-first (new tests on unmodified `120f6cc`):** test49
+16 pass / 7 fail — the seven new pins fail (49.15 P16-1
+conversion, 49.16 independence reason-pin, 49.17 contradiction
+reason-pin, 49.18 pre-dispatch reason-pin, 49.19/49.20 P16-2
+conversions, 49.21 P16-2 unestablishable pin); the two
+preservation controls (49.22, 49.23) pass, as do all fourteen
+pre-existing tests. **After the fix:** test49 23/23; default
+suite **679/679** (670 + 9 new, zero regressions); research suite
+unchanged at 11 pass / 7 fail with identical per-file accounting
+(repro43 1/2, repro44 6/0, repro45 4/2, repro46 0/3 — repro files
+byte-unchanged). Changes are confined to
+`reference/src/core/scq-engine.ts` (gated, as before) plus
+append-only test49 growth and this section; no pre-existing test
+was modified.

@@ -821,6 +821,25 @@ function unitValue(value: unknown): string | undefined {
   return typeof value === "string" && value.length > 0 ? value : undefined;
 }
 
+/**
+ * Correction round (P16-1): the numeric violation of ONE
+ * dimension, computed in isolation. `compareDeterminedDimensions`
+ * reports the first violation across a set; the classification
+ * logic below needs per-dimension answers, because unit
+ * comparability is a per-dimension precondition for numeric
+ * evidence (a violation on a dimension whose units cannot be
+ * established is not evidence, while a violation on an
+ * established-units dimension stands on its own).
+ */
+function numericViolationOnDimension(
+  quoted: CommercialEffect,
+  compared: CommercialEffect,
+  envelope: AcceptanceEnvelope,
+  dimension: FinancialDimension
+): string | null {
+  return compareDeterminedDimensions(quoted, compared, envelope, new Set([dimension]));
+}
+
 function assessUnitComparability(
   quoted: CommercialEffect,
   compared: CommercialEffect,
@@ -980,8 +999,6 @@ export function checkAcceptanceEnvelope(
   assertEnvelopeEnforceable(quoted, revalidated, proposal);
   const assessments = assessEnvelopePair(quoted, revalidated, proposal, "quote");
   const comparable = new Set(assessments.filter((d) => d.comparable).map((d) => d.dimension));
-  const violation = compareDeterminedDimensions(quoted, revalidated, envelope, comparable);
-  if (violation) return violation;
   // PR-16 (Finding 4): unit comparability gates the pass. A
   // numeric pass across differing established units is not a
   // pass (the numbers are not comparable), and a participating
@@ -991,11 +1008,31 @@ export function checkAcceptanceEnvelope(
   // VIOLATED / UNVERIFIED distinction belongs to the
   // post-dispatch reconciliation, where an outcome exists to
   // classify.
-  const unitProblem = assessUnitComparability(quoted, revalidated, comparable, unitContext)[0];
-  if (unitProblem) {
-    return unitProblem.kind === "contradiction"
-      ? `unit comparability precondition failed: ${unitProblem.detail}`
-      : `unit comparability cannot be established: ${unitProblem.detail}`;
+  //
+  // Correction round (P16-1): the REASON must be truthful, and
+  // unit comparability is a per-dimension PRECONDITION for
+  // numeric evidence. An established unit contradiction refuses
+  // on the contradiction; a numeric drift refuses as drift only
+  // on a dimension whose units are established (and compatible);
+  // a numeric difference on a dimension whose currency cannot be
+  // established refuses as UNESTABLISHABLE UNITS — the gate
+  // refuses either way (nothing dispatches on an unproven
+  // comparison), but it never reports an uninterpretable
+  // difference as a proven drift.
+  const unitProblems = assessUnitComparability(quoted, revalidated, comparable, unitContext);
+  const unitContradiction = unitProblems.find((p) => p.kind === "contradiction");
+  if (unitContradiction) {
+    return `unit comparability precondition failed: ${unitContradiction.detail}`;
+  }
+  const unestablishableDims = new Set(unitProblems.filter((p) => p.kind === "unestablishable").map((p) => p.dimension));
+  for (const dimension of comparable) {
+    if (unestablishableDims.has(dimension)) continue;
+    const violation = numericViolationOnDimension(quoted, revalidated, envelope, dimension);
+    if (violation) return violation;
+  }
+  const unitUnestablishable = unitProblems.find((p) => p.kind === "unestablishable");
+  if (unitUnestablishable) {
+    return `unit comparability cannot be established: ${unitUnestablishable.detail}`;
   }
   return null;
 }
@@ -1079,6 +1116,36 @@ export function checkAcceptanceEnvelope(
  * between "nothing to reconcile against" (no envelope) and "the
  * figures were established" (provenance) — OK requires the former
  * to be the ONLY gap.
+ *
+ * Correction round (P16-1, P16-2 — independent review of PR-16):
+ *
+ *  - P16-1: unit comparability is a per-dimension PRECONDITION
+ *    for numeric evidence, not a check performed after it. As
+ *    delivered, PR-16 compared numbers first, so a numeric
+ *    difference on a dimension whose currency could not be
+ *    established classified VIOLATED — but amounts in
+ *    unestablished units cannot be meaningfully compared, so
+ *    that difference is not evidence of a violation. Now: a
+ *    dimension's numeric difference establishes VIOLATED only
+ *    when that dimension's units are established (and, for a
+ *    contradiction, the contradiction itself is the established
+ *    evidence). A masked numeric difference leaves the dimension
+ *    UNVERIFIED unless an independent established violation
+ *    (another dimension's established numeric violation, or an
+ *    established unit contradiction) classifies the commit
+ *    VIOLATED.
+ *  - P16-2: the no-envelope path applies unit comparability
+ *    too. An established unit contradiction is established
+ *    evidence, envelope or not, and classifies VIOLATED; a
+ *    participating currency that cannot be established
+ *    classifies UNVERIFIED (a commit whose units cannot be
+ *    established cannot be verified as matching). Two paths are
+ *    excepted, by construction: EXACT's defined_equal_exact
+ *    committed figures ARE the quoted figures (their units are
+ *    the quote's units, identically), and a dimension that does
+ *    not participate (justified NOT_APPLICABLE / no established
+ *    figures) raises no unit question. The cancellation
+ *    exception itself — no envelope required — is unchanged.
  */
 export function reconcileCommittedEffect(
   quoted: CommercialEffect,
@@ -1089,6 +1156,22 @@ export function reconcileCommittedEffect(
 ): ReconciliationResult {
   const assessments = assessEnvelopePair(quoted, committed, proposal, "committed");
   const undetermined = assessments.filter((d) => !d.comparable && !d.skipped);
+  const comparable = new Set(assessments.filter((d) => d.comparable).map((d) => d.dimension));
+
+  // PR-16 (Finding 4) + correction round (P16-1/P16-2): unit
+  // comparability over the participating dimensions — computed
+  // once, BEFORE any path can return, and consumed by every
+  // classification path below, the no-envelope path included. A
+  // unit CONTRADICTION is an established negative (it outranks
+  // unverifiability, exactly like an established numeric
+  // violation); an UNESTABLISHABLE participating currency makes
+  // compliance unprovable (UNVERIFIED) and — P16-1 — strips that
+  // dimension's numeric difference of evidential force. Neither
+  // can read OK.
+  const unitProblems = assessUnitComparability(quoted, committed, comparable, unitContext);
+  const unitContradiction = unitProblems.find((p) => p.kind === "contradiction");
+  const unitUnestablishable = unitProblems.filter((p) => p.kind === "unestablishable");
+  const unestablishableDims = new Set(unitUnestablishable.map((p) => p.dimension));
 
   // PR-15 correction (P15-1): ONLY `undefined` is an omitted
   // envelope. The pre-correction `if (!envelope)` also routed
@@ -1105,32 +1188,64 @@ export function reconcileCommittedEffect(
     const unestablishedCommitted = assessments.filter(
       (d) => d.compared.kind === "unenforceable"
     );
+    // Correction round (P16-2): unit comparability applies here
+    // too — "no envelope" removes the tolerance comparison, not
+    // the question of whether the committed figures are in the
+    // units the quote stated. An established contradiction is
+    // established evidence and classifies VIOLATED; an
+    // unestablishable participating currency blocks OK
+    // (UNVERIFIED: the commit cannot be verified as matching in
+    // units that cannot be established). EXCEPTED by
+    // construction: committed figures whose source is
+    // defined_equal_exact ARE the quoted figures — EXACT defines
+    // committed := quoted, so their units are the quote's units
+    // identically and no unit question arises; dimensions that
+    // do not participate (not comparable) likewise raise none.
+    const definedEqualByConstruction = committed.provenance?.committedSource === "defined_equal_exact";
+    if (!definedEqualByConstruction) {
+      if (unitContradiction) {
+        return {
+          status: "VIOLATED",
+          reason:
+            `Post-commit reconciliation failed: no acceptance envelope applies, but the ACTUALLY-committed effect's ` +
+            `established units contradict the quoted effect's — ${unitContradiction.detail}. A unit contradiction is ` +
+            `established evidence and is envelope-independent: no tolerance comparison is needed to know that amounts ` +
+            `in differing currencies or at differing cadences are not the amounts quoted. The mutation has already ` +
+            `occurred and cannot be rolled back by this reconciliation check; it exists solely so this is never ` +
+            `reported silently.`,
+        };
+      }
+      if (unitUnestablishable.length > 0 && unestablishedCommitted.length === 0) {
+        return {
+          status: "UNVERIFIED",
+          reason:
+            `Post-commit reconciliation cannot be established: no acceptance envelope applies and the committed ` +
+            `figures are established, but their units cannot be verified as the quoted units — ` +
+            `${unitUnestablishable.map((p) => p.detail).join("; ")}. A commit whose participating units cannot be ` +
+            `established cannot be verified as matching, so OK is not available (correction round, P16-2). The ` +
+            `mutation has already occurred; its unestablished unit(s) require operator follow-up, not a silent OK.`,
+          undeterminedDimensions: unitUnestablishable.map((p) => p.dimension),
+        };
+      }
+    }
     if (unestablishedCommitted.length === 0) return { status: "OK" };
     return {
       status: "UNVERIFIED",
       reason:
         `Post-commit reconciliation cannot be established: no acceptance envelope applies, and the committed ` +
         `financial outcome is itself unestablished (${unestablishedCommitted.map((d) => describeAssessment(d, "committed")).join("; ")}). ` +
-        `Reporting OK would present unmeasured figures as verified actuals; the commit stands, but its finances are unverified.`,
-      undeterminedDimensions: unestablishedCommitted.map((d) => d.dimension),
+        `Reporting OK would present unmeasured figures as verified actuals; the commit stands, but its finances are unverified.` +
+        (!definedEqualByConstruction && unitUnestablishable.length > 0
+          ? ` Unit comparability is additionally unestablishable: ${unitUnestablishable.map((p) => p.detail).join("; ")}.`
+          : ""),
+      undeterminedDimensions: [
+        ...new Set([
+          ...unestablishedCommitted.map((d) => d.dimension),
+          ...(!definedEqualByConstruction ? unitUnestablishable.map((p) => p.dimension) : []),
+        ]),
+      ],
     };
   }
-
-  const comparable = new Set(assessments.filter((d) => d.comparable).map((d) => d.dimension));
-
-  // PR-16 (Finding 4): unit comparability over the participating
-  // dimensions — computed once, consumed by both classification
-  // paths below. A unit CONTRADICTION is an established negative
-  // (it outranks unverifiability, exactly like an established
-  // numeric violation); an UNESTABLISHABLE participating currency
-  // makes compliance unprovable (UNVERIFIED). Neither can read
-  // OK. The no-envelope path above is untouched: with nothing to
-  // compare against, unit comparability — a comparison
-  // precondition — does not arise; that path judges whether the
-  // committed figures are established actuals, as before.
-  const unitProblems = assessUnitComparability(quoted, committed, comparable, unitContext);
-  const unitContradiction = unitProblems.find((p) => p.kind === "contradiction");
-  const unitUnestablishable = unitProblems.filter((p) => p.kind === "unestablishable");
 
   // PR-15 (Finding 2): a MALFORMED envelope (a NaN / negative /
   // string-typed bound, an unknown field, a non-object shape)
@@ -1147,7 +1262,19 @@ export function reconcileCommittedEffect(
   // cannot be fully interpreted.
   const envelopeProblem = envelopeShapeProblem(envelope);
   if (envelopeProblem) {
-    const fireableViolation = compareDeterminedDimensions(quoted, committed, fireableEnvelopeProjection(envelope), comparable);
+    // Correction round (P16-1): the fireable projection's numeric
+    // evidence is subject to the same per-dimension unit
+    // precondition — a violation "established through the
+    // interpretable bounds" must be established on a dimension
+    // whose units are established; a numeric difference on an
+    // unestablishable-unit dimension fires nothing.
+    const fireable = fireableEnvelopeProjection(envelope);
+    let fireableViolation: string | null = null;
+    for (const dimension of comparable) {
+      if (unestablishableDims.has(dimension)) continue;
+      fireableViolation = numericViolationOnDimension(quoted, committed, fireable, dimension);
+      if (fireableViolation) break;
+    }
     if (fireableViolation) {
       return {
         status: "VIOLATED",
@@ -1185,7 +1312,33 @@ export function reconcileCommittedEffect(
     };
   }
 
-  const violation = compareDeterminedDimensions(quoted, committed, envelope, comparable);
+  // Correction round (P16-1): classification order. An
+  // established unit CONTRADICTION classifies first — it is
+  // established evidence in its own right, and it must not be
+  // displaced by a numeric difference computed across the very
+  // units that contradict (or across a dimension whose units
+  // cannot be established at all). A numeric violation then
+  // classifies only where it is established: on a dimension
+  // whose units are established and compatible. A numeric
+  // difference on an unestablishable-unit dimension is masked —
+  // it is not evidence — and the commit falls through to the
+  // UNVERIFIED classification below.
+  if (unitContradiction) {
+    return {
+      status: "VIOLATED",
+      reason:
+        `Post-commit reconciliation failed: the ACTUALLY-committed effect is not comparable with the quoted effect — ` +
+        `${unitContradiction.detail}. The numeric comparison is not meaningful across differing units, so numeric ` +
+        `equality does not reconcile this commit. The mutation has already occurred and cannot be rolled back by ` +
+        `this reconciliation check; it exists solely so this is never reported silently.`,
+    };
+  }
+  let violation: string | null = null;
+  for (const dimension of comparable) {
+    if (unestablishableDims.has(dimension)) continue;
+    violation = numericViolationOnDimension(quoted, committed, envelope, dimension);
+    if (violation) break;
+  }
   if (violation) {
     return {
       status: "VIOLATED",
@@ -1195,16 +1348,6 @@ export function reconcileCommittedEffect(
         `because ConsistencyGuarantee is BEST_EFFORT — a concurrent write may have landed between the ` +
         `pre-mutation preview and the mutating call itself. The mutation has already occurred and cannot be ` +
         `rolled back by this reconciliation check; it exists solely so this is never reported silently.`,
-    };
-  }
-  if (unitContradiction) {
-    return {
-      status: "VIOLATED",
-      reason:
-        `Post-commit reconciliation failed: the ACTUALLY-committed effect is not comparable with the quoted effect — ` +
-        `${unitContradiction.detail}. The numeric comparison is not meaningful across differing units, so numeric ` +
-        `equality does not reconcile this commit. The mutation has already occurred and cannot be rolled back by ` +
-        `this reconciliation check; it exists solely so this is never reported silently.`,
     };
   }
   if (unitUnestablishable.length > 0) {
