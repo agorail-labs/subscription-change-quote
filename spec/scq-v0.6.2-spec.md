@@ -1,6 +1,6 @@
 # SCQ v0.6.2 — Normative Specification (Fail-Closed Financial Semantics)
 
-Status: PUBLISHED — experimental specification. Ratified by the maintainer (PR #21, Oct 31, 2026) and published <DATE>. v0.6.1 is the previous specification. Publication asserts this text as the project's experimental normative semantics; it is not a conformance certification, not a package release, and not an authorization for live provider mutation. Open items and disclosed limitations are recorded in §9 and in `research/v0.6.2-release-gaps.md`.
+Status: PUBLISHED — experimental specification. Ratified by the maintainer (PR #21, Oct 31, 2026) and published Oct 31, 2026. v0.6.1 is the previous specification. Publication asserts this text as the project's experimental normative semantics; it is not a conformance certification, not a package release, and not an authorization for live provider mutation. Open items and disclosed limitations are recorded in §9 and in `research/v0.6.2-release-gaps.md`.
 
 This document is the project's current experimental normative specification, ratified by the
 maintainer under the repository's `protocol-change-approved` process (PR #21; design:
