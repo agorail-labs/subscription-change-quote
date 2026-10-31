@@ -3,7 +3,7 @@
 Branch `fix/pr-17-receipt-evidence-verification` from main
 `bda3ea27` (PR #26 merged). Finding 5 is the last open finding of
 Issue #22. Reproduced by `research/issue-22` repro46 (harness-level
-accounting in §9).
+accounting in §8).
 
 ## 1. The three confirmed failures
 
