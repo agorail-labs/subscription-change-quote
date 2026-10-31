@@ -19,11 +19,16 @@ export {
   DispatchBlockedError,
   ResolutionEvidenceError,
   RESOLUTION_EVIDENCE_MAX_AGE_MS,
+  establishResolutionEvidence,
   type StoredAttempt,
   type MutationIntent,
   type ResolutionClassification,
-  type ResolutionEvidenceInput,
+  type ResolutionEvidenceSource,
+  type ResolutionProviderRecord,
+  type EstablishedResolutionEvidence,
+  type ResolveAttemptInput,
   type StoredResolution,
+  type StoredLandingReconciliation,
 } from "./store/durable-store.js";
 export { DurableMutationCoordinator } from "./store/mutation-coordinator.js";
 export { StripeAdapter } from "./adapters/stripe-adapter.js";
