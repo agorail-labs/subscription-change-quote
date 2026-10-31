@@ -553,3 +553,53 @@ test("Test 49.23 (P16-2 preservation control): an EXACT defined-equal commit on 
   };
   assert.equal(reconcileCommittedEffect(quotedDenominated, committedDenominated, undefined, ENGINE_PROPOSAL).status, "OK");
 });
+
+// ---------------------------------------------------------------------------
+// Second correction round — P16-3 (independent re-review of cf13c99)
+//
+// The P16-2 defined_equal_exact exception was implemented as a
+// label-based skip: on the no-envelope path, a committed effect
+// carrying the defined_equal_exact provenance label skipped the
+// unit checks entirely. But the label is an ASSERTION that
+// committed := quoted by definition — it cannot override explicit
+// evidence in the record itself. A committed record that
+// explicitly states EUR against a USD quote (or ANNUAL against
+// MONTHLY) is, on its face, NOT the quoted figures, whatever its
+// label says. The rule: the label may excuse ABSENT unit
+// statements (that is what "by construction" means — test49.23);
+// it may never excuse CONTRADICTING unit statements.
+// ---------------------------------------------------------------------------
+
+test("Test 49.24 (P16-3 conversion): a no-envelope committed record labeled defined_equal_exact but explicitly stating EUR against a USD quote classifies VIOLATED — the label does not rescue an explicit contradiction", () => {
+  const quoted = p16Effect({ currency: "USD", cadence: "MONTHLY", recurringAmount: 80900 });
+  const committed = p16Effect({ currency: "EUR", cadence: "MONTHLY", recurringAmount: 80900, source: "defined_equal_exact" });
+  const result = reconcileCommittedEffect(quoted, committed, undefined, ENGINE_PROPOSAL);
+  assert.equal(result.status, "VIOLATED", `an explicit currency contradiction must take precedence over the defined_equal_exact label, got ${result.status}`);
+  assert.match(result.reason ?? "", /EUR/);
+});
+
+test("Test 49.25 (P16-3 conversion): a no-envelope committed record labeled defined_equal_exact but explicitly stating ANNUAL against a MONTHLY quote classifies VIOLATED", () => {
+  const quoted = p16Effect({ currency: "USD", cadence: "MONTHLY", recurringAmount: 80900 });
+  const committed = p16Effect({ currency: "USD", cadence: "ANNUAL", recurringAmount: 80900, source: "defined_equal_exact" });
+  const result = reconcileCommittedEffect(quoted, committed, undefined, ENGINE_PROPOSAL);
+  assert.equal(result.status, "VIOLATED", `an explicit cadence contradiction must take precedence over the defined_equal_exact label, got ${result.status}`);
+  assert.match(result.reason ?? "", /ANNUAL/);
+});
+
+test("Test 49.26 (P16-3 conversion, cancellation shape): a no-envelope cancellation record labeled defined_equal_exact but explicitly stating EUR against a USD quote classifies VIOLATED", () => {
+  const quoted = cancelEffect({ currency: "USD", cadence: "MONTHLY" });
+  const committed = cancelEffect({ currency: "EUR", cadence: "MONTHLY", source: "defined_equal_exact" });
+  const result = reconcileCommittedEffect(quoted, committed, undefined, CANCEL_PROPOSAL);
+  assert.equal(result.status, "VIOLATED", `an explicit currency contradiction on a cancellation record must take precedence over the defined_equal_exact label, got ${result.status}`);
+  assert.match(result.reason ?? "", /EUR/);
+});
+
+test("Test 49.27 (P16-3 preservation control): a defined_equal_exact record whose stated units are identical to the quote's reconciles OK on the no-envelope path — the label still excuses restated-identical and absent unit statements", () => {
+  // Stated identically (restated, not copied): the committed
+  // record explicitly denominates USD / MONTHLY, exactly the
+  // quoted units — no contradiction exists for the label to
+  // excuse, and none is invented.
+  const quoted = p16Effect({ currency: "USD", cadence: "MONTHLY", recurringAmount: 80900 });
+  const committed = p16Effect({ currency: "USD", cadence: "MONTHLY", recurringAmount: 80900, source: "defined_equal_exact" });
+  assert.equal(reconcileCommittedEffect(quoted, committed, undefined, ENGINE_PROPOSAL).status, "OK");
+});

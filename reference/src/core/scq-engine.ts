@@ -1146,6 +1146,20 @@ export function checkAcceptanceEnvelope(
  *    not participate (justified NOT_APPLICABLE / no established
  *    figures) raises no unit question. The cancellation
  *    exception itself — no envelope required — is unchanged.
+ *  - P16-3 (second correction round, re-review of cf13c99): the
+ *    defined_equal_exact exception is scoped to what "by
+ *    construction" can honestly mean. The label excuses ABSENT
+ *    unit statements (an unstated unit on a defined-equal record
+ *    is the quote's unit, identically); it may NEVER excuse
+ *    CONTRADICTING unit statements. A committed record that
+ *    explicitly states a currency or cadence contradicting the
+ *    quote's established units is, on its face, not the quoted
+ *    figures, whatever its provenance label asserts — the
+ *    explicit contradiction classifies VIOLATED on the
+ *    no-envelope path, label notwithstanding. (The envelope-
+ *    present and malformed-envelope paths never had the skip:
+ *    their contradiction checks were already unconditional, as
+ *    is the store recomputation that routes through here.)
  */
 export function reconcileCommittedEffect(
   quoted: CommercialEffect,
@@ -1195,26 +1209,37 @@ export function reconcileCommittedEffect(
     // established evidence and classifies VIOLATED; an
     // unestablishable participating currency blocks OK
     // (UNVERIFIED: the commit cannot be verified as matching in
-    // units that cannot be established). EXCEPTED by
-    // construction: committed figures whose source is
-    // defined_equal_exact ARE the quoted figures — EXACT defines
-    // committed := quoted, so their units are the quote's units
-    // identically and no unit question arises; dimensions that
-    // do not participate (not comparable) likewise raise none.
+    // units that cannot be established).
+    //
+    // Second correction round (P16-3): the contradiction check
+    // is NOT gated on provenance. The defined_equal_exact label
+    // excuses only ABSENT unit statements below (a defined-equal
+    // record's unstated unit is the quote's unit by
+    // construction); an EXPLICIT contradicting statement is
+    // evidence in the record itself, and a label asserting
+    // committed := quoted cannot override it — a record that
+    // states different units is, on its face, not the quoted
+    // figures. Dimensions that do not participate (not
+    // comparable) raise no unit question either way.
     const definedEqualByConstruction = committed.provenance?.committedSource === "defined_equal_exact";
+    if (unitContradiction) {
+      return {
+        status: "VIOLATED",
+        reason:
+          `Post-commit reconciliation failed: no acceptance envelope applies, but the ACTUALLY-committed effect's ` +
+          `established units contradict the quoted effect's — ${unitContradiction.detail}. A unit contradiction is ` +
+          `established evidence and is envelope-independent: no tolerance comparison is needed to know that amounts ` +
+          `in differing currencies or at differing cadences are not the amounts quoted. The mutation has already ` +
+          `occurred and cannot be rolled back by this reconciliation check; it exists solely so this is never ` +
+          `reported silently.` +
+          (definedEqualByConstruction
+            ? ` The record carries the defined_equal_exact provenance label, but that label asserts committed := quoted ` +
+              `by definition — it excuses absent unit statements only and cannot override the record's own explicit ` +
+              `unit statements (second correction round, P16-3).`
+            : ``),
+      };
+    }
     if (!definedEqualByConstruction) {
-      if (unitContradiction) {
-        return {
-          status: "VIOLATED",
-          reason:
-            `Post-commit reconciliation failed: no acceptance envelope applies, but the ACTUALLY-committed effect's ` +
-            `established units contradict the quoted effect's — ${unitContradiction.detail}. A unit contradiction is ` +
-            `established evidence and is envelope-independent: no tolerance comparison is needed to know that amounts ` +
-            `in differing currencies or at differing cadences are not the amounts quoted. The mutation has already ` +
-            `occurred and cannot be rolled back by this reconciliation check; it exists solely so this is never ` +
-            `reported silently.`,
-        };
-      }
       if (unitUnestablishable.length > 0 && unestablishedCommitted.length === 0) {
         return {
           status: "UNVERIFIED",

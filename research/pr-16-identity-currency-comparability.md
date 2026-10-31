@@ -431,3 +431,64 @@ byte-unchanged). Changes are confined to
 `reference/src/core/scq-engine.ts` (gated, as before) plus
 append-only test49 growth and this section; no pre-existing test
 was modified.
+
+## 11. Second correction round — P16-3 (independent re-review of `cf13c99`)
+
+Arjun's re-review verified 679/679 on both Nodes and confirmed
+P16-1 fixed and P16-2 fixed with one exception: the
+defined_equal_exact exception added for P16-2 was implemented as
+a **label-based skip** — on the no-envelope path,
+`reconcileCommittedEffect` checked
+`committed.provenance?.committedSource === "defined_equal_exact"`
+and skipped BOTH unit branches (contradiction and
+unestablishable) for a labeled record. A committed record
+explicitly stating EUR against a USD quote — or ANNUAL against
+MONTHLY — therefore still reconciled OK behind the label. This
+section supersedes the "No envelope, EXACT defined_equal_exact"
+row of §10's per-path table.
+
+**Rule now: the label may excuse ABSENT unit statements; it may
+never excuse CONTRADICTING unit statements.** The
+defined_equal_exact label is an assertion that committed :=
+quoted by protocol definition. Where the record states no unit,
+that assertion is the only evidence and the construction holds —
+the unstated unit IS the quote's unit, identically (test49.23,
+unchanged, passes unmodified). But where the record explicitly
+states a currency or cadence that contradicts the quote's
+established units, the record's own explicit statements are
+evidence that outranks the label: a record that states different
+units is, on its face, not the quoted figures. Implementation:
+the no-envelope path's unit-contradiction return is no longer
+gated on provenance — it fires for any committed source
+(`provider_actual`, `defined_equal_exact`, or any other) — and
+its reason names the precedence when the label is present. The
+unestablishable branch remains label-excused, exactly as before:
+absent statements are the case the construction legitimately
+covers. No other behavior changed.
+
+**Per-path audit for the same label-based skip:**
+
+| Path | Bypass present? | Disposition |
+|---|---|---|
+| No-envelope path (`reconcileCommittedEffect`, `envelope === undefined`) | **Yes** — the finding. | Fixed here: contradiction check ungated from the label; unestablishable remains label-excused (absent statements only). |
+| Envelope-present path (well-formed envelope) | No — the contradiction return precedes all classification, with no provenance condition anywhere in the branch. | Unchanged. |
+| Malformed-envelope path (fireable projection) | No — the contradiction return is unconditional there too. | Unchanged. |
+| Store `verifyCommitReceipt` recomputation (`quote-store.ts`) | No skip of its own — the store admits `defined_equal_exact` only as an *establishing source* for the evidence's figures (an admissibility check on provenance, not a unit exemption) and then recomputes through `reconcileCommittedEffect`. It routed through the no-envelope bypass whenever the stored quote carried no envelope, and it inherits this fix by the same route. | Fixed transitively; no store change. |
+| Store `establishVerification` minting (`quote-store.ts`) | Same as above — computes its reconciliation through `reconcileCommittedEffect`; no label-based pre-branch. | Fixed transitively; no store change. |
+| Adapter establishments (Stripe, Paddle, Zuora, Chargebee simulator, Chargebee-live) | No — every adapter that produces a defined_equal_exact committed effect constructs it as a copy of the quoted effect (units identical by construction) and still passes it through `reconcileCommittedEffect`; none substitutes a hardcoded OK or branches on the label before reconciling. The engine's no-envelope branch was the only label-based skip in the codebase. | Unchanged. |
+
+**Failing-first (new tests on unmodified `cf13c99`):** test49
+24 pass / 3 fail — the three P16-3 conversions fail (49.24
+currency contradiction behind the label; 49.25 cadence
+contradiction behind the label; 49.26 the cancellation-shaped
+currency case), each returning OK pre-fix; the preservation
+control 49.27 (label + units restated identically ⇒ OK) passes,
+as do all 23 pre-existing tests, test49.23 included and
+unmodified. **After the fix:** test49 27/27; default suite
+**683/683** (679 + 4 new, zero regressions); research suite
+unchanged at 11 pass / 7 fail with identical per-file accounting
+(repro43 1/2, repro44 6/0, repro45 4/2, repro46 0/3 — repro files
+byte-unchanged). Changes are confined to
+`reference/src/core/scq-engine.ts` (gated, as before) plus
+append-only test49 growth and this section; no pre-existing test
+was modified.
