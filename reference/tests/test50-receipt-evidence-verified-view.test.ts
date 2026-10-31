@@ -1,9 +1,25 @@
-import { test } from "node:test";
+import { after, test } from "node:test";
 import assert from "node:assert/strict";
 import { createHash } from "node:crypto";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { rmSync } from "node:fs";
+
+// ---------------------------------------------------------------------------
+// Temp-file cleanup (test infrastructure): every database file handed out
+// via tmpDbPath is removed when this file's tests finish — pass or fail —
+// so repeated suite runs do not accumulate scq-test50-* litter in the OS
+// temp dir. (tmpDbPath's pre-use removal of stale files is unchanged.)
+// ---------------------------------------------------------------------------
+const tempDbFiles: string[] = [];
+after(() => {
+  for (const path of tempDbFiles.splice(0)) {
+    rmSync(path, { force: true });
+    rmSync(path + "-wal", { force: true });
+    rmSync(path + "-shm", { force: true });
+  }
+});
+
 import {
   SCQError,
   type CommercialEffect,
@@ -686,6 +702,7 @@ test("Test 50.25: an altered recorded candidate refuses restore (identity digest
 
 function tmpDbPath(name: string): string {
   const path = join(tmpdir(), `scq-test50-${name}-${process.pid}.sqlite`);
+  tempDbFiles.push(path);
   rmSync(path, { force: true });
   rmSync(path + "-wal", { force: true });
   rmSync(path + "-shm", { force: true });

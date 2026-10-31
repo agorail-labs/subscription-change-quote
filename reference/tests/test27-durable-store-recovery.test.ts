@@ -1,7 +1,25 @@
-import { test } from "node:test";
+import { after, test } from "node:test";
 import assert from "node:assert/strict";
 import { spawn, spawnSync } from "node:child_process";
-import { existsSync, mkdtempSync, readFileSync, writeFileSync } from "node:fs";
+import { existsSync, mkdtempSync, readFileSync, writeFileSync, rmSync } from "node:fs";
+
+// ---------------------------------------------------------------------------
+// Temp-dir cleanup (test infrastructure): every directory handed out via
+// trackTempDir is removed when this file's tests finish — pass or fail —
+// so repeated suite runs do not accumulate scq-* litter in the OS temp
+// dir. Cleanup runs only after the owning tests complete; durable-store
+// tests that reopen a store across simulated restarts within one test
+// are unaffected.
+// ---------------------------------------------------------------------------
+const tempDirs: string[] = [];
+function trackTempDir(dir: string): string {
+  tempDirs.push(dir);
+  return dir;
+}
+after(() => {
+  for (const dir of tempDirs.splice(0)) rmSync(dir, { recursive: true, force: true });
+});
+
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { createRequire } from "node:module";
@@ -27,7 +45,7 @@ const CHILD = new URL("./helpers/durable-child.js", import.meta.url).pathname;
 const require = createRequire(import.meta.url);
 
 function tmpDb(name = "scq.db"): string {
-  const dir = mkdtempSync(join(tmpdir(), "scq-pr8-"));
+  const dir = trackTempDir(mkdtempSync(join(tmpdir(), "scq-pr8-")));
   return join(dir, name);
 }
 function openStore(path: string, opts: Record<string, unknown> = {}): DurableQuoteStore {
@@ -322,7 +340,7 @@ test("Test 27.16 (row 16): crash during a verification transition recovers the o
 
 test("Test 27.17 (row 17): two concurrent processes committing the same quote dispatch EXACTLY once", async () => {
   const path = tmpDb();
-  const marker = join(mkdtempSync(join(tmpdir(), "scq-pr8-race-")), "dispatches.log");
+  const marker = join(trackTempDir(mkdtempSync(join(tmpdir(), "scq-pr8-race-"))), "dispatches.log");
   writeFileSync(marker, "");
   const setup = openStore(path);
   setup.put(makeStoredQuote("q1"));
@@ -407,7 +425,7 @@ test("Test 27.22b (row 22): a locked database surfaces SQLITE_BUSY as a persiste
   const setup = openStore(path);
   setup.put(makeStoredQuote("q1"));
   setup.close();
-  const ready = join(mkdtempSync(join(tmpdir(), "scq-pr8-lock-")), "ready");
+  const ready = join(trackTempDir(mkdtempSync(join(tmpdir(), "scq-pr8-lock-"))), "ready");
   const holder = spawn(process.execPath, [CHILD, "hold-lock", path, ready], { stdio: "ignore" });
   try {
     for (let i = 0; i < 100 && !existsSync(ready); i++) await new Promise((r) => setTimeout(r, 50));

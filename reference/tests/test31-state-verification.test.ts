@@ -1,6 +1,24 @@
-import { test } from "node:test";
+import { after, test } from "node:test";
 import assert from "node:assert/strict";
-import { mkdtempSync } from "node:fs";
+import { mkdtempSync, rmSync } from "node:fs";
+
+// ---------------------------------------------------------------------------
+// Temp-dir cleanup (test infrastructure): every directory handed out via
+// trackTempDir is removed when this file's tests finish — pass or fail —
+// so repeated suite runs do not accumulate scq-* litter in the OS temp
+// dir. Cleanup runs only after the owning tests complete; durable-store
+// tests that reopen a store across simulated restarts within one test
+// are unaffected.
+// ---------------------------------------------------------------------------
+const tempDirs: string[] = [];
+function trackTempDir(dir: string): string {
+  tempDirs.push(dir);
+  return dir;
+}
+after(() => {
+  for (const dir of tempDirs.splice(0)) rmSync(dir, { recursive: true, force: true });
+});
+
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { SCQError } from "../src/core/types.js";
@@ -606,7 +624,7 @@ test("Test 31.25 (row 25, COMPATIBILITY): receipt verification still rejects sel
 // ---------------------------------------------------------------------------
 
 function tmpDb(): string {
-  return join(mkdtempSync(join(tmpdir(), "scq-pr9-")), "scq.db");
+  return join(trackTempDir(mkdtempSync(join(tmpdir(), "scq-pr9-"))), "scq.db");
 }
 
 test("Test 31.26 (row 26, COMPATIBILITY): original receipt replay is unchanged after verification through the refactored establishment AND a durable restart", () => {
