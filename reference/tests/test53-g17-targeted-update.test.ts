@@ -21,16 +21,41 @@
  * wire shape on this same mock, proving the harness can detect the
  * failure it claims to detect).
  *
- * Evidence class: SIMULATED throughout. The positive
- * CHANGE_QUANTITY verdict (53.2) additionally depends on ASSUMED
- * rule A1 (same-ID update-in-place); 53.5–53.7 run the identical
- * wire request under the other documented-plausible same-ID
- * behaviors and show the verdict does not survive them — which is
- * why the research package keeps G-17 OPEN and recommends
- * vendor clarification before any adapter change.
+ * Evidence class: SIMULATED throughout. The CHANGE_QUANTITY runs
+ * additionally depend on ASSUMED rule A1 (same-ID update-in-place);
+ * 53.5–53.7 run the identical wire request under the other
+ * documented-plausible same-ID behaviors and show the outcome does
+ * not survive them — which is why the research package keeps G-17
+ * OPEN and recommends vendor clarification before any adapter
+ * change.
+ *
+ * CORRECTION ROUND (independent review of PR #38 @ ecc3ff5,
+ * findings G17-R1..R4 — see research package §10):
+ *  R1. ADD_ADDON is a PROVIDER operation class, not an SCQ action
+ *      (core/types.ts ChangeAction has no ADD_ADDON; pinned by
+ *      53.31). Its positive result demonstrates provider capability
+ *      only.
+ *  R2. `resource_version` is a millisecond timestamp, not a counter.
+ *      The mock now stamps it from a controllable clock (same-ms
+ *      collisions included); the executor no longer classifies on
+ *      any delta. CHANGE_QUANTITY's verdict ceiling is
+ *      PRESERVATION_UNVERIFIABLE even on its happiest path (53.2),
+ *      because an overwritten same-item interleaving is
+ *      observationally indistinguishable from a clean run.
+ *  R3. Schedule history is unverifiable from the T4 flag: 53.24 is
+ *      now an explicit negative test — a schedule created after T2
+ *      at the same timestamp is deleted by the dispatch and leaves
+ *      T4 identical to baseline; the verdict is item-scoped only.
+ *  R4. Positive classifications are ITEM_PRESERVED_* and every
+ *      verdict carries scope MOCK_VISIBLE_ITEM_SUBSET_ONLY, the
+ *      unobservable-dimensions list, and interleavingExcluded:
+ *      false. 53.35 is the collateral-effect counterexample (a
+ *      coupon silently dropped by the update does not change the
+ *      item verdict — because the verdict never covered coupons).
  */
 import { test } from "node:test";
 import assert from "node:assert/strict";
+import { readFileSync } from "node:fs";
 import { ChargebeeClient } from "../src/live/chargebee-http.js";
 import { ChargebeeLiveAdapter, buildChargebeeUpdateParams } from "../src/live/chargebee-scq-adapter.js";
 import { QuoteStore } from "../src/store/quote-store.js";
@@ -45,10 +70,13 @@ import {
   G17_ADDON_STORAGE,
   G17_ADDON_MANDATORY,
   G17_ADDON_EXTERNAL,
+  G17_COUPON_WELCOME,
   type G17MockOptions,
 } from "../src/live/pilot/g17-mock-transport.js";
 import {
   G17TargetedUpdatePrototype,
+  G17_UNOBSERVABLE_DIMENSIONS,
+  SCQ_CHANGE_ACTIONS,
   buildTargetedUpdateParams,
   type G17Operation,
   type G17Prepared,
@@ -76,12 +104,15 @@ async function staged(proto: G17TargetedUpdatePrototype, op: G17Operation) {
 // Positive paths + wire shape
 // ------------------------------------------------------------------
 
-test("Test 53.1 (G-17): ADD_ADDON of a new item via additive dispatch preserves all unrelated state (DOCUMENTED additive semantics, SIMULATED)", async () => {
+test("Test 53.1 (G-17): ADD_ADDON of a new item via additive dispatch — item subset observed preserved (DOCUMENTED additive semantics, SIMULATED; scope-corrected per G17-R1/R4)", async () => {
   const { mock, proto } = setup();
   const t0 = await proto.readSnapshot();
   const verdict = await proto.execute(ADD_STORAGE, t0, KEY);
-  assert.equal(verdict.classification, "PRESERVED_VERIFIED");
+  assert.equal(verdict.classification, "ITEM_PRESERVED_OBSERVED");
   assert.equal(verdict.evidence, "SIMULATED");
+  assert.equal(verdict.scope, "MOCK_VISIBLE_ITEM_SUBSET_ONLY", "G17-R4: the verdict speaks for the visible item subset only, never for preservation in general");
+  assert.equal(verdict.interleavingExcluded, false, "G17-R2/R3: interleaving is never excluded by this prototype");
+  assert.equal(verdict.inScqActionSchema, false, "G17-R1: ADD_ADDON is a provider operation class, NOT an SCQ ChangeAction");
   const update = mock.calls.find((c) => c.mutating)!;
   assert.equal(update.replaceItemsList, false, "the wire dispatch is additive, never replacement");
   assert.deepEqual(update.itemPriceIds, [G17_ADDON_STORAGE], "the wire payload names ONLY the authorized target item");
@@ -94,11 +125,13 @@ test("Test 53.1 (G-17): ADD_ADDON of a new item via additive dispatch preserves 
   ]);
 });
 
-test("Test 53.2 (G-17): CHANGE_QUANTITY to an absolute target preserves unrelated state — under ASSUMED same-ID update-in-place semantics (A1, SIMULATED)", async () => {
+test("Test 53.2 (G-17): CHANGE_QUANTITY lands the absolute target under ASSUMED A1 — but the verdict ceiling is PRESERVATION_UNVERIFIABLE (G17-R2: an overwritten same-item interleaving is indistinguishable from this clean run)", async () => {
   const { mock, proto } = setup();
   const t0 = await proto.readSnapshot();
   const verdict = await proto.execute(SEATS_TO_21, t0, KEY);
-  assert.equal(verdict.classification, "PRESERVED_VERIFIED");
+  assert.equal(verdict.classification, "PRESERVATION_UNVERIFIABLE", "the target state is observed in effect, yet timestamp-only evidence cannot exclude a same-item interleaving — no verified claim is made");
+  assert.match(verdict.details.join(" "), /CEILING \(G17-R2\)/);
+  assert.equal(verdict.inScqActionSchema, true, "CHANGE_QUANTITY IS an SCQ ChangeAction — and it remains unproven");
   const update = mock.calls.find((c) => c.mutating)!;
   assert.equal(update.replaceItemsList, false);
   assert.deepEqual(update.itemPriceIds, [G17_ADDON_SEATS]);
@@ -106,7 +139,7 @@ test("Test 53.2 (G-17): CHANGE_QUANTITY to an absolute target preserves unrelate
     { item_price_id: G17_PLAN_MONTHLY, quantity: 1 },
     { item_price_id: G17_ADDON_SEATS, quantity: 21 },
     { item_price_id: G17_ADDON_SUPPORT, quantity: 2 },
-  ]);
+  ], "the mock state DID land exactly as authorized — the ceiling is an evidence limit, not an outcome failure");
 });
 
 test("Test 53.3 (G-17): the targeted builder emits a minimal payload — target item only, replace_items_list=false, no plan, no retained set", () => {
@@ -242,16 +275,17 @@ test("Test 53.17 (G-17 scenario 5a): a scheduled change exists at T2 -> REFUSED_
 // Race window T2 -> T3: staged prepare/dispatch/verify.
 // ------------------------------------------------------------------
 
-test("Test 53.18 (G-17 scenario 1b): another actor adds an addon BETWEEN T2 and T3 -> additive dispatch preserves it (PRESERVED_WITH_CONCURRENT_CHANGE)", async () => {
+test("Test 53.18 (G-17 scenario 1b): another actor adds an addon BETWEEN T2 and T3 -> additive dispatch preserves it in the item subset (ITEM_PRESERVED_WITH_CONCURRENT_CHANGE)", async () => {
   const { mock, proto } = setup();
-  const { prepared } = await staged(proto, SEATS_TO_21);
+  const { prepared } = await staged(proto, ADD_STORAGE);
   mock.externalAddItem(G17_ADDON_EXTERNAL, 1);
   const outcome = await proto.dispatch(prepared);
   assert.equal(outcome.ok, true);
   const verdict = await proto.verify(prepared);
-  assert.equal(verdict.classification, "PRESERVED_WITH_CONCURRENT_CHANGE");
+  assert.equal(verdict.classification, "ITEM_PRESERVED_WITH_CONCURRENT_CHANGE");
+  assert.equal(verdict.scope, "MOCK_VISIBLE_ITEM_SUBSET_ONLY");
   assert.ok(mock.peekItems().some((i) => i.item_price_id === G17_ADDON_EXTERNAL && i.quantity === 1), "the concurrent addon survived the dispatch intact");
-  assert.ok(mock.peekItems().some((i) => i.item_price_id === G17_ADDON_SEATS && i.quantity === 21), "the authorized change also landed");
+  assert.ok(mock.peekItems().some((i) => i.item_price_id === G17_ADDON_STORAGE && i.quantity === 3), "the authorized change also landed");
 });
 
 test("Test 53.19 (G-17 control): the SAME interleaving under the CURRENT full-replacement wire shape deletes the concurrent addon (Issue #22 Finding 1 reproduced on this mock)", async () => {
@@ -268,14 +302,15 @@ test("Test 53.19 (G-17 control): the SAME interleaving under the CURRENT full-re
   assert.ok(!mock.peekItems().some((i) => i.item_price_id === G17_ADDON_EXTERNAL), "full replacement silently deleted the concurrently added addon — the harness detects the failure the prototype is designed to avoid");
 });
 
-test("Test 53.20 (G-17 scenario 2b): another actor modifies the SAME item's quantity between T2 and T3 -> never VERIFIED (PRESERVATION_UNVERIFIABLE)", async () => {
+test("Test 53.20 (G-17 scenario 2b): another actor modifies the SAME item's quantity between T2 and T3 -> PRESERVATION_UNVERIFIABLE, and the T4 state is identical to the clean run in 53.2 (that identity is the G17-R2 point)", async () => {
   const { mock, proto } = setup();
   const { prepared } = await staged(proto, SEATS_TO_21);
   mock.externalSetQuantity(G17_ADDON_SEATS, 5);
   await proto.dispatch(prepared);
   const verdict = await proto.verify(prepared);
   assert.equal(verdict.classification, "PRESERVATION_UNVERIFIABLE");
-  assert.match(verdict.details.join(" "), /resource_version advanced/);
+  assert.match(verdict.details.join(" "), /CEILING \(G17-R2\)/);
+  assert.ok(mock.peekItems().some((i) => i.item_price_id === G17_ADDON_SEATS && i.quantity === 21), "the dispatch overwrote the interleaved quantity 5 with the authorized 21 — and no T4 evidence can distinguish this history from 53.2's clean run");
 });
 
 test("Test 53.21 (G-17 scenario 3b): an unrelated item is removed between T2 and T3 -> PRESERVATION_VIOLATED (a missing item cannot be attributed away)", async () => {
@@ -288,14 +323,15 @@ test("Test 53.21 (G-17 scenario 3b): an unrelated item is removed between T2 and
   assert.match(verdict.details.join(" "), /g17-addon-support is missing/);
 });
 
-test("Test 53.22 (G-17 scenario 4a): a mandatory addon attached between T2 and T3 survives the additive dispatch (PRESERVED_WITH_CONCURRENT_CHANGE)", async () => {
+test("Test 53.22 (G-17 scenario 4a): a mandatory addon attached between T2 and T3 survives the additive dispatch (ITEM_PRESERVED_WITH_CONCURRENT_CHANGE)", async () => {
   const { mock, proto } = setup();
-  const { prepared } = await staged(proto, SEATS_TO_21);
+  const { prepared } = await staged(proto, ADD_STORAGE);
   mock.externalAddItem(G17_ADDON_MANDATORY, 1, { mandatory: true });
   await proto.dispatch(prepared);
   const verdict = await proto.verify(prepared);
-  assert.equal(verdict.classification, "PRESERVED_WITH_CONCURRENT_CHANGE");
+  assert.equal(verdict.classification, "ITEM_PRESERVED_WITH_CONCURRENT_CHANGE");
   assert.ok(mock.peekItems().some((i) => i.item_price_id === G17_ADDON_MANDATORY));
+  assert.ok(mock.peekItems().some((i) => i.item_price_id === G17_ADDON_STORAGE && i.quantity === 3));
 });
 
 test("Test 53.23 (G-17 scenario 4b): a mandatory addon present at T2 disappears by T4 -> PRESERVATION_VIOLATED", async () => {
@@ -308,15 +344,22 @@ test("Test 53.23 (G-17 scenario 4b): a mandatory addon present at T2 disappears 
   assert.equal(verdict.classification, "PRESERVATION_VIOLATED");
 });
 
-test("Test 53.24 (G-17 scenario 5b): a scheduled change created between T2 and T3 is DELETED by the dispatch (documented D4) — item preservation is not schedule preservation", async () => {
+test("Test 53.24 (G-17 scenario 5b, NEGATIVE test per G17-R3): a scheduled change created between T2 and T3 at the SAME timestamp is DELETED by the dispatch (documented D4) and leaves T4 IDENTICAL to the no-schedule baseline — the item verdict cannot see it and must not claim to", async () => {
   const { mock, proto } = setup();
-  const { prepared } = await staged(proto, SEATS_TO_21);
+  const { prepared } = await staged(proto, ADD_STORAGE);
+  // No clock advance anywhere in this test: the schedule's creation,
+  // the dispatch, and the T4 read all share one millisecond
+  // timestamp, so not even the version distinguishes this history
+  // from a world where the schedule never existed.
   mock.externalScheduleChange();
+  assert.equal(mock.peekHasScheduledChanges(), true);
   await proto.dispatch(prepared);
   assert.equal(mock.peekHasScheduledChanges(), false, "the update deleted the concurrently created scheduled change, exactly as the vendor docs describe for Ramps-disabled sites");
   const verdict = await proto.verify(prepared);
-  assert.notEqual(verdict.classification, "PRESERVED_VERIFIED", "a dispatch that destroyed a concurrent schedule must never report a clean preservation verdict");
-  assert.equal(verdict.classification, "PRESERVATION_UNVERIFIABLE");
+  assert.equal(verdict.classification, "ITEM_PRESERVED_OBSERVED", "the ITEM subset is genuinely as authorized — the failure is in what the verdict cannot cover, not in the items");
+  assert.equal(verdict.scope, "MOCK_VISIBLE_ITEM_SUBSET_ONLY");
+  assert.match(verdict.details.join(" "), /scheduled-change HISTORY is unverifiable/, "the verdict itself declares the destroyed schedule outside its evidence");
+  assert.ok(verdict.unobservableDimensions.some((d) => d.includes("scheduled-change history")), "the unverifiable schedule dimension travels with the verdict (G17-R3)");
 });
 
 test("Test 53.25 (G-17 scenario 6b): plan/cadence changes between T2 and T3 -> PRESERVATION_VIOLATED at T4", async () => {
@@ -380,4 +423,75 @@ test("Test 53.30 (G-17, DOCUMENTED D5): native idempotency replays the same key+
     () => client.updateForItems(G17_SUBSCRIPTION_ID, buildTargetedUpdateParams(SEATS_TO_21), "replay-key"),
     /422|duplicate_request/,
   );
+});
+
+// ------------------------------------------------------------------
+// Correction round — independent review findings G17-R1..R4.
+// ------------------------------------------------------------------
+
+test("Test 53.31 (G17-R1): ADD_ADDON is NOT an SCQ action — core/types.ts ChangeAction is exactly {CHANGE_QUANTITY, CHANGE_PLAN, CHANGE_CADENCE, CANCEL}, and verdicts carry the distinction", async () => {
+  const typesSource = readFileSync(new URL("../../src/core/types.ts", import.meta.url), "utf8");
+  assert.match(typesSource, /export type ChangeAction = "CHANGE_QUANTITY" \| "CHANGE_PLAN" \| "CHANGE_CADENCE" \| "CANCEL";/, "the SCQ action schema is pinned from source, not from memory");
+  assert.ok(!typesSource.includes("ADD_ADDON"), "no ADD_ADDON exists anywhere in the core types — the prototype's positive class is provider capability only");
+  assert.deepEqual([...SCQ_CHANGE_ACTIONS], ["CHANGE_QUANTITY", "CHANGE_PLAN", "CHANGE_CADENCE", "CANCEL"]);
+  const { proto } = setup();
+  const addVerdict = await proto.execute(ADD_STORAGE, await proto.readSnapshot(), KEY);
+  assert.equal(addVerdict.inScqActionSchema, false);
+  const cqVerdict = await proto.execute(SEATS_TO_21, await proto.readSnapshot(), KEY);
+  assert.equal(cqVerdict.inScqActionSchema, true);
+});
+
+test("Test 53.32 (G17-R2): timestamp delta MAGNITUDE carries no evidence — a same-item interleaving 1ms later and one 24h later classify identically", async () => {
+  const classifications: string[] = [];
+  for (const delta of [1, 86_400_000]) {
+    const { mock, proto } = setup();
+    const { prepared } = await staged(proto, SEATS_TO_21);
+    mock.advanceTime(delta);
+    mock.externalSetQuantity(G17_ADDON_SEATS, 5);
+    await proto.dispatch(prepared);
+    const verdict = await proto.verify(prepared);
+    classifications.push(verdict.classification);
+    assert.match(verdict.details.join(" "), /counts no changes and attributes none/, "the verdict states the timestamp limit instead of reasoning from the delta");
+  }
+  assert.deepEqual(classifications, ["PRESERVATION_UNVERIFIABLE", "PRESERVATION_UNVERIFIABLE"], "a larger timestamp delta is not stronger evidence of anything");
+});
+
+test("Test 53.33 (G17-R2): same-millisecond collision — interleaved change + dispatch at ONE timestamp leave resource_version unchanged, and the verdict still cannot verify", async () => {
+  const { mock, proto } = setup();
+  const { prepared } = await staged(proto, SEATS_TO_21);
+  const versionAtT2 = mock.currentResourceVersion;
+  mock.externalSetQuantity(G17_ADDON_SEATS, 5); // same mock millisecond
+  await proto.dispatch(prepared); // same mock millisecond
+  assert.equal(mock.currentResourceVersion, versionAtT2, "two state changes occurred and the timestamp version did not move — a timestamp is not a counter");
+  const verdict = await proto.verify(prepared);
+  assert.equal(verdict.classification, "PRESERVATION_UNVERIFIABLE");
+});
+
+test("Test 53.34 (G17-R2/R3): an add-then-remove history inside the window leaves the final item set EXACTLY equal to T2+delta — the verdict observes the item subset and explicitly does not exclude the invisible history", async () => {
+  const { mock, proto } = setup();
+  const { prepared } = await staged(proto, ADD_STORAGE);
+  mock.externalAddItem(G17_ADDON_EXTERNAL, 1);
+  mock.externalRemoveItem(G17_ADDON_EXTERNAL);
+  await proto.dispatch(prepared);
+  const verdict = await proto.verify(prepared);
+  assert.equal(verdict.classification, "ITEM_PRESERVED_OBSERVED");
+  assert.equal(verdict.interleavingExcluded, false);
+  assert.match(verdict.details.join(" "), /interleaving is NOT excluded/);
+});
+
+test("Test 53.35 (G17-R4 COUNTEREXAMPLE): the update silently drops a coupon as a collateral effect — the item verdict is unchanged, because coupons were never inside its scope", async () => {
+  const { mock, proto } = setup({ collateralDropCouponId: G17_COUPON_WELCOME });
+  assert.deepEqual(mock.peekCoupons(), [G17_COUPON_WELCOME]);
+  const verdict = await proto.execute(ADD_STORAGE, await proto.readSnapshot(), KEY);
+  assert.deepEqual(mock.peekCoupons(), [], "the coupon is GONE — a real preservation-relevant effect outside the item list");
+  assert.equal(verdict.classification, "ITEM_PRESERVED_OBSERVED", "and the item verdict still reports the item subset as observed — which is exactly why it may never be read as a general preservation claim");
+  assert.ok(verdict.unobservableDimensions.some((d) => d.includes("coupons")), "the verdict carries coupons as an uncertified dimension");
+});
+
+test("Test 53.36 (G17-R4): the unobservable-dimensions list names every dimension the review required — coupons, billing timing, mandatory-addon associations, contract terms, financial effects, schedule history", () => {
+  const joined = G17_UNOBSERVABLE_DIMENSIONS.join(" | ");
+  for (const needle of ["coupons", "billing timing", "mandatory-addon associations", "contractual terms", "credits, unbilled charges", "scheduled-change history"]) {
+    assert.ok(joined.includes(needle), `unobservable dimensions must name: ${needle}`);
+  }
+  assert.ok(G17_UNOBSERVABLE_DIMENSIONS.length >= 6);
 });

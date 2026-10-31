@@ -28,11 +28,26 @@
 //        D5. Native idempotency: same key + same parameters replays
 //            the original response inside the window; same key +
 //            different parameters is HTTP 422.
-//        D6. `resource_version` is a millisecond timestamp bumped on
-//            every change; it is response-side only. This mock does
-//            NOT accept it (or any other field) as a write
-//            precondition, because no documented write parameter
-//            carries an expected version.
+//        D6. `resource_version` is a millisecond TIMESTAMP of the
+//            most recent change (per the subscription-object docs:
+//            "updated with a new timestamp in milliseconds for every
+//            change made to the resource"); it is response-side
+//            only. This mock does NOT accept it (or any other field)
+//            as a write precondition, because no documented write
+//            parameter carries an expected version.
+//            CORRECTED in the G17-R2 review round: the first version
+//            of this mock advanced the version by a fixed +1000 per
+//            change, which made it behave like a change COUNTER.
+//            A real timestamp is not a counter: the delta between
+//            two versions measures ELAPSED TIME, not the number of
+//            changes; several changes inside one millisecond leave
+//            the version unchanged (collision), and one change long
+//            after another produces a huge delta. The mock now
+//            models exactly that, via a controllable clock
+//            (setTime/advanceTime): every mutation stamps the
+//            version with the current mock time, so tests can
+//            produce varying increments and same-millisecond
+//            collisions. No verdict may count changes from it.
 //
 //  (A) ASSUMED rules — the documentation does NOT establish these.
 //      They are parameters of this mock precisely so tests can show
@@ -69,6 +84,8 @@ export type G17MockOptions = {
   multiPlanEnabled?: boolean;
   /** After applying the target, silently drop this unrelated item (partial application). */
   partialApplyDropItemId?: string;
+  /** Provider-side COLLATERAL effect: applying the update silently removes this coupon. The item list is unaffected — this exists to prove the prototype's verdict does not cover coupon/discount state (G17-R4 counterexample). */
+  collateralDropCouponId?: string;
   /** Return a success-shaped 200 but do not apply the target item at all. */
   ignoreTarget?: boolean;
   /** Apply the update, record idempotency, then throw (lost response). */
@@ -103,6 +120,7 @@ export const G17_ADDON_SUPPORT = "g17-addon-support";
 export const G17_ADDON_STORAGE = "g17-addon-storage";
 export const G17_ADDON_MANDATORY = "g17-addon-mandatory";
 export const G17_ADDON_EXTERNAL = "g17-addon-external";
+export const G17_COUPON_WELCOME = "g17-coupon-welcome10";
 
 const CATALOG: Record<string, { price: number; pricing_model: string; item_type: string; period?: string }> = {
   [G17_PLAN_MONTHLY]: { price: 49900, pricing_model: "flat_fee", item_type: "plan", period: "month" },
@@ -121,7 +139,10 @@ function amountFor(itemPriceId: string, quantity: number, unitPrice: number): nu
 
 export class G17MockChargebee {
   calls: G17Call[] = [];
+  /** Mock wall clock (ms). `resource_version` is stamped from it (D6). */
+  private nowMs = 1700000000000;
   private resourceVersion = 1700000000000;
+  private coupons: string[] = [G17_COUPON_WELCOME];
   private items: G17Item[] = [
     { item_price_id: G17_PLAN_MONTHLY, item_type: "plan", quantity: 1, unit_price: 49900, amount: 49900 },
     // Subscription-level unit_price override (catalog 1200, charged 1000).
@@ -139,6 +160,14 @@ export class G17MockChargebee {
   get mutationCount(): number { return this.calls.filter((c) => c.mutating).length; }
   get currentResourceVersion(): number { return this.resourceVersion; }
 
+  /** Test clock controls (D6): set or advance the mock wall clock.
+   * Mutations stamp `resource_version` with the CURRENT time, so
+   * changes made without advancing the clock collide at the same
+   * timestamp — exactly as real same-millisecond changes do. */
+  setTime(ms: number): void { this.nowMs = ms; }
+  advanceTime(deltaMs: number): void { this.nowMs += deltaMs; }
+  private touch(): void { this.resourceVersion = this.nowMs; }
+
   // ---- Test-facing external-actor surface (NOT part of the wire API).
   // Each helper models an independent actor changing provider state
   // between the prototype's stages and bumps resource_version (D6),
@@ -149,7 +178,7 @@ export class G17MockChargebee {
     const unitPrice = meta?.price ?? 0;
     this.items.push({ item_price_id: itemPriceId, item_type: meta?.item_type ?? "addon", quantity, unit_price: unitPrice, amount: amountFor(itemPriceId, quantity, unitPrice) });
     if (opts.mandatory) this.mandatoryItemIds.add(itemPriceId);
-    this.resourceVersion += 1000;
+    this.touch();
   }
 
   externalSetQuantity(itemPriceId: string, quantity: number): void {
@@ -157,13 +186,13 @@ export class G17MockChargebee {
     if (!it) throw new Error(`externalSetQuantity: ${itemPriceId} not present`);
     it.quantity = quantity;
     it.amount = amountFor(itemPriceId, quantity, it.unit_price);
-    this.resourceVersion += 1000;
+    this.touch();
   }
 
   externalRemoveItem(itemPriceId: string): void {
     this.items = this.items.filter((i) => i.item_price_id !== itemPriceId);
     this.mandatoryItemIds.delete(itemPriceId);
-    this.resourceVersion += 1000;
+    this.touch();
   }
 
   externalChangePlan(newPlanItemPriceId: string, currencyCode?: string): void {
@@ -172,17 +201,25 @@ export class G17MockChargebee {
     this.items = this.items.filter((i) => i.item_type !== "plan");
     this.items.unshift({ item_price_id: newPlanItemPriceId, item_type: "plan", quantity: 1, unit_price: meta.price, amount: meta.price });
     if (currencyCode) this.currencyCode = currencyCode;
-    this.resourceVersion += 1000;
+    this.touch();
   }
 
-  externalScheduleChange(): void { this.hasScheduledChanges = true; this.resourceVersion += 1000; }
-  externalCancelScheduledChange(): void { this.hasScheduledChanges = false; this.resourceVersion += 1000; }
+  externalScheduleChange(): void { this.hasScheduledChanges = true; this.touch(); }
+  externalCancelScheduledChange(): void { this.hasScheduledChanges = false; this.touch(); }
+
+  /** External actor removes a coupon. The prototype executor never
+   * reads coupon state — that blindness is the G17-R4 point. */
+  externalRemoveCoupon(couponId: string): void {
+    this.coupons = this.coupons.filter((c) => c !== couponId);
+    this.touch();
+  }
 
   /** Direct state read for test assertions (bypasses the wire log). */
   peekItems(): Array<{ item_price_id: string; quantity: number }> {
     return this.items.map((i) => ({ item_price_id: i.item_price_id, quantity: i.quantity }));
   }
   peekHasScheduledChanges(): boolean { return this.hasScheduledChanges; }
+  peekCoupons(): string[] { return [...this.coupons]; }
 
   private subscriptionJson(): any {
     return {
@@ -195,6 +232,7 @@ export class G17MockChargebee {
         current_term_end: 1702592000,
         next_billing_at: 1702592000,
         has_scheduled_changes: this.hasScheduledChanges,
+        coupon_ids: [...this.coupons],
         has_scheduled_advance_invoices: false,
         subscription_items: this.items.map((i) => ({ ...i })),
       },
@@ -292,7 +330,14 @@ export class G17MockChargebee {
       this.items = this.items.filter((i) => i.item_price_id !== this.options.partialApplyDropItemId);
     }
 
-    this.resourceVersion += 1000;
+    // G17-R4 collateral fault: the update itself silently removes a
+    // coupon. Item state is untouched; only a verdict scoped to the
+    // item subset can (and must) remain silent about this.
+    if (this.options.collateralDropCouponId) {
+      this.coupons = this.coupons.filter((c) => c !== this.options.collateralDropCouponId);
+    }
+
+    this.touch();
 
     // ASSUMED rule A2: full-remaining-period delta pricing for
     // per-unit quantity changes, for response shape only.

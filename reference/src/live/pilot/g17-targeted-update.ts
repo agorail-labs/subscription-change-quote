@@ -15,7 +15,7 @@
 // Candidate mechanism under test: a MINIMAL additive dispatch —
 // `update_for_items` with `replace_items_list=false` and ONLY the
 // authorized target item in `subscription_items` — for exactly two
-// operation classes:
+// PROVIDER operation classes:
 //   - ADD_ADDON of a new item price (provider-documented additive
 //     behavior), and
 //   - CHANGE_QUANTITY of an existing per-unit item to an absolute
@@ -26,6 +26,20 @@
 // CHANGE_CADENCE, CANCEL) is UNSUPPORTED by this prototype and fails
 // closed before any transport call, each for a documented reason
 // recorded in buildTargetedUpdateParams.
+//
+// SCOPE CORRECTION (G17-R1, independent review of PR #38): the
+// operation labels above are PROVIDER operation classes, not SCQ
+// actions. The SCQ action schema (core/types.ts `ChangeAction`)
+// contains exactly CHANGE_QUANTITY, CHANGE_PLAN, CHANGE_CADENCE and
+// CANCEL — there is NO ADD_ADDON (or REMOVE_ADDON) SCQ action. The
+// positive ADD_ADDON result therefore demonstrates a provider
+// capability only; it is not currently a path by which any SCQ
+// proposal can execute, and making it one would require separately
+// approved normative / schema / capability / adapter / conformance
+// work. Every verdict carries `inScqActionSchema` so this cannot be
+// misread downstream. Among the actions SCQ does have,
+// CHANGE_QUANTITY remains unproven (ASSUMED A1 + the G17-R2
+// evidence ceiling below).
 //
 // Execution protocol (T0/T2/T3/T4, mirroring Issue #30's threat
 // matrix):
@@ -48,14 +62,43 @@
 //       docs warn list APIs are eventually consistent). The verdict
 //       compares T4 against T2 + the authorized delta — never
 //       against the target set alone (the Issue #22 Finding 1
-//       lesson) — and uses the resource_version delta as evidence:
-//       exactly one provider change is attributable to this
-//       dispatch; a larger delta means interleaved activity whose
-//       effect on the target cannot be excluded
-//       (PRESERVATION_UNVERIFIABLE), while interleaved activity that
-//       is still fully visible and intact at T4 is reported as
-//       PRESERVED_WITH_CONCURRENT_CHANGE rather than silently
-//       absorbed into a clean verdict.
+//       lesson).
+//
+// EVIDENCE CORRECTIONS (G17-R2/R3/R4, independent review of
+// PR #38 — these supersede the first version's T4 treatment):
+//   R2. `resource_version` is a millisecond TIMESTAMP, not a change
+//       counter and not a causal token. A timestamp delta measures
+//       elapsed time: it cannot count changes (same-millisecond
+//       changes collide at one version), cannot attribute them, and
+//       its magnitude carries no evidentiary weight. The first
+//       version of this prototype classified on a synthetic +1000
+//       mock step; that inference is REMOVED. The version is now
+//       recorded only as changed/unchanged colour in the details.
+//       Consequence: for CHANGE_QUANTITY, whose target item already
+//       exists, an interleaved same-item change overwritten by this
+//       dispatch is observationally indistinguishable from a clean
+//       run — so the verdict ceiling for that class is
+//       PRESERVATION_UNVERIFIABLE absent independent
+//       operation-bound proof, even when the target state is
+//       observed in effect.
+//   R3. The scheduled-change dimension is NOT verifiable from a
+//       Boolean flag: a schedule created after T2 and deleted by
+//       the T3 dispatch leaves T4's flag identical to the
+//       no-schedule baseline. ADD_ADDON is therefore NOT
+//       authorization-preserving under all authorized-state
+//       dimensions merely because its item list is additive; the
+//       schedule-history dimension is declared unverifiable in
+//       every post-dispatch verdict.
+//   R4. The verdict inspects ONLY a mock-visible subset: item IDs,
+//       quantities, unit prices, currency, status, plan identity,
+//       and the scheduling flag. It does NOT establish preservation
+//       of discounts/coupons, billing timing, mandatory-addon
+//       associations, contractual terms, or provider-side financial
+//       effects (see G17_UNOBSERVABLE_DIMENSIONS). The positive
+//       classifications are named ITEM_PRESERVED_* and every
+//       verdict carries scope "MOCK_VISIBLE_ITEM_SUBSET_ONLY" and
+//       interleavingExcluded: false. No verdict here is, or may be
+//       translated into, a general SCQ verified-receipt claim.
 //
 // Every verdict produced against the G-17 mock is SIMULATED
 // evidence. No verdict in this module is a live-provider claim.
@@ -93,11 +136,39 @@ export type G17Classification =
   | "REFUSED_SCHEDULED_CHANGE_AT_RISK"
   | "DISPATCH_REJECTED"
   | "INDETERMINATE"
-  | "PRESERVED_VERIFIED"
-  | "PRESERVED_WITH_CONCURRENT_CHANGE"
+  | "ITEM_PRESERVED_OBSERVED"
+  | "ITEM_PRESERVED_WITH_CONCURRENT_CHANGE"
   | "PRESERVATION_UNVERIFIABLE"
   | "PRESERVATION_VIOLATED"
   | "TARGET_NOT_ESTABLISHED";
+
+/**
+ * The SCQ action schema, mirrored from core/types.ts `ChangeAction`
+ * (pinned against the source by test 53.31). ADD_ADDON and
+ * REMOVE_ADDON are provider operation classes with NO counterpart
+ * here (G17-R1).
+ */
+export const SCQ_CHANGE_ACTIONS = ["CHANGE_QUANTITY", "CHANGE_PLAN", "CHANGE_CADENCE", "CANCEL"] as const;
+
+export function isScqChangeAction(kind: G17Operation["kind"]): boolean {
+  return (SCQ_CHANGE_ACTIONS as readonly string[]).includes(kind);
+}
+
+/**
+ * Authorized-state dimensions this prototype's T4 comparison does
+ * NOT observe and therefore never certifies (G17-R3/R4). Carried on
+ * every post-dispatch verdict so the scope limit travels with the
+ * result instead of living only in prose.
+ */
+export const G17_UNOBSERVABLE_DIMENSIONS = [
+  "discounts and coupons (applied, removed, or repriced)",
+  "billing timing (next_billing_at, term boundaries, proration timing)",
+  "mandatory-addon associations beyond item presence",
+  "contractual terms and contract-term state",
+  "credits, unbilled charges and invoice effects beyond the response shape",
+  "payment method, metadata and other subscription attributes",
+  "scheduled-change history (a schedule created and deleted inside the window leaves the T4 flag identical to baseline)",
+] as const;
 
 export type G17Verdict = {
   classification: G17Classification;
@@ -108,7 +179,29 @@ export type G17Verdict = {
   details: string[];
   /** Evidence class of this verdict. Always SIMULATED in this package. */
   evidence: "SIMULATED";
+  /** G17-R4: the ONLY state this verdict speaks for. */
+  scope: "MOCK_VISIBLE_ITEM_SUBSET_ONLY";
+  /** G17-R1: whether this operation class exists in the SCQ action schema. */
+  inScqActionSchema: boolean;
+  /** G17-R2/R3: this prototype NEVER excludes interleaved activity. Always false. */
+  interleavingExcluded: false;
+  /** G17-R3/R4: dimensions never certified by any verdict here. */
+  unobservableDimensions: readonly string[];
 };
+
+function mkVerdict(classification: G17Classification, operation: G17Operation["kind"], dispatched: boolean, details: string[]): G17Verdict {
+  return {
+    classification,
+    operation,
+    dispatched,
+    details,
+    evidence: "SIMULATED",
+    scope: "MOCK_VISIBLE_ITEM_SUBSET_ONLY",
+    inScqActionSchema: isScqChangeAction(operation),
+    interleavingExcluded: false,
+    unobservableDimensions: G17_UNOBSERVABLE_DIMENSIONS,
+  };
+}
 
 export type G17Prepared = {
   operation: G17Operation;
@@ -244,33 +337,37 @@ export class G17TargetedUpdatePrototype {
     }
   }
 
-  /** T4 stage: independent re-read and preservation verdict. */
+  /** T4 stage: independent re-read and preservation verdict.
+   * The verdict covers ONLY the mock-visible item subset (R4);
+   * `resource_version` is reported as changed/unchanged colour and
+   * is NEVER used to count or attribute changes (R2). */
   async verify(prepared: G17Prepared): Promise<G17Verdict> {
     const { operation, t2 } = prepared;
     let t4: G17Snapshot;
     try {
       t4 = await this.readSnapshot();
     } catch (e) {
-      return { classification: "INDETERMINATE", operation: operation.kind, dispatched: true, evidence: "SIMULATED", details: [`T4 re-read failed (${e instanceof Error ? e.message : String(e)}); the committed state is unestablishable.`] };
+      return mkVerdict("INDETERMINATE", operation.kind, true, [`T4 re-read failed (${e instanceof Error ? e.message : String(e)}); the committed state is unestablishable.`]);
     }
     const details: string[] = [];
+    details.push(`resource_version ${t4.resourceVersion === t2.resourceVersion ? "is UNCHANGED" : "changed"} between T2 and T4 (${t2.resourceVersion} -> ${t4.resourceVersion}). It is a millisecond timestamp: this fact counts no changes and attributes none (G17-R2).`);
     const targetId = operation.kind === "CANCEL" ? undefined : operation.itemPriceId;
 
     // Target establishment.
     const t4Target = t4.items.filter((i) => i.itemPriceId === targetId);
     if (t4Target.length === 0) {
-      return { classification: "TARGET_NOT_ESTABLISHED", operation: operation.kind, dispatched: true, evidence: "SIMULATED", details: [`target item ${targetId} is absent at T4; the dispatch did not establish the authorized change.`] };
+      return mkVerdict("TARGET_NOT_ESTABLISHED", operation.kind, true, [...details, `target item ${targetId} is absent at T4; the dispatch did not establish the authorized change.`]);
     }
     if (t4Target.length > 1) {
-      return { classification: "PRESERVATION_VIOLATED", operation: operation.kind, dispatched: true, evidence: "SIMULATED", details: [`target item ${targetId} appears ${t4Target.length} times at T4: additive dispatch duplicated the item instead of updating it in place. The authorized absolute quantity was not the effect.`] };
+      return mkVerdict("PRESERVATION_VIOLATED", operation.kind, true, [...details, `target item ${targetId} appears ${t4Target.length} times at T4: additive dispatch duplicated the item instead of updating it in place. The authorized absolute quantity was not the effect.`]);
     }
     if ((operation.kind === "ADD_ADDON" || operation.kind === "CHANGE_QUANTITY") && t4Target[0].quantity !== operation.quantity) {
       if (operation.kind === "CHANGE_QUANTITY" && t4Target[0].quantity === t2.items.find((i) => i.itemPriceId === targetId)?.quantity) {
-        return { classification: "TARGET_NOT_ESTABLISHED", operation: operation.kind, dispatched: true, evidence: "SIMULATED", details: [`target item ${targetId} still has its T2 quantity ${t4Target[0].quantity} at T4 despite a success response: the dispatch was silently not applied.`] };
+        return mkVerdict("TARGET_NOT_ESTABLISHED", operation.kind, true, [...details, `target item ${targetId} still has its T2 quantity ${t4Target[0].quantity} at T4 despite a success response: the dispatch was silently not applied.`]);
       }
       const summed = operation.kind === "CHANGE_QUANTITY" ? (t2.items.find((i) => i.itemPriceId === targetId)?.quantity ?? 0) + operation.quantity : undefined;
       details.push(`target quantity at T4 is ${t4Target[0].quantity}, not the authorized absolute quantity ${operation.quantity}${summed !== undefined && t4Target[0].quantity === summed ? " — it equals T2 quantity + requested quantity, i.e. the provider SUMMED rather than set (ASSUMED rule A1 alternative)" : ""}.`);
-      return { classification: "PRESERVATION_VIOLATED", operation: operation.kind, dispatched: true, evidence: "SIMULATED", details };
+      return mkVerdict("PRESERVATION_VIOLATED", operation.kind, true, details);
     }
 
     // Unrelated-state preservation: every non-target T2 item must be
@@ -289,36 +386,39 @@ export class G17TargetedUpdatePrototype {
     const t4Plan = t4.items.find((i) => i.itemType === "plan")?.itemPriceId;
     if (t2Plan !== t4Plan) violations.push(`plan changed (${t2Plan} -> ${t4Plan})`);
     if (violations.length > 0) {
-      return { classification: "PRESERVATION_VIOLATED", operation: operation.kind, dispatched: true, evidence: "SIMULATED", details: violations };
+      return mkVerdict("PRESERVATION_VIOLATED", operation.kind, true, [...details, ...violations]);
     }
 
     // Concurrent additions that survived intact: visible at T4,
-    // not in T2, not the target. Their survival is the preservation
+    // not in T2, not the target. Their survival is the item-list
     // WIN over full replacement — reported, not absorbed.
     const extras = t4.items.filter((i) => i.itemPriceId !== targetId && !t2.items.some((b) => b.itemPriceId === i.itemPriceId));
-    const rvDelta = t4.resourceVersion - t2.resourceVersion;
+
+    // G17-R2 ceiling: for CHANGE_QUANTITY the target item already
+    // existed, so an interleaved same-item change overwritten by
+    // this dispatch is observationally indistinguishable from a
+    // clean run under timestamp-only evidence. The target state
+    // being observed in effect does NOT lift the ceiling: absent
+    // independent operation-bound proof, this class is UNVERIFIABLE
+    // even on its happiest path.
+    if (operation.kind === "CHANGE_QUANTITY") {
+      details.push(`target item ${targetId} is observed at T4 with the authorized quantity ${operation.quantity} and no unrelated item in the visible subset is contradicted. CEILING (G17-R2): an interleaved change to the SAME item inside the T2->T4 window, overwritten by this dispatch, would leave exactly this T4 state; timestamp evidence cannot exclude it and there is no provider-enforced before/after causal token for this mutation. Verdict is therefore capped at PRESERVATION_UNVERIFIABLE.`);
+      if (extras.length > 0) details.push(`concurrent item(s) intact at T4: ${extras.map((i) => `${i.itemPriceId} x${i.quantity}`).join(", ")} — observed, but they do not lift the same-item ceiling.`);
+      return mkVerdict("PRESERVATION_UNVERIFIABLE", operation.kind, true, details);
+    }
+
     if (extras.length > 0) {
       details.push(`concurrent item(s) added by another actor are intact at T4: ${extras.map((i) => `${i.itemPriceId} x${i.quantity}`).join(", ")}. Under the current adapter's full replacement they would have been deleted.`);
-      if (t4.hasScheduledChanges !== t2.hasScheduledChanges) details.push("scheduled-change flag also changed concurrently (false -> true); the concurrent schedule itself was not deleted by this dispatch.");
-      return { classification: "PRESERVED_WITH_CONCURRENT_CHANGE", operation: operation.kind, dispatched: true, evidence: "SIMULATED", details };
+      if (t4.hasScheduledChanges !== t2.hasScheduledChanges) details.push("scheduled-change flag also changed concurrently (false -> true); that schedule's own history is outside the verified subset.");
+      details.push("Scope: ITEM subset only. Interleaved histories that leave no net item trace (add-then-remove, schedule created-then-deleted) are NOT excluded by this verdict (G17-R2/R3).");
+      return mkVerdict("ITEM_PRESERVED_WITH_CONCURRENT_CHANGE", operation.kind, true, details);
     }
     if (t4.hasScheduledChanges !== t2.hasScheduledChanges) {
-      details.push(`scheduled-change flag changed (${t2.hasScheduledChanges} -> ${t4.hasScheduledChanges}) with no item evidence; the schedule state the authorization relied on no longer holds.`);
-      return { classification: "PRESERVATION_UNVERIFIABLE", operation: operation.kind, dispatched: true, evidence: "SIMULATED", details };
+      details.push(`scheduled-change flag changed (${t2.hasScheduledChanges} -> ${t4.hasScheduledChanges}) with no item evidence; the schedule state the authorization relied on no longer holds, and schedule history is not reconstructible from the flag.`);
+      return mkVerdict("PRESERVATION_UNVERIFIABLE", operation.kind, true, details);
     }
-    if (rvDelta !== 1000) {
-      // The mock bumps resource_version by exactly 1000 per change
-      // (D6 model). Anything else means interleaved activity that
-      // left no net item trace — e.g. a same-item change that this
-      // dispatch then overwrote. In live terms the exact step is a
-      // mock artifact; the transferable claim is only that a
-      // version delta beyond the dispatch's own change is positive
-      // evidence of unobserved interleaved activity.
-      details.push(`resource_version advanced by ${rvDelta} (mock units), more than this dispatch alone explains: interleaved activity occurred in the T2->T4 window and left no net item trace. Whether it touched the target item cannot be excluded — under the mock's set semantics a same-item interleaved change WAS overwritten by this dispatch.`);
-      return { classification: "PRESERVATION_UNVERIFIABLE", operation: operation.kind, dispatched: true, evidence: "SIMULATED", details };
-    }
-    details.push("T4 equals T2 + exactly the authorized delta; resource_version advanced by exactly the dispatch's own step; no scheduled changes existed at T2 and none were affected.");
-    return { classification: "PRESERVED_VERIFIED", operation: operation.kind, dispatched: true, evidence: "SIMULATED", details };
+    details.push("T4's visible item subset equals T2 + exactly the authorized delta, and no concurrent item change is visible. Scope limits (G17-R2/R3/R4): this is an ITEM-subset observation only — interleaving is NOT excluded (an add-then-remove or a same-millisecond change leaves this exact trace), scheduled-change HISTORY is unverifiable (a schedule created after T2 and deleted by this dispatch leaves the T4 flag identical to baseline), and the unobservable dimensions carried on this verdict are not certified.");
+    return mkVerdict("ITEM_PRESERVED_OBSERVED", operation.kind, true, details);
   }
 
   /** Full T0->T4 run. Refusals return verdicts; they never throw. */
@@ -327,12 +427,12 @@ export class G17TargetedUpdatePrototype {
     try {
       prepared = await this.prepare(operation, t0, idempotencyKey);
     } catch (e) {
-      if (e instanceof G17Refusal) return { classification: e.classification, operation: operation.kind, dispatched: false, evidence: "SIMULATED", details: [e.message] };
+      if (e instanceof G17Refusal) return mkVerdict(e.classification, operation.kind, false, [e.message]);
       throw e;
     }
     const outcome = await this.dispatch(prepared);
     if (!outcome.ok) {
-      return { classification: outcome.classification ?? "INDETERMINATE", operation: operation.kind, dispatched: true, evidence: "SIMULATED", details: outcome.details };
+      return mkVerdict(outcome.classification ?? "INDETERMINATE", operation.kind, true, outcome.details);
     }
     return this.verify(prepared);
   }
