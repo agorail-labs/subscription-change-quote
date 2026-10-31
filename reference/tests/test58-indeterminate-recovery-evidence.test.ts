@@ -469,6 +469,10 @@ test("Test 58.9: a second terminal resolution for the same attempt refuses; exac
   rig.tick(60_000);
 
   resolveValid(rig, attemptId, "CONFIRMED_NON_EXECUTION", { reference: "oplog-ref-first" });
+  // The resolution bumped the attempt's updatedAt to the resolution
+  // instant; a second establishment must observe after it (R3) so
+  // the refusal under test is resolveAttempt's own ALREADY_RESOLVED.
+  rig.tick(60_000);
   const second = establish(rig, attemptId, "CONFIRMED_NON_EXECUTION", { reference: "oplog-ref-second" });
   assert.throws(
     () => resolve(rig.store, attemptId, resolveInput("CONFIRMED_NON_EXECUTION", second)),
@@ -676,6 +680,7 @@ test("Test 58.13: CONFIRMED_LANDING alone unblocks nothing; the reconciliation b
   );
   // A fresh quote, created after the landing AND bound to the landed
   // state version, is the permitted positive case.
+  rig.tick(1_000); // a quote issued AT the resolution instant is stale by the <= rule; the fresh quote is issued after it
   rig.store.put({ ...makeStoredQuote("q3", "sub_1"), created_at: rig.nowIso(), subscription_version_at_quote: "v2" });
   const fresh = rig.store.beginDispatch(INTENT("q3", "sub_1", "key-5"));
   assert.equal(fresh.state, "DISPATCHING", "a fresh quote validated against the landed state may dispatch");
