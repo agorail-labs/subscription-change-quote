@@ -35,7 +35,7 @@ quote's `proration_date` replayed, then figures := quoted
 (`defined_equal_exact`), reconciliation := self-comparison, outcome
 `COMMITTED_AND_VERIFIED` unconditionally, snapshot from the return value.
 
-**Reachability boundary (pinned executably, test60.13).** This arm is **not
+**Reachability boundary (pinned executably, test61.13).** This arm is **not
 reachable from adapter-minted quotes today**: Stripe's advertised coverage
 for non-CANCEL actions carries `termEffect: "UNKNOWN"`, so
 `enforceGuaranteeRequest` refuses an overall-EXACT update quote at creation
@@ -44,7 +44,7 @@ reason. The live defect surface is therefore CANCEL; the update arm is a
 defensive path (shared branch, proration-replay machinery) that must still
 not be an unverified path if a stored EXACT record ever reaches it — the
 counterexamples exercise it through a store-seeded EXACT record built from a
-genuine adapter-minted quote (see test60's helper; only the commit path is
+genuine adapter-minted quote (see test61's helper; only the commit path is
 under test, no verification is bypassed by the seeding).
 
 ### 1c. REVALIDATE arm (contrast — the correct discipline, already present)
@@ -99,7 +99,7 @@ diverged).
 - `_debugLoseNextCancelResponse` — cancel-side symmetry for the existing
   `_debugLoseNextUpdateResponse` (lands, then `api_connection_error`).
 
-## 3. Failing-first results (test60 vs the baseline adapter)
+## 3. Failing-first results (test61 vs the baseline adapter)
 
 14 tests: **7 pass / 7 fail** on the unmodified adapter (full output in the
 delivery record). Exact baseline classifications:
@@ -189,9 +189,9 @@ arm's `establishCommittedEffect`):
 ## 6. Validation (Phase 4)
 
 - Full suite: **843/843 on Node v22.14.0** and **843/843 on Node
-  v20.19.5** (baseline 829 + test60's 14; better-sqlite3 rebuilt per Node
+  v20.19.5** (baseline 829 + test61's 14; better-sqlite3 rebuilt per Node
   version; Node 22 binding restored last, suite re-run 843/843).
-- test60: **14/14**. Existing Stripe regressions (test17 incl. 17.12,
+- test61: **14/14**. Existing Stripe regressions (test17 incl. 17.12,
   test4, test12, test35, test49, test54) all pass unmodified.
 - Receipt replay / idempotency: pinned by 60.6 (UNVERIFIED receipt replays
   verbatim, no re-dispatch against missing state) and 60.12 (VIOLATED
@@ -217,7 +217,7 @@ arm's `establishCommittedEffect`):
   the no-verifier fail-closed posture of the durable store (PR #50) is
   unaffected.
 - **The EXACT-update arm** remains unreachable from adapter-minted quotes
-  (quote-time coverage refusal, test60.13); it is verified defensively via
+  (quote-time coverage refusal, test61.13); it is verified defensively via
   a store-seeded record because the branch is shared with CANCEL.
 - G-21 stays OPEN for its other items per the gap register; this note
   resolves item 1's *implementation* question only.

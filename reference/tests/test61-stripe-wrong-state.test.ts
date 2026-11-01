@@ -59,7 +59,7 @@ const GENEROUS_ENVELOPE = {
  * API. Why not createChangeQuote: Stripe's advertised coverage
  * for non-CANCEL actions is termEffect UNKNOWN, so
  * enforceGuaranteeRequest refuses an overall EXACT request for
- * updates at quote creation (pinned executably in test 60.13) —
+ * updates at quote creation (pinned executably in test 61.13) —
  * the commit branch's EXACT arm is unreachable from adapter-minted
  * update quotes today. The branch is nevertheless shared with
  * CANCEL and carries the proration_date replay machinery, so its
@@ -95,7 +95,7 @@ function termEndCancelQuote(adapter: StripeAdapter, subId: string) {
   });
 }
 
-test("Test 60.0 (fault shape): the wrong-state fault makes the returned artifact agree with the request while persisted state diverges; one-shot", () => {
+test("Test 61.0 (fault shape): the wrong-state fault makes the returned artifact agree with the request while persisted state diverges; one-shot", () => {
   const { sim, sub } = freshStripeFixture();
   sim._debugWrongQuantityOnNextUpdate = 130;
   const { subscription } = sim.update(sub.id, [{ id: "si_1", price: "price_seat_basic", quantity: 120 }], "create_prorations");
@@ -107,7 +107,7 @@ test("Test 60.0 (fault shape): the wrong-state fault makes the returned artifact
   assert.equal(sim.retrieve(sub.id).items[0].quantity, 140, "no fault remains armed for the next mutation");
 });
 
-test("Test 60.1: EXACT quantity change landing the WRONG quantity must not verify — VIOLATED over the observed state", async () => {
+test("Test 61.1: EXACT quantity change landing the WRONG quantity must not verify — VIOLATED over the observed state", async () => {
   const { sim, sub } = freshStripeFixture();
   const store = new QuoteStore();
   const adapter = new StripeAdapter(sim, store);
@@ -122,7 +122,7 @@ test("Test 60.1: EXACT quantity change landing the WRONG quantity must not verif
   assert.equal(receipt.committedEffect.recurring?.resultingAmount, 130_000, "the recorded recurring figure is the observed (wrong) state's figure");
 });
 
-test("Test 60.2: EXACT plan change landing the WRONG price must not verify — VIOLATED", async () => {
+test("Test 61.2: EXACT plan change landing the WRONG price must not verify — VIOLATED", async () => {
   const { sim, sub } = freshStripeFixture();
   const store = new QuoteStore();
   const adapter = new StripeAdapter(sim, store);
@@ -143,7 +143,7 @@ test("Test 60.2: EXACT plan change landing the WRONG price must not verify — V
   assert.equal(receipt.resultingSnapshot.items[0].offeringRef, "plan:basic:monthly", "the snapshot reports the observed offering, not the intended one");
 });
 
-test("Test 60.3: TERM_END CANCEL landing as an IMMEDIATE cancellation must not verify — VIOLATED (premature termination)", async () => {
+test("Test 61.3: TERM_END CANCEL landing as an IMMEDIATE cancellation must not verify — VIOLATED (premature termination)", async () => {
   const { sim, sub } = freshStripeFixture();
   const adapter = new StripeAdapter(sim, new QuoteStore());
   const quote = await termEndCancelQuote(adapter, sub.id);
@@ -157,7 +157,7 @@ test("Test 60.3: TERM_END CANCEL landing as an IMMEDIATE cancellation must not v
   assert.equal(receipt.resultingSnapshot.status, "canceled", "the receipt snapshot reports the observed terminal state, not the returned artifact's scheduled shape");
 });
 
-test("Test 60.4: TERM_END CANCEL landing with the WRONG effective date must not verify — VIOLATED", async () => {
+test("Test 61.4: TERM_END CANCEL landing with the WRONG effective date must not verify — VIOLATED", async () => {
   const { sim, sub } = freshStripeFixture();
   const adapter = new StripeAdapter(sim, new QuoteStore());
   const quote = await termEndCancelQuote(adapter, sub.id);
@@ -171,7 +171,7 @@ test("Test 60.4: TERM_END CANCEL landing with the WRONG effective date must not 
   assert.equal(receipt.outcome, "COMMITTED_AND_VERIFIED");
 });
 
-test("Test 60.5: TERM_END CANCEL whose schedule never lands is COMMITTED_UNVERIFIED — absence is not a verified schedule, and not OK", async () => {
+test("Test 61.5: TERM_END CANCEL whose schedule never lands is COMMITTED_UNVERIFIED — absence is not a verified schedule, and not OK", async () => {
   const { sim, sub } = freshStripeFixture();
   const adapter = new StripeAdapter(sim, new QuoteStore());
   const quote = await termEndCancelQuote(adapter, sub.id);
@@ -184,7 +184,7 @@ test("Test 60.5: TERM_END CANCEL whose schedule never lands is COMMITTED_UNVERIF
   assert.equal(receipt.reconciliation.status, "UNVERIFIED", "an absent schedule is UNVERIFIABLE under §6.12 — never OK, and not an established contradiction either");
 });
 
-test("Test 60.6: EXACT update whose post-mutation state is MISSING is COMMITTED_UNVERIFIED with unestablished candidates", async () => {
+test("Test 61.6: EXACT update whose post-mutation state is MISSING is COMMITTED_UNVERIFIED with unestablished candidates", async () => {
   const { sim, sub } = freshStripeFixture();
   const store = new QuoteStore();
   const adapter = new StripeAdapter(sim, store);
@@ -203,7 +203,7 @@ test("Test 60.6: EXACT update whose post-mutation state is MISSING is COMMITTED_
   assert.deepEqual(replay, receipt, "the recorded receipt replays verbatim; no second dispatch is attempted against missing state");
 });
 
-test("Test 60.7: EXACT update with a LOST RESPONSE is INDETERMINATE and is never blindly retried", async () => {
+test("Test 61.7: EXACT update with a LOST RESPONSE is INDETERMINATE and is never blindly retried", async () => {
   const { sim, sub } = freshStripeFixture();
   const store = new QuoteStore();
   const adapter = new StripeAdapter(sim, store);
@@ -222,7 +222,7 @@ test("Test 60.7: EXACT update with a LOST RESPONSE is INDETERMINATE and is never
   assert.equal(sim.retrieve(sub.id).items[0].quantity, 120, "state is unchanged after the refused retry (no double-apply)");
 });
 
-test("Test 60.8: TERM_END CANCEL with a LOST RESPONSE is INDETERMINATE and is never blindly retried", async () => {
+test("Test 61.8: TERM_END CANCEL with a LOST RESPONSE is INDETERMINATE and is never blindly retried", async () => {
   const { sim, sub } = freshStripeFixture();
   const adapter = new StripeAdapter(sim, new QuoteStore());
   const quote = await termEndCancelQuote(adapter, sub.id);
@@ -240,7 +240,7 @@ test("Test 60.8: TERM_END CANCEL with a LOST RESPONSE is INDETERMINATE and is ne
   assert.equal(sim.retrieve(sub.id).cancel_at_period_end, true, "no second cancellation was dispatched");
 });
 
-test("Test 60.9 (control): EXACT quantity change landing as authorized still verifies — defined_equal_exact figures, OK", async () => {
+test("Test 61.9 (control): EXACT quantity change landing as authorized still verifies — defined_equal_exact figures, OK", async () => {
   const { sim, sub } = freshStripeFixture();
   const store = new QuoteStore();
   const adapter = new StripeAdapter(sim, store);
@@ -255,7 +255,7 @@ test("Test 60.9 (control): EXACT quantity change landing as authorized still ver
   assert.equal(receipt.resultingSnapshot.items[0].quantity, 120);
 });
 
-test("Test 60.10 (control): TERM_END CANCEL landing as authorized still verifies — defined_equal_exact, OK", async () => {
+test("Test 61.10 (control): TERM_END CANCEL landing as authorized still verifies — defined_equal_exact, OK", async () => {
   const { sim, sub } = freshStripeFixture();
   const adapter = new StripeAdapter(sim, new QuoteStore());
   const quote = await termEndCancelQuote(adapter, sub.id);
@@ -269,7 +269,7 @@ test("Test 60.10 (control): TERM_END CANCEL landing as authorized still verifies
   assert.equal(sim.retrieve(sub.id).cancel_at_period_end, true);
 });
 
-test("Test 60.11 (control): IMMEDIATE CANCEL landing as authorized still verifies — OK", async () => {
+test("Test 61.11 (control): IMMEDIATE CANCEL landing as authorized still verifies — OK", async () => {
   const { sim, sub } = freshStripeFixture();
   const adapter = new StripeAdapter(sim, new QuoteStore());
   const quote = await adapter.createChangeQuote(sub.id, {
@@ -283,12 +283,12 @@ test("Test 60.11 (control): IMMEDIATE CANCEL landing as authorized still verifie
   assert.equal(receipt.resultingSnapshot.status, "canceled");
 });
 
-test("Test 60.13 (boundary pin): EXACT-mode UPDATE quotes are refused at quote creation on Stripe — coverage, not verification, is what gates them today", async () => {
+test("Test 61.13 (boundary pin): EXACT-mode UPDATE quotes are refused at quote creation on Stripe — coverage, not verification, is what gates them today", async () => {
   // Stripe's advertised coverage for non-CANCEL actions carries
   // termEffect UNKNOWN, so an overall EXACT request for an update
   // fails enforceGuaranteeRequest before any quote exists. This
   // pins the reachability boundary the EXACT-update cases above
-  // are seeded around (60.1/60.2 helpers): the live EXACT surface
+  // are seeded around (61.1/61.2 helpers): the live EXACT surface
   // on this adapter is CANCEL, and the update arm of the shared
   // commit branch is defensive — it must still not be an
   // unverified path if a stored EXACT record ever reaches it.
@@ -306,7 +306,7 @@ test("Test 60.13 (boundary pin): EXACT-mode UPDATE quotes are refused at quote c
   );
 });
 
-test("Test 60.12: a VIOLATED receipt replays verbatim (no re-dispatch), and the one-shot fault does not leak into the next commit", async () => {
+test("Test 61.12: a VIOLATED receipt replays verbatim (no re-dispatch), and the one-shot fault does not leak into the next commit", async () => {
   const { sim, sub } = freshStripeFixture();
   const store = new QuoteStore();
   const adapter = new StripeAdapter(sim, store);
