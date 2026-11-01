@@ -817,7 +817,13 @@ export class StripeAdapter implements SubscriptionProvider {
       // before a verified receipt is recorded. The establishment
       // itself lives in establishExactOrCancelEffect below and
       // mirrors the REVALIDATE arm's discipline.
-      const established = this.establishExactOrCancelEffect(validated, resultingSub, mutationInvoice, journalWatermark);
+      // R2′: the operation identity is read from the DISPATCHED
+      // call's response artifact (resultingSub is that artifact)
+      // and passed alongside the watermark — the establishment
+      // binds the journal's transition to this exact call by it.
+      // A fault-skipped dispatch's response carries no identity,
+      // and the establishment fails closed on its absence.
+      const established = this.establishExactOrCancelEffect(validated, resultingSub, mutationInvoice, journalWatermark, resultingSub.operationId);
       committedEffect = established.effect;
       reconciliation = established.reconciliation;
       receiptStatus = established.status;
@@ -923,12 +929,30 @@ export class StripeAdapter implements SubscriptionProvider {
    *    cannot verify it). The provider's OWN wrong landing
    *    keeps the MISMATCH classification above: its transition
    *    is the operation's, with the wrong fingerprint journaled.
+   *  - identity binding (focused follow-up R2′): kind is not
+   *    identity — another actor can call the same public
+   *    mutation method, and if THIS dispatch was skipped (it
+   *    journaled nothing) while the other actor's ordinary
+   *    same-kind call landed exactly the intended state, the
+   *    window above holds exactly one transition of the
+   *    dispatched kind with a matching fingerprint, produced by
+   *    a DIFFERENT operation. The gate therefore additionally
+   *    requires the window's transition to carry the operation
+   *    identity minted for the call this adapter dispatched —
+   *    the identity that call's RESPONSE artifact carries
+   *    (`dispatchedOperationId`). A skipped dispatch's response
+   *    carries no identity at all, and the foreign transition
+   *    carries the other operation's, so the chain is denied
+   *    and the commit fails closed to COMMITTED_UNVERIFIED /
+   *    UNVERIFIED with the figures as candidates — the same
+   *    disposition as every other attribution break.
    */
   private establishExactOrCancelEffect(
     validated: StoredQuote,
     mutationSub: StripeSubscription,
     mutationInvoice: StripeInvoice | undefined,
-    journalWatermark: number
+    journalWatermark: number,
+    dispatchedOperationId: string | undefined
   ): {
     effect: CommercialEffect;
     reconciliation: ReconciliationResult;
@@ -1035,20 +1059,26 @@ export class StripeAdapter implements SubscriptionProvider {
     // is not an operation-keyed observation — the Chargebee
     // broken-bracket boundary). The journal window since the
     // pre-dispatch watermark must contain exactly this
-    // operation's transition — of the dispatched kind — and the
-    // verification read must still sit at that transition's
-    // resulting fingerprint. Anything else (an external or
-    // additional transition, no own transition at all, or a
-    // read that has moved past the attributed transition) means
-    // the observed state was not produced by this operation
-    // alone, and neither a VERIFIED nor a VIOLATED verdict may
-    // be built on it.
+    // operation's transition — of the dispatched kind, carrying
+    // THIS dispatch's operation identity (R2′: the identity the
+    // dispatched call's response artifact carries — kind alone
+    // cannot distinguish this dispatch from another actor's
+    // ordinary same-kind call) — and the verification read must
+    // still sit at that transition's resulting fingerprint.
+    // Anything else (an external or additional transition, no
+    // own transition at all, an identity that is absent or
+    // another operation's, or a read that has moved past the
+    // attributed transition) means the observed state was not
+    // produced by this operation alone, and neither a VERIFIED
+    // nor a VIOLATED verdict may be built on it.
     const dispatchedKind = isCancelCommit ? "cancel" : "update";
     const transitionsSince = this.sim.listTransitions(subscriptionId, journalWatermark);
     const ownTransition = transitionsSince.length === 1 ? transitionsSince[0] : undefined;
     const attributionBroken =
       ownTransition === undefined ||
       ownTransition.kind !== dispatchedKind ||
+      dispatchedOperationId === undefined ||
+      ownTransition.operationId !== dispatchedOperationId ||
       ownTransition.resultingFingerprint !== snap.version;
     if (attributionBroken) {
       const detail =
@@ -1064,8 +1094,18 @@ export class StripeAdapter implements SubscriptionProvider {
             : ownTransition!.kind !== dispatchedKind
               ? `the only transition recorded after dispatch is an "${ownTransition!.kind}" transition, not this ` +
                 `operation's "${dispatchedKind}" — the observed state was produced by another actor, not by this operation`
-              : "the verification read's fingerprint differs from the fingerprint journaled for this operation's " +
-                "transition — the observed state has moved past the state this operation produced";
+              : dispatchedOperationId === undefined
+                ? "the dispatched call's response carries no operation identity, while the only transition " +
+                  `recorded after dispatch carries ${ownTransition!.operationId ?? "no identity"} — this dispatch ` +
+                  "applied no transition of its own (a landing that never occurred behind a success response), " +
+                  "and the recorded transition is another operation's; the observed state is not this operation's outcome"
+                : ownTransition!.operationId !== dispatchedOperationId
+                  ? `the only transition recorded after dispatch carries operation identity ` +
+                    `${ownTransition!.operationId ?? "(none)"}, but the response of the call this adapter dispatched ` +
+                    `carries ${dispatchedOperationId} — the observed state was produced by a different operation ` +
+                    "of the same kind, not by this one"
+                  : "the verification read's fingerprint differs from the fingerprint journaled for this operation's " +
+                    "transition — the observed state has moved past the state this operation produced";
       return {
         effect: candidateFromResponse(),
         reconciliation: {
