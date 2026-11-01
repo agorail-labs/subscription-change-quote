@@ -31,7 +31,7 @@ import type { ProviderObservation } from "../src/core/types.js";
 //     though the receipt caps at COMMITTED_UNVERIFIED.
 //   * When the begin binding fails (validate -> dispatch window),
 //     the figure is a function of third-party state: varying ONLY
-//     the third party's quantity moves it 1:1 (58.2). Under spec
+//     the third party's quantity moves it 1:1 (60.2). Under spec
 //     §6.15 ("no third-party or unattributed figure may be recorded
 //     as this commit's determined actual") it may not be recorded
 //     DETERMINED. It is recorded as a §3.10 CANDIDATE instead:
@@ -40,16 +40,61 @@ import type { ProviderObservation } from "../src/core/types.js";
 //     reconciliation UNVERIFIED naming the dimension.
 //
 // FAILING-FIRST RECORD (measured against unmodified main
-// b00e74b): 58.1, 58.2, 58.3, 58.4, 58.5, 58.7, 58.9, 58.10 FAIL
+// b00e74b): 60.1, 60.2, 60.3, 60.4, 60.5, 60.7, 60.9, 60.10 FAIL
 // on their classification assertions (the figure is DETERMINED
 // where the audit requires a candidate) — the defect
-// reproductions. 58.6, 58.8 are characterization PINS (pass
-// before and after). 58.11, 58.12 are POSITIVE CONTROLS (pass
+// reproductions. 60.6, 60.8 are characterization PINS (pass
+// before and after). 60.11, 60.12 are POSITIVE CONTROLS (pass
 // before and after):
 //   attributable figures — including a VIOLATED one — must REMAIN
 //   DETERMINED; the narrowing must not overcorrect.
 // All evidence is SIMULATED (the Chargebee simulator's own pricing
 // and fingerprint mechanics). No live provider behavior is claimed.
+//
+// CORRECTION (PR #53 maintainer review, 2026-10-31) — two parts:
+// (1) RENUMBER: as first delivered (branch head 5d8f4df) this
+// suite was numbered test58, colliding with PR #50's
+// test58-indeterminate-recovery-evidence; test59 was also taken,
+// so the suite is renumbered test60. Test IDs and references were
+// renumbered mechanically; no case changed identity.
+// (2) §3.10 SOURCE DEFECT in the audit's own fix: the
+// begin-unbound candidate was built from the post-mutation
+// ARTIFACT READ (the persisted record read back via
+// retrieveMutation). Published §3.10 permits a committed
+// candidate ONLY from data already in hand at recording time —
+// the mutating call's own response, or (cancellations) the
+// stored quote — and states verbatim that "a candidate is never
+// derived from a further provider read performed after the
+// mutation landed." The classification (candidate / UNKNOWN /
+// unestablished) was right; the VALUE'S SOURCE was not, and 60.5
+// proved it observably: operation B's receipt carried operation
+// A's 20000, taken from A's artifact. The correction derives the
+// candidate from mutation.result — the mutating call's own
+// response — and leaves the candidate number ABSENT when the
+// response carries no admissible finite figure (candidates are
+// optional under §3.10); the artifact read remains in service
+// ONLY for attribution diagnostics (the begin binding itself).
+// Probe-verified simulator facts: the response carries
+// netImmediate + invoiceEstimateLineItems computed at execution
+// from the begin state, so 60.1's 12500 and 60.2's 5000 survive
+// unchanged as RESPONSE figures (numerically identical to the
+// artifact's — the sim persists the artifact FROM the response's
+// result); B's own response in 60.5 carries 10000 (its earlier
+// comment's "30000 priced off B's begin state" was wrong and is
+// corrected in place below).
+// FAILING-FIRST RECORD FOR THE CORRECTION (measured against
+// 5d8f4df before the source fix): amended 60.5 FAILS (receipt
+// carried A's 20000, not B's response figure 10000); new 60.13
+// FAILS (candidate took the artifact read's substituted 999999);
+// new 60.14 FAILS (candidate backfilled 12500 from the artifact
+// although the response carried no figure); EVERY candidate case
+// FAILS on assertCandidate's new §3.10 source assertions (the
+// provenance named the artifact read as the source). All
+// classification and figure-VALUE assertions in 60.1–60.4, 60.7,
+// 60.9, 60.10 already passed against 5d8f4df — the B — NARROW
+// decision and its values were never in question; only the
+// candidate's source was. See research/i46-immediate-attribution-
+// audit.md, correction section.
 
 const START = new Date("2026-08-01T00:00:00.000Z");
 
@@ -99,7 +144,7 @@ const ADD_PRO = (qty: number) => (s: ChargebeeSubscription) => {
   s.subscriptionItems.push({ id: "item_2", itemPriceId: "ip_seat_pro_monthly", quantity: qty });
 };
 
-/** The audit's required classification for a begin-unbound artifact figure: a §3.10 candidate. */
+/** The audit's required classification for a begin-unbound execution figure: a §3.10 candidate sourced from the mutating call's own response. */
 function assertCandidate(receipt: any, expectedNet: number) {
   assert.equal(receipt.status, "COMMITTED_UNVERIFIED");
   assert.equal(receipt.outcome, "COMMITTED_UNVERIFIED");
@@ -115,6 +160,51 @@ function assertCandidate(receipt: any, expectedNet: number) {
   assert.equal(receipt.committedEffect.determinacy?.recurringFinancialEffect, "UNKNOWN");
   assert.equal(receipt.committedEffect.provenance?.committedSource, "unestablished");
   assert.match(receipt.committedEffect.provenance?.immediate ?? "", /CANDIDATE/);
+  // §3.10 SOURCE (PR #53 review correction): a committed
+  // candidate's only permitted post-dispatch source is the
+  // mutating call's own response — never a further provider read
+  // performed after the mutation landed. The provenance must say
+  // so, and must not name the post-mutation artifact read.
+  assert.match(
+    receipt.committedEffect.provenance?.immediate ?? "",
+    /mutating call's own response/,
+    "§3.10: the candidate is sourced from the mutating call's own response",
+  );
+  assert.doesNotMatch(
+    receipt.committedEffect.provenance?.immediate ?? "",
+    /retrieveMutation/,
+    "§3.10: the candidate is never derived from the post-mutation artifact read",
+  );
+  assert.deepEqual(receipt.reconciliation.undeterminedDimensions, [
+    "immediateFinancialEffect",
+    "recurringFinancialEffect",
+  ]);
+  assert.equal(receipt.committedEffect.recurring?.resultingAmount, undefined);
+}
+
+/**
+ * The §3.10 classification when the mutating call's own response
+ * supplies NO admissible figure: the candidate number is ABSENT
+ * (candidates are optional) — never backfilled from the
+ * post-mutation artifact read, however finite its figure is.
+ * Everything else about the begin-unbound receipt is unchanged:
+ * COMMITTED_UNVERIFIED / UNVERIFIED, both dimensions
+ * undetermined, unestablished source, no recurring figure.
+ */
+function assertCandidateAbsent(receipt: any) {
+  assert.equal(receipt.status, "COMMITTED_UNVERIFIED");
+  assert.equal(receipt.outcome, "COMMITTED_UNVERIFIED");
+  assert.equal(receipt.reconciliation.status, "UNVERIFIED");
+  assert.match(receipt.reconciliation.reason ?? "", /fingerprint bracket does not close/);
+  assert.equal(receipt.committedEffect.immediate, undefined, "no candidate number: the response supplied no admissible figure");
+  assert.equal(receipt.committedEffect.determinacy?.immediateFinancialEffect, "UNKNOWN");
+  assert.equal(receipt.committedEffect.determinacy?.recurringFinancialEffect, "UNKNOWN");
+  assert.equal(receipt.committedEffect.provenance?.committedSource, "unestablished");
+  assert.match(
+    receipt.committedEffect.provenance?.immediate ?? "",
+    /no candidate figure is recorded/,
+    "the provenance states that no candidate figure is recorded, and why",
+  );
   assert.deepEqual(receipt.reconciliation.undeterminedDimensions, [
     "immediateFinancialEffect",
     "recurringFinancialEffect",
@@ -123,10 +213,10 @@ function assertCandidate(receipt: any, expectedNet: number) {
 }
 
 // ---------------------------------------------------------------------------
-// 58.1 — (a) The original issue #46 scenario.
+// 60.1 — (a) The original issue #46 scenario.
 // ---------------------------------------------------------------------------
 
-test("Test 58.1 (issue #46, case a): a third-party addition in the validate->dispatch window makes the artifact's immediate a candidate, not a determined actual", async () => {
+test("Test 60.1 (issue #46, case a): a third-party addition in the validate->dispatch window makes the execution's immediate a candidate, not a determined actual", async () => {
   const { sim, adapter, sub } = fixture();
   const quote = await quote120(adapter, sub);
   assert.equal(quote.commercialEffect.immediate?.net, 20000, "the validated state's authorized delta");
@@ -147,13 +237,13 @@ test("Test 58.1 (issue #46, case a): a third-party addition in the validate->dis
 });
 
 // ---------------------------------------------------------------------------
-// 58.2 — (a2) Invariance probe: the disproof of independent
+// 60.2 — (a2) Invariance probe: the disproof of independent
 // attributability. Identical quote, identical dispatched operation;
 // only the third party's quantity changes — the recorded figure
 // moves 1:1 with it.
 // ---------------------------------------------------------------------------
 
-test("Test 58.2 (issue #46, case a2): the recorded figure varies 1:1 with the third party's quantity — it is not independently attributable to the dispatched operation", async () => {
+test("Test 60.2 (issue #46, case a2): the recorded figure varies 1:1 with the third party's quantity — it is not independently attributable to the dispatched operation", async () => {
   const { sim, adapter, sub } = fixture();
   const quote = await quote120(adapter, sub);
   inDispatchWindow(sim, sub, ADD_PRO(10));
@@ -166,12 +256,12 @@ test("Test 58.2 (issue #46, case a2): the recorded figure varies 1:1 with the th
 });
 
 // ---------------------------------------------------------------------------
-// 58.3 — (b) Concurrent PRICE change in the gap: the third party
+// 60.3 — (b) Concurrent PRICE change in the gap: the third party
 // swaps the existing item's price id (monthly -> annual). The
 // begin state's price basis is one this commit never validated.
 // ---------------------------------------------------------------------------
 
-test("Test 58.3 (issue #46, case b): a concurrent price-id swap in the validate->dispatch window contaminates the pricing basis — the artifact's large credit is a candidate", async () => {
+test("Test 60.3 (issue #46, case b): a concurrent price-id swap in the validate->dispatch window contaminates the pricing basis — the execution's large credit is a candidate", async () => {
   const { sim, adapter, sub } = fixture();
   const quote = await quote120(adapter, sub);
   inDispatchWindow(sim, sub, (s) => {
@@ -180,19 +270,19 @@ test("Test 58.3 (issue #46, case b): a concurrent price-id swap in the validate-
 
   const receipt = await adapter.commitChangeQuote(quote.id);
   // Begin level priced at the swapped basis: 100 x 10000 = 1000000;
-  // end level 120 x 1000 = 120000; artifact delta = -880000.
+  // end level 120 x 1000 = 120000; execution delta = -880000.
   assertCandidate(receipt, -880000);
   assert.equal(receipt.committedEffect.immediate?.credit, 880000, "the candidate retains its full shape — figure kept, claim removed");
 });
 
 // ---------------------------------------------------------------------------
-// 58.4 — (c) Equal net amount, different third-party configurations.
+// 60.4 — (c) Equal net amount, different third-party configurations.
 // Two different begin states with the same price total produce the
 // SAME recorded figure: the number carries no information about
 // which third-party facts it nets.
 // ---------------------------------------------------------------------------
 
-test("Test 58.4 (issue #46, case c): different third-party configurations with equal price totals yield the identical figure — attribution cannot be read off the number", async () => {
+test("Test 60.4 (issue #46, case c): different third-party configurations with equal price totals yield the identical figure — attribution cannot be read off the number", async () => {
   const run = async (mutate: (s: ChargebeeSubscription) => void) => {
     const { sim, adapter, sub } = fixture();
     const quote = await quote120(adapter, sub);
@@ -213,13 +303,17 @@ test("Test 58.4 (issue #46, case c): different third-party configurations with e
 });
 
 // ---------------------------------------------------------------------------
-// 58.5 — (d) The artifact read back is a DIFFERENT operation's: the
+// 60.5 — (d) The artifact read back is a DIFFERENT operation's: the
 // mutating call's response carries the first operation's id, so the
 // establishment reads operation A's artifact for operation B's
-// commit. Its figure is not B's, under any reading.
+// commit. Its figure is not B's, under any reading — and under
+// §3.10 it may not even supply B's CANDIDATE: a candidate comes
+// only from B's own mutating call's response. (As first delivered,
+// this test expected A's 20000 as B's candidate — the exact source
+// violation the PR #53 maintainer review caught. Amended below.)
 // ---------------------------------------------------------------------------
 
-test("Test 58.5 (issue #46, case d): an artifact belonging to a different operation cannot establish this commit's immediate — its figure is recorded only as a candidate", async () => {
+test("Test 60.5 (issue #46, case d): an artifact belonging to a different operation cannot establish this commit's immediate — and cannot supply its candidate either (§3.10 source)", async () => {
   const { sim, adapter, sub } = fixture();
   // Operation A: a complete, clean commit (100 -> 120, figure 20000).
   const quoteA = await quote120(adapter, sub);
@@ -243,32 +337,53 @@ test("Test 58.5 (issue #46, case d): an artifact belonging to a different operat
 
   const receiptB = await adapter.commitChangeQuote(quoteB.id);
   assert.equal(sim.get(sub.id).subscriptionItems[0].quantity, 130, "B's own dispatch did land");
-  // The recorded figure is A's (20000) — not B's operation's
-  // (30000 priced off B's begin state, not B's authorized 10000).
-  // A different operation's figure is the limiting case of an
-  // unattributed figure: candidate only, never determined.
-  assertCandidate(receiptB, 20000);
+  // §3.10 SOURCE (PR #53 review correction): the only candidate
+  // B's receipt may record is the figure from B's OWN mutating
+  // call's response. Probe-verified: B's response reports 10000 —
+  // the figure B's own execution computed from its begin state
+  // (price level 120000 at quantity 120 -> dispatched 130000; the
+  // earlier draft of this test claimed "30000 priced off B's
+  // begin state", which the probe refuted). Operation A's
+  // artifact carries A's 20000; the pre-correction code took B's
+  // candidate from that post-mutation read — a source §3.10
+  // forbids outright ("a candidate is never derived from a
+  // further provider read performed after the mutation landed").
+  // A's figure therefore appears NOWHERE on B's receipt: not as
+  // an actual, and not as a candidate.
+  assertCandidate(receiptB, 10000);
+  assert.notEqual(
+    receiptB.committedEffect.immediate?.net,
+    20000,
+    "operation A's artifact figure never appears on B's receipt — not even as a candidate (§3.10 source rule)",
+  );
 });
 
 // ---------------------------------------------------------------------------
-// 58.6 — (e) PIN: a preview figure is never the committed source.
-// The recorded figure always comes from the bound artifact (or the
-// mutation response as a labeled candidate) — never from the
-// revalidated preview, whose figure here (20000) differs from the
-// artifact's (12500).
+// 60.6 — (e) PIN: a preview figure is never the committed source.
+// On a broken begin bracket the recorded figure is the mutating
+// call's own response figure, recorded as a labeled candidate
+// (§3.10) — never the revalidated preview, whose figure here
+// (20000) differs from the response's (12500). (As first
+// delivered, Part 1 named the bound artifact as the governing
+// source; the PR #53 review correction re-sources the candidate
+// to the response — the figure's VALUE is unchanged, because the
+// simulator computes the response and the artifact from the same
+// execution. The pin's substance — never a preview — is intact.)
 // ---------------------------------------------------------------------------
 
-test("Test 58.6 (issue #46, case e) [PIN]: the committed figure is never sourced from a preview — artifact figures govern, and a figureless artifact leaves only response candidates", async () => {
-  // Part 1: in the 58.1 geometry the recorded figure is the
-  // artifact's 12500, NOT the validated/revalidated preview's
-  // 20000 — on unmodified main and after the fix alike.
+test("Test 60.6 (issue #46, case e) [PIN]: the committed figure is never sourced from a preview — the mutating call's own response governs the candidate, and a figureless artifact leaves only response candidates", async () => {
+  // Part 1: in the 60.1 geometry the recorded figure is the
+  // mutating call's own response figure 12500, NOT the
+  // validated/revalidated preview's 20000 — on unmodified main
+  // (wrongly classified DETERMINED) and after the audit alike.
   {
     const { sim, adapter, sub } = fixture();
     const quote = await quote120(adapter, sub);
     inDispatchWindow(sim, sub, ADD_PRO(5));
     const receipt = await adapter.commitChangeQuote(quote.id);
-    assert.equal(receipt.committedEffect.immediate?.net, 12500, "the artifact's figure, not the preview's 20000");
-    assert.match(receipt.committedEffect.provenance?.immediate ?? "", /persisted mutation artifact/, "the provenance names the artifact — not a preview or estimate — as the figure's source");
+    assert.equal(receipt.committedEffect.immediate?.net, 12500, "the response's figure, not the preview's 20000");
+    assert.match(receipt.committedEffect.provenance?.immediate ?? "", /mutating call's own response/, "the provenance names the mutating call's own response — not a preview or estimate — as the candidate's source");
+    assert.doesNotMatch(receipt.committedEffect.provenance?.immediate ?? "", /retrieveMutation/, "the candidate is not sourced from the post-mutation artifact read");
   }
   // Part 2: with the artifact's financials omitted (sim fault), the
   // establishment falls back to the mutation response's CANDIDATES
@@ -288,12 +403,12 @@ test("Test 58.6 (issue #46, case e) [PIN]: the committed figure is never sourced
 });
 
 // ---------------------------------------------------------------------------
-// 58.7 — (f) Post-commit observation from a DIFFERENT subscription,
+// 60.7 — (f) Post-commit observation from a DIFFERENT subscription,
 // composed with the broken begin bracket: the foreign record
 // supplies no figure and verifies nothing.
 // ---------------------------------------------------------------------------
 
-test("Test 58.7 (issue #46, case f): a foreign post-commit record under a broken begin bracket contributes no figure — the artifact's figure stays a candidate", async () => {
+test("Test 60.7 (issue #46, case f): a foreign post-commit record under a broken begin bracket contributes no figure — the execution's figure stays a candidate", async () => {
   const { sim, adapter, sub } = fixture();
   const quote = await quote120(adapter, sub);
   const realUpdate = sim.updateForItems.bind(sim);
@@ -313,19 +428,20 @@ test("Test 58.7 (issue #46, case f): a foreign post-commit record under a broken
 
   const receipt = await adapter.commitChangeQuote(quote.id);
   sim.get = realGet;
-  // The only figure recorded is the bound artifact's own (12500) —
-  // as a candidate. The foreign record established nothing.
+  // The only figure recorded is the mutating call's own response
+  // figure (12500) — as a candidate. The foreign record
+  // established nothing.
   assertCandidate(receipt, 12500);
 });
 
 // ---------------------------------------------------------------------------
-// 58.8 — (g) PIN: provider response with incomplete provenance —
+// 60.8 — (g) PIN: provider response with incomplete provenance —
 // the artifact persists a net figure but NO line items. The
 // establishment treats the artifact as carrying no financial
 // actuals and records response candidates only.
 // ---------------------------------------------------------------------------
 
-test("Test 58.8 (issue #46, case g) [PIN]: an artifact without line items establishes nothing — response candidates only, both dimensions UNKNOWN", async () => {
+test("Test 60.8 (issue #46, case g) [PIN]: an artifact without line items establishes nothing — response candidates only, both dimensions UNKNOWN", async () => {
   const { sim, adapter, sub } = fixture();
   const quote = await quote120(adapter, sub);
   const realRetrieve = sim.retrieveMutation.bind(sim);
@@ -344,14 +460,14 @@ test("Test 58.8 (issue #46, case g) [PIN]: an artifact without line items establ
 });
 
 // ---------------------------------------------------------------------------
-// 58.9 — (h) The candidate lifecycle: later INDEPENDENT evidence
+// 60.9 — (h) The candidate lifecycle: later INDEPENDENT evidence
 // establishes the dimension against the recorded candidate
 // (A-17-1: the candidate is judged, not matched), a conflicting
 // actual is appended and flagged without replacing the accepted
 // one, and the recorded receipt is never rewritten.
 // ---------------------------------------------------------------------------
 
-test("Test 58.9 (issue #46, case h): independent evidence later establishes the candidate's dimension; a conflicting actual flags the view UNVERIFIED and never rewrites the recorded receipt", async () => {
+test("Test 60.9 (issue #46, case h): independent evidence later establishes the candidate's dimension; a conflicting actual flags the view UNVERIFIED and never rewrites the recorded receipt", async () => {
   const { sim, store, adapter, sub } = fixture();
   const quote = await quote120(adapter, sub);
   inDispatchWindow(sim, sub, ADD_PRO(5));
@@ -364,7 +480,7 @@ test("Test 58.9 (issue #46, case h): independent evidence later establishes the 
       immediate: { net: immediateNet },
       determinacy: { immediateFinancialEffect: "DETERMINED", recurringFinancialEffect: "UNKNOWN" },
       provenance: {
-        immediate: "test58: independent post-commit read of the operation-bound charge record (simulated)",
+        immediate: "test60: independent post-commit read of the operation-bound charge record (simulated)",
         committedSource: "provider_actual",
       },
     },
@@ -375,7 +491,7 @@ test("Test 58.9 (issue #46, case h): independent evidence later establishes the 
       items: [{ id: "item_1", offeringRef: "ip_seat_basic_monthly", quantity: 120 }],
       billing: { currency: "usd", cadence: "MONTHLY", recurringAmount: 120000 },
     },
-    source: "test58: independent post-commit provider reads (simulated)",
+    source: "test60: independent post-commit provider reads (simulated)",
     observedAt: "2026-08-01T01:00:00.000Z",
   });
 
@@ -411,13 +527,13 @@ test("Test 58.9 (issue #46, case h): independent evidence later establishes the 
 });
 
 // ---------------------------------------------------------------------------
-// 58.10 — (i) Partial application of a bundled change under a
+// 60.10 — (i) Partial application of a bundled change under a
 // broken begin bracket: the state contradiction is CONTEXT, not a
 // verified failure (Z1) — an unattributable effect must not be
 // classified VIOLATED, and its figure is a candidate.
 // ---------------------------------------------------------------------------
 
-test("Test 58.10 (issue #46, case i): bundled change, wrong-quantity application, and a begin-window write — UNVERIFIED with a candidate figure, never VIOLATED", async () => {
+test("Test 60.10 (issue #46, case i): bundled change, wrong-quantity application, and a begin-window write — UNVERIFIED with a candidate figure, never VIOLATED", async () => {
   const { sim, adapter, sub } = fixture({
     subscriptionItems: [
       { id: "item_1", itemPriceId: "ip_seat_basic_monthly", quantity: 100 },
@@ -438,20 +554,20 @@ test("Test 58.10 (issue #46, case i): bundled change, wrong-quantity application
 
   const receipt = await adapter.commitChangeQuote(quote.id);
   assert.notEqual(receipt.reconciliation.status, "VIOLATED", "an unattributable contradiction is context, not an established violation");
-  // Artifact figure: begin (100x1000 + 6x1500 = 109000) -> applied
+  // Execution figure: begin (100x1000 + 6x1500 = 109000) -> applied
   // end (130x1000 + 10x1500 = 145000) = +36000 — retained as a
   // candidate, establishing nothing.
   assertCandidate(receipt, 36000);
 });
 
 // ---------------------------------------------------------------------------
-// 58.11 — (j) POSITIVE CONTROL 1: a fully attributable committed
+// 60.11 — (j) POSITIVE CONTROL 1: a fully attributable committed
 // obligation that VIOLATES the authorization envelope stays
 // DETERMINED + VIOLATED. The narrowing must never suppress an
 // independently established violation.
 // ---------------------------------------------------------------------------
 
-test("Test 58.11 (issue #46, case j) [POSITIVE CONTROL]: an attributable wrong landing exceeding the envelope remains DETERMINED and VIOLATED", async () => {
+test("Test 60.11 (issue #46, case j) [POSITIVE CONTROL]: an attributable wrong landing exceeding the envelope remains DETERMINED and VIOLATED", async () => {
   const { sim, adapter, sub } = fixture();
   const quote = await quote120(adapter, sub, {
     maxImmediateNetIncrease: 25000,
@@ -469,7 +585,7 @@ test("Test 58.11 (issue #46, case j) [POSITIVE CONTROL]: an attributable wrong l
 });
 
 // ---------------------------------------------------------------------------
-// 58.12 — POSITIVE CONTROL 2 (the anti-overcorrection control for
+// 60.12 — POSITIVE CONTROL 2 (the anti-overcorrection control for
 // the narrowing itself): interference confined to the
 // mutate -> verify window (test25.9's geometry) leaves the
 // immediate DETERMINED — the operation began on exactly the state
@@ -477,7 +593,7 @@ test("Test 58.11 (issue #46, case j) [POSITIVE CONTROL]: an attributable wrong l
 // validated baseline alone.
 // ---------------------------------------------------------------------------
 
-test("Test 58.12 (issue #46) [POSITIVE CONTROL]: mutate->verify-window interference alone keeps the immediate DETERMINED (begin binding holds)", async () => {
+test("Test 60.12 (issue #46) [POSITIVE CONTROL]: mutate->verify-window interference alone keeps the immediate DETERMINED (begin binding holds)", async () => {
   const { sim, adapter, sub } = fixture();
   const quote = await quote120(adapter, sub);
   const realUpdate = sim.updateForItems.bind(sim);
@@ -497,4 +613,95 @@ test("Test 58.12 (issue #46) [POSITIVE CONTROL]: mutate->verify-window interfere
   assert.equal(receipt.committedEffect.determinacy?.immediateFinancialEffect, "DETERMINED");
   assert.equal(receipt.committedEffect.recurring?.resultingAmount, undefined);
   assert.equal(receipt.committedEffect.determinacy?.recurringFinancialEffect, "UNKNOWN");
+});
+
+// ---------------------------------------------------------------------------
+// 60.13 — (k) §3.10 SOURCE REGRESSION (PR #53 review correction):
+// response-versus-artifact disagreement. The mutating call's
+// response and the later artifact read report DIFFERENT figures
+// for the same execution; the candidate must be the RESPONSE's.
+// The artifact read's role is attribution diagnostics only.
+// ---------------------------------------------------------------------------
+
+test("Test 60.13 (issue #46, case k) [§3.10 SOURCE]: when the post-mutation artifact read disagrees with the mutating call's response, the candidate is the response's figure — never the artifact read's", async () => {
+  const { sim, adapter, sub } = fixture();
+  const quote = await quote120(adapter, sub);
+  inDispatchWindow(sim, sub, ADD_PRO(5));
+  // Corrupt ONLY the figure the later artifact read returns: the
+  // record the establishment reads back now claims 999999, while
+  // the mutating call's own response reported the execution's
+  // figure (12500, per 60.1's geometry). Attribution data
+  // (fingerprints, recorded request) is left intact, so the
+  // begin-unbound determination is unchanged — only the number
+  // the read offers differs.
+  const realRetrieve = sim.retrieveMutation.bind(sim);
+  sim.retrieveMutation = ((id: string) => {
+    const art = realRetrieve(id);
+    return {
+      ...art,
+      netImmediate: 999999,
+      invoiceEstimateLineItems: [{ description: "Prorated charge", amount: 999999 }],
+    };
+  }) as typeof realRetrieve;
+
+  const receipt = await adapter.commitChangeQuote(quote.id);
+  // The candidate is the response's 12500 (assertCandidate pins
+  // the full classification AND the §3.10 source assertions).
+  assertCandidate(receipt, 12500);
+  assert.notEqual(
+    receipt.committedEffect.immediate?.net,
+    999999,
+    "the post-mutation artifact read's figure is never the candidate's source (§3.10)",
+  );
+});
+
+// ---------------------------------------------------------------------------
+// 60.14 — (l) §3.10 SOURCE REGRESSION (PR #53 review correction):
+// the response carries no admissible figure — omitted, or
+// nonfinite. The candidate number stays ABSENT even though the
+// retrievable artifact carries a finite figure: §3.10 permits a
+// candidate from the mutating call's own response ONLY, and
+// candidates are optional.
+// ---------------------------------------------------------------------------
+
+test("Test 60.14 (issue #46, case l) [§3.10 SOURCE]: a response with no admissible figure leaves the candidate absent — the retrievable artifact's finite figure never backfills it", async () => {
+  // (i) The response OMITS its immediate figure. The artifact
+  // persisted by the same execution still carries 12500 and is
+  // retrievable — the pre-correction code recorded it as the
+  // candidate; §3.10 forbids that source.
+  {
+    const { sim, adapter, sub } = fixture();
+    const quote = await quote120(adapter, sub);
+    inDispatchWindow(sim, sub, ADD_PRO(5));
+    const wrapped = sim.updateForItems.bind(sim);
+    sim.updateForItems = ((...args: Parameters<typeof wrapped>) => {
+      const out = wrapped(...args);
+      const result = { ...(out.result as object) } as Record<string, unknown>;
+      delete result.netImmediate;
+      return { ...out, result: result as typeof out.result };
+    }) as typeof wrapped;
+
+    const receipt = await adapter.commitChangeQuote(quote.id);
+    assert.equal(
+      sim.retrieveMutation(sim.latestMutationId(sub.id)!).netImmediate,
+      12500,
+      "scenario check: the retrievable artifact DOES carry a finite figure — it is simply not a permitted candidate source",
+    );
+    assertCandidateAbsent(receipt);
+  }
+  // (ii) The response's figure is NONFINITE (NaN). Same rule:
+  // inadmissible is absent, never backfilled.
+  {
+    const { sim, adapter, sub } = fixture();
+    const quote = await quote120(adapter, sub);
+    inDispatchWindow(sim, sub, ADD_PRO(5));
+    const wrapped = sim.updateForItems.bind(sim);
+    sim.updateForItems = ((...args: Parameters<typeof wrapped>) => {
+      const out = wrapped(...args);
+      return { ...out, result: { ...out.result, netImmediate: Number.NaN } };
+    }) as typeof wrapped;
+
+    const receipt = await adapter.commitChangeQuote(quote.id);
+    assertCandidateAbsent(receipt);
+  }
 });
