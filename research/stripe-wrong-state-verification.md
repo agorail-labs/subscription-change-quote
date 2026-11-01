@@ -106,18 +106,18 @@ delivery record). Exact baseline classifications:
 
 | Case | Baseline | Required |
 | --- | --- | --- |
-| 60.1 EXACT qty 120→persisted 130 | `COMMITTED_AND_VERIFIED` / `OK` | VIOLATED |
-| 60.2 EXACT plan, persisted price unchanged | `COMMITTED_AND_VERIFIED` / `OK` | VIOLATED |
-| 60.3 TERM_END cancel lands immediate | `COMMITTED_AND_VERIFIED` / `OK` (snapshot showed the *scheduled* shape from the return) | VIOLATED |
-| 60.4 TERM_END cancel, period end +7d | `COMMITTED_AND_VERIFIED` / `OK` | VIOLATED |
-| 60.5 TERM_END cancel never lands | `COMMITTED_AND_VERIFIED` / `OK` | `COMMITTED_UNVERIFIED` / `UNVERIFIED` |
-| 60.6 EXACT update, post-mutation state missing | commit **threw** `No such subscription` (unguarded `fingerprint()` after the mutation); no receipt recorded | `COMMITTED_UNVERIFIED` receipt with unestablished candidates |
-| 60.12 replay of the (would-be) VIOLATED receipt | first commit `OK` — nothing to replay | VIOLATED receipt, verbatim replay |
+| 61.1 EXACT qty 120→persisted 130 | `COMMITTED_AND_VERIFIED` / `OK` | VIOLATED |
+| 61.2 EXACT plan, persisted price unchanged | `COMMITTED_AND_VERIFIED` / `OK` | VIOLATED |
+| 61.3 TERM_END cancel lands immediate | `COMMITTED_AND_VERIFIED` / `OK` (snapshot showed the *scheduled* shape from the return) | VIOLATED |
+| 61.4 TERM_END cancel, period end +7d | `COMMITTED_AND_VERIFIED` / `OK` | VIOLATED |
+| 61.5 TERM_END cancel never lands | `COMMITTED_AND_VERIFIED` / `OK` | `COMMITTED_UNVERIFIED` / `UNVERIFIED` |
+| 61.6 EXACT update, post-mutation state missing | commit **threw** `No such subscription` (unguarded `fingerprint()` after the mutation); no receipt recorded | `COMMITTED_UNVERIFIED` receipt with unestablished candidates |
+| 61.12 replay of the (would-be) VIOLATED receipt | first commit `OK` — nothing to replay | VIOLATED receipt, verbatim replay |
 
-Passing on baseline, by design (pins/controls): 60.0 fault shape; 60.7/60.8
+Passing on baseline, by design (pins/controls): 61.0 fault shape; 61.7/61.8
 lost response ⇒ `INDETERMINATE` + no blind retry (the recorded-outcome guard
-already refused a second commit, state landed exactly once); 60.9/60.10/60.11
-happy paths; 60.13 the EXACT-update reachability boundary.
+already refused a second commit, state landed exactly once); 61.9/61.10/61.11
+happy paths; 61.13 the EXACT-update reachability boundary.
 
 ## 4. Root cause
 
@@ -184,17 +184,23 @@ arm's `establishCommittedEffect`):
 | TERM_END schedule absent | VERIFIED / OK | **COMMITTED_UNVERIFIED** / UNVERIFIED |
 | Post-mutation state missing | commit threw; no receipt | **COMMITTED_UNVERIFIED** / UNVERIFIED, candidates labelled |
 | Lost response (update/cancel) | INDETERMINATE, no retry | unchanged (pinned) |
-| Happy paths (EXACT, TERM_END, IMMEDIATE cancel) | VERIFIED / OK, `defined_equal_exact` | unchanged (pinned by 60.9–60.11 + test17.12) |
+| Happy paths (EXACT, TERM_END, IMMEDIATE cancel) | VERIFIED / OK, `defined_equal_exact` | unchanged (pinned by 61.9–61.11 + test17.12) |
 
 ## 6. Validation (Phase 4)
 
-- Full suite: **843/843 on Node v22.14.0** and **843/843 on Node
-  v20.19.5** (baseline 829 + test61's 14; better-sqlite3 rebuilt per Node
-  version; Node 22 binding restored last, suite re-run 843/843).
-- test61: **14/14**. Existing Stripe regressions (test17 incl. 17.12,
-  test4, test12, test35, test49, test54) all pass unmodified.
-- Receipt replay / idempotency: pinned by 60.6 (UNVERIFIED receipt replays
-  verbatim, no re-dispatch against missing state) and 60.12 (VIOLATED
+- Full suite: **875/875 on Node v22.14.0** and **875/875 on Node
+  v20.19.5** (better-sqlite3 rebuilt per Node version; Node 22 binding
+  restored last, suite re-run 875/875). Composition: 843 at the
+  original PR head; PR #53's merge brought the integrated baseline
+  to 871 (including main's own test60-i46 suite — the Stripe suite
+  renumbered test60 → test61 to avoid the identifier collision);
+  the correction round (§8) adds tests 61.14–61.17 for 875.
+- test61: **18/18**. Existing Stripe regressions (test17 incl. 17.12,
+  test4, test12, test35, test49, test54) all pass unmodified, as does
+  the REVALIDATE arm's pinned concurrent-write discipline
+  (test17.9 — that arm's establishment is out of this round's scope).
+- Receipt replay / idempotency: pinned by 61.6 (UNVERIFIED receipt replays
+  verbatim, no re-dispatch against missing state) and 61.12 (VIOLATED
   receipt replays verbatim), and by the unmodified suite (test17.10
   family, test50, durable-store test58/test59 — PR #50's machinery
   untouched).
@@ -221,3 +227,107 @@ arm's `establishCommittedEffect`):
   a store-seeded record because the branch is shared with CANCEL.
 - G-21 stays OPEN for its other items per the gap register; this note
   resolves item 1's *implementation* question only.
+- **The transition journal is a simulator model.** It is complete
+  and ordered by construction (every modeled mutation path
+  journals). A live Stripe adapter would need the provider's real
+  event/artifact binding — webhook delivery is neither complete
+  nor ordered by default — so the attribution chain demonstrates
+  the *discipline*, not a live capability. SIMULATED_PASS.
+
+## 8. Correction round (PR #52 review — R1, R2, R3)
+
+The independent review of the original delivery verified the
+central finding and the corrected classifications, and returned
+three corrections. Dispositions:
+
+**R3 — integration.** PR #53 (issue #46) merged while this PR was
+in review and added its own `test60` suite on main. The branch
+merged `origin/main` (`e2a44f2`; merge commit, no rebase — the PR
+carries review history) and this suite renumbered
+**test60 → test61** (file, test names, traceability and this
+note). Integrated baseline before the R1/R2 work: **871 tests,
+all passing** (843 at the original head + PR #53's 28).
+
+**R1 — UNVERIFIABLE receipts must name the undetermined
+dimensions (§3.10/§6.15).** The state-UNVERIFIABLE branch of
+`establishExactOrCancelEffect` recorded `candidateFromResponse()`
+figures (both determinacies UNKNOWN) but returned
+`undeterminedDimensions: []` — an empty list falsely implying
+every dimension had been determined. Fixed: the branch now names
+`["immediateFinancialEffect", "recurringFinancialEffect"]`, the
+same order as the missing-read branch. Failing-first: test61.5
+(extended) and test61.14 both failed on exactly this assertion
+against the integrated unfixed code. Test61.14's shape is
+deliberate: a seeded item entry with **no identifier** — under
+§6.12 (SV3/SV5) an unidentifiable observed entry could be a
+contradictory duplicate, so the verdict is UNVERIFIABLE while
+the identified entry lands exactly as authorized and no third
+party intervenes. (Test61.6's missing-state shape takes the
+missing-read branch, which already named both dimensions, so it
+could not pin this branch.)
+
+**R2 — attribution before classification (§6.15).** The original
+correction classified the *observed* state without establishing
+that this operation produced it: a third party's rewrite between
+dispatch and verification was recorded as this operation's
+VIOLATED actuals, a third-party-installed matching schedule
+verified a cancel that never landed, and the EXACT arm's M3
+`latest_invoice` check sat *behind* the MISMATCH branch. The
+correction builds an operation-attribution chain on the
+simulator's public surface and consumes it in the establishment
+**before** any classification:
+
+- *Transition journal (sim, additive).* The sim now journals
+  every state transition per subscription — its model of
+  Stripe's `customer.subscription.updated` event stream:
+  `update()`/`cancel()` applications append
+  `{ seq, subscriptionId, kind, at, resultingFingerprint }`,
+  and `_debugMutateDirectly` appends `kind: "external"`.
+  Fault-skipped effects journal **nothing** (a skipped cancel
+  leaves no transition — its absence is the evidence), while
+  wrong landings journal their **wrong** fingerprint (the wrong
+  landing is the operation's own transition, so attribution
+  convicts rather than excuses it: tests 61.1–61.4 are
+  unchanged). The journal never enters `fingerprint()` material
+  and changes no existing behaviour. Public reads:
+  `transitionSeq(id)` (watermark) and `listTransitions(id,
+  afterSeq)`.
+- *Adapter consumption.* `commitChangeQuote` captures the
+  watermark immediately before dispatch and passes it to the
+  establishment. The observed state is attributed to this
+  operation only when the window since the watermark holds
+  **exactly one** transition, of the dispatched kind, whose
+  journaled resulting fingerprint equals the verification
+  read's fingerprint. Otherwise the commit is
+  `COMMITTED_UNVERIFIED` / `UNVERIFIED`: the observed state is
+  recorded as context, the figures as candidates with both
+  undetermined dimensions named — never VIOLATED, never
+  VERIFIED/OK. The M3 `latest_invoice` check is retained,
+  now evaluated only for attributed states (the journal gate
+  precedes it).
+
+After-fix matrix for the reviewer's three scenarios (all three
+failed failing-first against the integrated unfixed code —
+13 pass / 5 fail across the extended test61, the other two
+failures being R1's pair):
+
+| Scenario | Before (round-1 correction) | After (this round) |
+| --- | --- | --- |
+| S1 (61.15): cancel lands correct TERM_END schedule; third party rewrites the date before the read | `COMMITTED_AND_VERIFIED` / **VIOLATED** over the third party's state | `COMMITTED_UNVERIFIED` / UNVERIFIED, observed state as context |
+| S2 (61.16): cancel skipped (never lands); third party installs the intended schedule before the read | `COMMITTED_AND_VERIFIED` / **OK**, `defined_equal_exact` | `COMMITTED_UNVERIFIED` / UNVERIFIED — a matching state this operation did not produce cannot verify it |
+| S3 (61.17): intervening update lands a mismatch and replaces `latest_invoice` (EXACT arm) | `COMMITTED_AND_VERIFIED` / **VIOLATED** (MISMATCH fired before the M3 check) | `COMMITTED_UNVERIFIED` / UNVERIFIED — attribution gate precedes classification |
+| Controls: provider's own wrong landing (61.1–61.4) | VIOLATED | **unchanged** — VIOLATED over observed actuals |
+| Controls: happy paths (61.9–61.11), lost response (61.7/61.8), replay (61.12) | as pinned | **unchanged** |
+
+No scenario required a downgrade: the journal binds all three
+honestly — each interposition is a journaled transition (or a
+journaled absence), so the attribution verdict is computed from
+the modeled event stream rather than asserted.
+
+Validation for this round: failing-first record
+`P1-52-R12-FAILING-FIRST` (test61 vs the integrated unfixed
+code: 18 tests, 13 pass / 5 fail — 61.5 and 61.14 for R1;
+61.15–61.17 for R2); after the fix, test61 **18/18** and the
+full suite **875/875 on Node v22.14.0 and v20.19.5**, all runs
+against the committed tree. Freeze footprint empty; neutrality
+OK. All results SIMULATED_PASS.
