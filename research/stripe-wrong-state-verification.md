@@ -347,3 +347,124 @@ the binding figures above are from clean-`dist/` rebuilds of
 the committed tree. Lesson recorded with the original delivery's
 slip: validate the committed tree *as a clean checkout*, not
 the worktree.
+
+## 9. Focused follow-up (PR #52 review — R2′: kind is not operation identity)
+
+The focused final review of the correction round verified R1,
+R3 and the R2 scenarios, and returned one narrower attribution
+edge: the transition journal bound a transition's **kind**, but
+not the **individual operation** that applied it. Another actor
+can call the same public mutation method — so if the dispatched
+cancel is skipped (it journals nothing) and a distinct actor's
+ordinary `sim.cancel()` then lands exactly the intended
+schedule, the post-dispatch window holds exactly one
+kind:"cancel" transition with a matching fingerprint, and the
+R2 gate attributed that foreign landing to this commit:
+`COMMITTED_AND_VERIFIED` / OK for an operation that did nothing.
+Test61.16 did not catch it — its interposition is
+`_debugMutateDirectly` (kind:"external"), which the kind check
+already rejects; the same-kind path was untested.
+
+**Failing-first** (record `P1-52-R2B-FAILING-FIRST`; test61 vs
+head `bb1bd82` with only the new tests and one mirrored fault
+hook added — the adapter and gate unmodified): 20 tests,
+18 pass / 2 fail.
+
+- **Test61.18** implements the reviewer's exact construction on
+  the public surface: an interposer whose `cancel()` arms
+  `_debugSkipCancelOnNextCancel`, calls `super.cancel(id, true)`
+  (this dispatch: nominal scheduled response, persisted schedule
+  reverted, journals nothing), calls `super.cancel(id, true)`
+  again as a distinct actor's ordinary cancellation (persists
+  the intended TERM_END schedule; journals exactly one
+  kind:"cancel" transition), and returns the FIRST call's
+  response. Unfixed classification: **`COMMITTED_AND_VERIFIED` /
+  OK, `defined_equal_exact`** — the predicted false verification.
+- **Test61.19** is the symmetric EXACT-update analogue, via the
+  store-seeded EXACT record and a mirrored one-shot skip hook
+  (`_debugSkipUpdateOnNextUpdate`: nominal success response —
+  artifact + generated invoice — persisted record restored,
+  journals nothing). It is constructible, with one documented
+  difference in the unfixed failure shape: the kind-only gate
+  likewise passes the foreign update transition and the state
+  verdict is VERIFIED, but the top line is then capped at
+  COMMITTED_UNVERIFIED by the downstream M3 `latest_invoice`
+  check — which records the **skipped call's own invoice
+  figures as this operation's DETERMINED `provider_actual`s**
+  (both determinacies DETERMINED, `undeterminedDimensions: []`).
+  The test therefore fails on the establishment assertions, not
+  the top-line outcome: even where M3 incidentally caps the
+  outcome, the pre-fix code establishes an operation that
+  applied nothing. The update arm cannot reproduce 61.18's
+  VERIFIED/OK shape pre-fix because M3 sits downstream of the
+  gate; the defect pinned — no per-operation identity at the
+  attribution gate — is the same.
+
+**The fix — per-operation identity binding** (sim + adapter,
+additive; the R1/R2/R3 corrections untouched):
+
+- *Sim.* Every `update()`/`cancel()` **application** mints a
+  unique operation identity from a sim-wide monotonic counter
+  (`op_<n>`, deterministic per simulator instance). The journal
+  entry gains `operationId`; `_debugMutateDirectly` entries
+  (kind:"external") carry none — they were not applied by a
+  mutation call whose response any consumer holds.
+- *Response stamp.* The identity reaches the adapter **from the
+  response of the exact call it dispatched**: the sim stamps it
+  as `operationId` on the RETURNED subscription artifact only
+  (a documented, additive public field on that artifact). It is
+  never persisted into the stored record (`seedSubscription`
+  strips it; `retrieve()` clones the stored record, which never
+  carries it) and never enters `fingerprint()` material.
+- *Fault semantics preserved.* A fault-skipped operation applies
+  no transition, so its synthesized nominal response is stamped
+  with **nothing** — the skip paths return before stamping, and
+  the absence is the evidence. A fault that DOES apply a
+  transition (wrong quantity/price, immediate/shifted cancel)
+  journals that transition under its own freshly minted identity
+  and its response carries the same identity — attribution still
+  convicts it, so 61.1–61.4 remain VIOLATED. The lost-response
+  hooks are untouched (no response reaches establishment;
+  INDETERMINATE unchanged, 61.7/61.8).
+- *Adapter.* `commitChangeQuote` reads the identity from the
+  dispatched call's response artifact and passes it into
+  `establishExactOrCancelEffect`. The attribution gate now
+  requires ALL of: window length exactly 1; kind = the
+  dispatched kind; `transition.operationId` = the response's
+  operation identity; `resultingFingerprint` = the verification
+  read's fingerprint. Identity absent from the response or any
+  mismatch denies attribution (fail-closed) →
+  `COMMITTED_UNVERIFIED` / `UNVERIFIED`, observed state as
+  context, figures as candidates with both undetermined
+  dimensions named — never OK, never VIOLATED. The REVALIDATE
+  arm is unchanged; it does not consume the journal or the
+  identity.
+
+After-fix matrix:
+
+| Case | On bb1bd82 (failing-first) | After R2′ |
+| --- | --- | --- |
+| 61.18: skipped cancel; another actor's ordinary cancel lands the intended schedule | `COMMITTED_AND_VERIFIED` / **OK**, `defined_equal_exact` | `COMMITTED_UNVERIFIED` / **UNVERIFIED** — the window's transition carries the other operation's identity; this dispatch's response carries none |
+| 61.19: skipped update; another actor's ordinary update lands the intended state | gate passed the foreign transition; capped by M3 with the skipped call's figures recorded as DETERMINED `provider_actual` | `COMMITTED_UNVERIFIED` / **UNVERIFIED** at the attribution gate — figures stay unestablished candidates, both dimensions named; M3 never reached |
+| Controls: provider's own wrong landing (61.1–61.4) | VIOLATED | **unchanged** — the wrong landing is journaled under the dispatch's own identity, and its response carries it |
+| Controls: happy paths (61.9–61.11), S1–S3 (61.15–61.17), R1 pair (61.5/61.14), lost response (61.7/61.8), replay (61.12), boundary (61.13) | as pinned | **unchanged** |
+
+**Stated limit.** The stamped response artifact is the
+simulator's model of an operation-bound result — a result
+object that names the individual operation that produced it.
+Nothing here claims a real provider's webhook/event behaviour
+establishes such a binding: a live adapter would need the
+provider's real per-operation artifact (an operation/result
+identifier returned by the mutation call itself, bound to the
+provider's own transition record), and where a provider offers
+none, the honest disposition remains the fail-closed one —
+attribution denied, outcome UNVERIFIED. The journal remains a
+simulator model: complete and ordered by construction.
+
+Validation for this round: failing-first record
+`P1-52-R2B-FAILING-FIRST` (test61 vs `bb1bd82` + new tests/hook:
+20 tests, 18 pass / 2 fail — 61.18, 61.19); after the fix,
+test61 **20/20** and the full suite **863/863 on Node v22.14.0
+and v20.19.5**, all final runs against the committed tree from
+a clean `dist/`. Freeze footprint empty; neutrality OK. All
+results SIMULATED_PASS.
