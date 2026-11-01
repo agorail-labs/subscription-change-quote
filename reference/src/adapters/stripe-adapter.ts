@@ -730,6 +730,17 @@ export class StripeAdapter implements SubscriptionProvider {
       }
     }
 
+    // Issue #44 correction round (R2): capture the simulator's
+    // transition-journal watermark immediately BEFORE dispatch.
+    // After the mutation, the journal since this watermark is
+    // the operation-attribution chain the EXACT/CANCEL
+    // establishment consults before classifying anything: which
+    // transitions followed, of what kind, and what state each
+    // produced. (The REVALIDATE arm does not consume it — it
+    // has its own bound-artifact discipline — but the capture
+    // point is shared, and the read is side-effect free.)
+    const journalWatermark = this.sim.transitionSeq(validated.subscription_id);
+
     let resultingSub: StripeSubscription;
     let mutationInvoice: StripeInvoice | undefined;
     try {
@@ -806,7 +817,7 @@ export class StripeAdapter implements SubscriptionProvider {
       // before a verified receipt is recorded. The establishment
       // itself lives in establishExactOrCancelEffect below and
       // mirrors the REVALIDATE arm's discipline.
-      const established = this.establishExactOrCancelEffect(validated, resultingSub, mutationInvoice);
+      const established = this.establishExactOrCancelEffect(validated, resultingSub, mutationInvoice, journalWatermark);
       committedEffect = established.effect;
       reconciliation = established.reconciliation;
       receiptStatus = established.status;
@@ -888,11 +899,36 @@ export class StripeAdapter implements SubscriptionProvider {
    *    under UNKNOWN determinacy (or, in the attribution case
    *    where the bound invoice IS readable, this commit's own
    *    bound-invoice actuals — never the intervening invoice's).
+   *    Every such receipt whose figures are candidates names
+   *    BOTH undetermined dimensions (correction round R1,
+   *    §3.10/§6.15).
+   *  - attribution broken (correction round R2, §6.15): before
+   *    ANY of the classifications above, the establishment
+   *    consults the simulator's transition journal — its model
+   *    of Stripe's subscription event stream — over the window
+   *    since the pre-dispatch watermark. The observed state is
+   *    attributable to THIS operation only when the window
+   *    holds exactly one transition, of the dispatched kind,
+   *    whose resulting fingerprint equals the verification
+   *    read's fingerprint. An intervening or external
+   *    transition, a missing own transition (a landing that
+   *    never occurred behind a success response), or state that
+   *    has moved past the attributed transition means the
+   *    observed state is NOT this operation's outcome:
+   *    COMMITTED_UNVERIFIED with an UNVERIFIED reconciliation,
+   *    the observed state recorded as context and the figures
+   *    as candidates — never VIOLATED (another actor's state is
+   *    not this operation's determined violation) and never
+   *    VERIFIED/OK (a state this operation did not produce
+   *    cannot verify it). The provider's OWN wrong landing
+   *    keeps the MISMATCH classification above: its transition
+   *    is the operation's, with the wrong fingerprint journaled.
    */
   private establishExactOrCancelEffect(
     validated: StoredQuote,
     mutationSub: StripeSubscription,
-    mutationInvoice: StripeInvoice | undefined
+    mutationInvoice: StripeInvoice | undefined,
+    journalWatermark: number
   ): {
     effect: CommercialEffect;
     reconciliation: ReconciliationResult;
@@ -993,6 +1029,61 @@ export class StripeAdapter implements SubscriptionProvider {
       }
     );
 
+    // Correction round R2 — the attribution gate, evaluated
+    // BEFORE any classification of the observed state (§6.15:
+    // attribution precedes classification; a current-state read
+    // is not an operation-keyed observation — the Chargebee
+    // broken-bracket boundary). The journal window since the
+    // pre-dispatch watermark must contain exactly this
+    // operation's transition — of the dispatched kind — and the
+    // verification read must still sit at that transition's
+    // resulting fingerprint. Anything else (an external or
+    // additional transition, no own transition at all, or a
+    // read that has moved past the attributed transition) means
+    // the observed state was not produced by this operation
+    // alone, and neither a VERIFIED nor a VIOLATED verdict may
+    // be built on it.
+    const dispatchedKind = isCancelCommit ? "cancel" : "update";
+    const transitionsSince = this.sim.listTransitions(subscriptionId, journalWatermark);
+    const ownTransition = transitionsSince.length === 1 ? transitionsSince[0] : undefined;
+    const attributionBroken =
+      ownTransition === undefined ||
+      ownTransition.kind !== dispatchedKind ||
+      ownTransition.resultingFingerprint !== snap.version;
+    if (attributionBroken) {
+      const detail =
+        transitionsSince.length === 0
+          ? "no state transition was recorded for this operation after dispatch — the dispatched operation's " +
+            "landing is absent from the provider's transition journal, so the observed state, whatever produced " +
+            "it, is not established as this operation's outcome"
+          : transitionsSince.length > 1
+            ? `${transitionsSince.length} state transitions followed the dispatch (kinds: ` +
+              `${transitionsSince.map((t) => t.kind).join(", ")}; seqs ${transitionsSince.map((t) => t.seq).join(", ")}) — ` +
+              "an intervening transition moved the subscription past this operation's own landing before the " +
+              "verification read, so the observed state is not this operation's outcome alone"
+            : ownTransition!.kind !== dispatchedKind
+              ? `the only transition recorded after dispatch is an "${ownTransition!.kind}" transition, not this ` +
+                `operation's "${dispatchedKind}" — the observed state was produced by another actor, not by this operation`
+              : "the verification read's fingerprint differs from the fingerprint journaled for this operation's " +
+                "transition — the observed state has moved past the state this operation produced";
+      return {
+        effect: candidateFromResponse(),
+        reconciliation: {
+          status: "UNVERIFIED",
+          reason:
+            "the mutation's response was received and the post-commit state was read back, but the observed " +
+            `state cannot be attributed to THIS operation: ${detail}. The observed state is recorded as ` +
+            "context only, and the recorded figures are the mutation response's candidates, pending a later " +
+            "verification — the state is neither recorded as this operation's verified landing nor as its " +
+            "determined violation",
+          undeterminedDimensions: ["immediateFinancialEffect", "recurringFinancialEffect"],
+        },
+        status: "COMMITTED_UNVERIFIED",
+        outcome: "COMMITTED_UNVERIFIED",
+        snapshot: snap,
+      };
+    }
+
     if (state.verdict === "MISMATCH") {
       let effect: CommercialEffect;
       if (isCancelCommit) {
@@ -1076,7 +1167,13 @@ export class StripeAdapter implements SubscriptionProvider {
             `(unverifiable dimensions: ${state.unverifiableDimensions.join(", ") || "none named"}), so the commit ` +
             "is not reported as verified; the recorded figures are the mutation response's candidates, pending " +
             "a later verification",
-          undeterminedDimensions: [],
+          // Correction round R1 (§3.10/§6.15): the recorded
+          // figures are unestablished candidates in BOTH
+          // dimensions (candidateFromResponse), so both
+          // dimensions must be NAMED as undetermined — this
+          // branch previously returned [], falsely implying
+          // every dimension had been determined.
+          undeterminedDimensions: ["immediateFinancialEffect", "recurringFinancialEffect"],
         },
         status: "COMMITTED_UNVERIFIED",
         outcome: "COMMITTED_UNVERIFIED",

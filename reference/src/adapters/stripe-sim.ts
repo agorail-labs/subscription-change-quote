@@ -129,6 +129,41 @@ export type UpcomingInvoicePreview = {
 /** An invoice object as persisted by `update()` and read back via `retrieveInvoice()`. */
 export type StripeInvoice = UpcomingInvoicePreview & { id: string };
 
+/**
+ * One entry in the simulator's state-transition journal — its
+ * model of Stripe's subscription event stream
+ * (`customer.subscription.updated`): every state transition the
+ * modeled provider applies to a subscription, in order, with
+ * the fingerprint of the state the transition produced.
+ *
+ * `kind` distinguishes the transitions an adapter's own dispatch
+ * makes ("update" / "cancel") from out-of-band changes applied
+ * by other actors (`_debugMutateDirectly` — a webhook, another
+ * system, a dashboard edit), which Stripe would equally surface
+ * as events. The journal is what lets a consumer build an
+ * OPERATION-ATTRIBUTION chain (issue #44 correction round, R2):
+ * a bare current-state read cannot say WHICH operation produced
+ * the observed state; the journal can say which transitions
+ * occurred, in which order, and what state each produced.
+ *
+ * Stated limit: this is the SIMULATOR's model of the event
+ * stream — complete and ordered by construction. A live adapter
+ * would have to bind the provider's real event/artifact stream
+ * with the same discipline; nothing here demonstrates that
+ * binding. The journal never enters `fingerprint()` material
+ * and changes no existing behaviour.
+ */
+export type StripeStateTransition = {
+  /** Monotonically increasing sequence number within this simulator instance. */
+  seq: number;
+  subscriptionId: string;
+  kind: "update" | "cancel" | "external";
+  /** Simulator clock (unix seconds) at the moment the transition was applied. */
+  at: number;
+  /** `fingerprint()` of the persisted state immediately after the transition. */
+  resultingFingerprint: string;
+};
+
 type ProrationBehavior = "create_prorations" | "none" | "always_invoice";
 
 const PRICE_CATALOG: Record<string, StripePrice> = {
@@ -141,6 +176,47 @@ export class StripeSim {
   private subs = new Map<string, StripeSubscription>();
   private invoices = new Map<string, StripeInvoice>();
   private now: number; // unix seconds, mutable so tests can simulate time passing
+
+  // State-transition journal (see StripeStateTransition):
+  // append-only, in application order. Seeding a subscription
+  // records NO entry — it establishes the initial state rather
+  // than transitioning it.
+  private transitions: StripeStateTransition[] = [];
+  private transitionCounter = 0;
+
+  private recordTransition(subscriptionId: string, kind: StripeStateTransition["kind"]): void {
+    this.transitionCounter += 1;
+    this.transitions.push({
+      seq: this.transitionCounter,
+      subscriptionId,
+      kind,
+      at: this.now,
+      resultingFingerprint: this.fingerprint(subscriptionId),
+    });
+  }
+
+  /**
+   * The current journal watermark for a subscription: the `seq`
+   * of its most recent recorded transition, or 0 if none. A
+   * consumer captures this immediately before dispatching an
+   * operation so it can afterwards attribute exactly the
+   * transitions that followed. Read-only.
+   */
+  transitionSeq(subscriptionId: string): number {
+    for (let i = this.transitions.length - 1; i >= 0; i--) {
+      if (this.transitions[i].subscriptionId === subscriptionId) return this.transitions[i].seq;
+    }
+    return 0;
+  }
+
+  /**
+   * The transitions recorded for a subscription after `afterSeq`
+   * (exclusive), in application order. Read-only: entries are
+   * copies, and the journal itself is append-only.
+   */
+  listTransitions(subscriptionId: string, afterSeq = 0): StripeStateTransition[] {
+    return this.transitions.filter((t) => t.subscriptionId === subscriptionId && t.seq > afterSeq).map((t) => ({ ...t }));
+  }
 
   // v0.6.2 (PR-3) fault-injection hooks (migration matrix F-6: the
   // conformance suite needs negative cases the happy-path model
@@ -206,6 +282,11 @@ export class StripeSim {
     const sub = this.subs.get(id);
     if (!sub) throw new StripeSimError("resource_missing", `No such subscription: ${id}`);
     mutator(sub);
+    // An out-of-band change is still a provider-visible
+    // transition: Stripe would surface it on the same event
+    // stream. Journaled as "external" so an operation-attribution
+    // chain can distinguish it from an adapter's own dispatch.
+    this.recordTransition(id, "external");
   }
 
   /**
@@ -323,6 +404,12 @@ export class StripeSim {
       this._debugWrongQuantityOnNextUpdate = undefined;
       this._debugWrongPriceOnNextUpdate = undefined;
     }
+    // Journal the transition with the PERSISTED state's
+    // fingerprint: under a wrong-quantity/price fault the wrong
+    // landing IS this operation's own transition, so the entry
+    // records the wrong fingerprint — attribution must be able
+    // to convict the operation, not just excuse it.
+    this.recordTransition(subscriptionId, "update");
     if (this._debugDropSubscriptionOnNextMutation) {
       this._debugDropSubscriptionOnNextMutation = false;
       this.subs.delete(subscriptionId);
@@ -365,15 +452,29 @@ export class StripeSim {
         sub.cancel_at_period_end = false;
       }
     }
+    let skipReverted = false;
     if (this._debugSkipCancelOnNextCancel) {
       this._debugSkipCancelOnNextCancel = false;
       sub.status = preCancel.status;
       sub.cancel_at_period_end = preCancel.cancel_at_period_end;
       sub.canceled_at = preCancel.canceled_at;
+      skipReverted = true;
     }
     if (this._debugShiftPeriodEndOnNextCancel !== undefined) {
       sub.current_period_end += this._debugShiftPeriodEndOnNextCancel;
       this._debugShiftPeriodEndOnNextCancel = undefined;
+    }
+    // Journal the transition with the PERSISTED state's
+    // fingerprint — including the immediate/shifted wrong
+    // landings, which are this operation's own transitions. The
+    // one exception is the skip fault: it restored the
+    // pre-cancel state, so NO transition occurred for the
+    // skipped effect and nothing is journaled — an attribution
+    // chain must find the operation's transition ABSENT, which
+    // is exactly what distinguishes a no-op landing from a
+    // landed one behind an identical success response.
+    if (!skipReverted) {
+      this.recordTransition(subscriptionId, "cancel");
     }
     if (this._debugDropSubscriptionOnNextMutation) {
       this._debugDropSubscriptionOnNextMutation = false;
