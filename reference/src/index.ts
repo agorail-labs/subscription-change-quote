@@ -1,5 +1,5 @@
 /**
- * Experimental SCQ v0.6.1 reference package entry point.
+ * Experimental SCQ v0.6.2 reference package entry point.
  *
  * The adapters exported here operate on in-memory, provider-shaped simulators.
  * They do NOT connect to production billing providers. A real integration
@@ -39,10 +39,10 @@ export {
 } from "./store/durable-store.js";
 export { DurableMutationCoordinator } from "./store/mutation-coordinator.js";
 export { StripeAdapter } from "./adapters/stripe-adapter.js";
-export { StripeSim } from "./adapters/stripe-sim.js";
+export { StripeSim, type StripePrice, type StripeSubscriptionItem, type StripeSubscription } from "./adapters/stripe-sim.js";
 export { PaddleAdapter } from "./adapters/paddle-adapter.js";
-export { PaddleSim } from "./adapters/paddle-sim.js";
+export { PaddleSim, type PaddlePrice, type PaddleSubscriptionItem, type PaddleSubscription } from "./adapters/paddle-sim.js";
 export { ZuoraAdapter } from "./adapters/zuora-adapter.js";
-export { ZuoraSim } from "./adapters/zuora-sim.js";
+export { ZuoraSim, type ZuoraRatePlanCharge, type ZuoraRatePlan, type ZuoraTermStructure, type ZuoraSubscription } from "./adapters/zuora-sim.js";
 export { ChargebeeAdapter } from "./adapters/chargebee-adapter.js";
-export { ChargebeeSim } from "./adapters/chargebee-sim.js";
+export { ChargebeeSim, type ChargebeeSubscriptionItem, type ChargebeeContractTerm, type ChargebeeSubscription } from "./adapters/chargebee-sim.js";

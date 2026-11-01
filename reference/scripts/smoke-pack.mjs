@@ -28,10 +28,23 @@ try {
   if (pack.length !== 1) throw new Error("Expected one npm tarball.");
   const entry = pack[0];
   const packedFiles = new Set(entry.files.map((file) => file.path));
-  for (const expected of ["dist/src/index.js", "dist/src/index.d.ts", "LICENSE", "README.md", "package.json"]) {
+  for (const expected of [
+    "dist/src/index.js",
+    "dist/src/index.d.ts",
+    "LICENSE",
+    "README.md",
+    "DEVELOPER-GUIDE.md",
+    "examples/scenario-a-verified.mjs",
+    "examples/scenario-b-divergence.mjs",
+    "examples/scenario-c-indeterminate.mjs",
+    "package.json",
+  ]) {
     if (!packedFiles.has(expected)) throw new Error("Missing required packed file: " + expected);
   }
-  const excludedPrefixes = ["dist/tests/", "dist/demo/", "dist/scripts/", "tests/", "demo/", "scripts/"];
+  // dist/src/live/ (the env-gated Chargebee live pilot) must NOT ship:
+  // the published artifact is simulator-only. The exports map already
+  // encapsulates it; the files allowlist now excludes it outright.
+  const excludedPrefixes = ["dist/tests/", "dist/demo/", "dist/scripts/", "dist/src/live/", "tests/", "demo/", "scripts/"];
   for (const file of packedFiles) {
     if (excludedPrefixes.some((prefix) => file.startsWith(prefix)) ||
         (file.endsWith(".ts") && !file.endsWith(".d.ts"))) {
@@ -73,6 +86,19 @@ void provider; void proposed; void maybeReceipt; void SCQError;`;
     join(consumerDir, "check.mts"),
   ], consumerDir);
   console.log("External TypeScript consumer: OK");
+
+  // Run the shipped quick-start scenarios A and B from the INSTALLED
+  // copy (in-memory only: they must pass even though this consumer
+  // installed with --ignore-scripts, i.e. without a better-sqlite3
+  // native binding — proof the simulator paths never load it).
+  // Scenario C's durable segment needs the native binding and is
+  // covered by the full clean-room procedure in
+  // docs/PACKAGE-RELEASE-READINESS.md, not by this offline smoke.
+  const installedExamples = join(consumerDir, "node_modules", ...name.split("/"), "examples");
+  for (const scenario of ["scenario-a-verified.mjs", "scenario-b-divergence.mjs"]) {
+    run(process.execPath, [join(installedExamples, scenario)], consumerDir);
+    console.log("Installed example " + scenario + ": OK");
+  }
   console.log("Tarball packaging smoke test: OK (nothing published)");
 } finally {
   rmSync(dir, { recursive: true, force: true });

@@ -1,23 +1,123 @@
-# @arjun2075/scq-reference — experimental reference package
+# @agorail-labs/scq-reference — experimental reference package
 
-This is a **simulation-only developer preview** of the Subscription Change Quote (SCQ) v0.6.1 contract. The package version (0.1.0) is separate from the protocol version (0.6.1).
+> **Experimental — not published on npm, not for production billing.**
+> This package is a simulator-backed reference implementation of the
+> Subscription Change Quote (SCQ) protocol. It carries `private: true`
+> and exists so developers can install it from a locally built tarball
+> and evaluate the protocol's behavior. Nothing in it is certified
+> provider conformance, and it is not a replacement billing API or a
+> production payment SDK.
 
-**Not published on npm. Not certified for production billing.** The four adapters are backed by in-memory Stripe-, Paddle-, Zuora-, and Chargebee-shaped simulators, not provider API SDKs.
+This package implements the **published SCQ v0.6.2 experimental
+specification** (`spec/scq-v0.6.2-spec.md` in the repository). The
+specification and this package are separate artifacts: the spec's
+publication did not approve this package for release, and this
+package's version (`0.6.2-experimental.1`) tracks the spec version it
+implements plus an experimental build suffix — it is not a stability
+promise.
 
-To produce and test a local package from this repository:
+## What it does
+
+SCQ models a subscription change as a **quote** (a priced, bounded,
+expiring proposal), an explicit **approval** decision by the
+integrator, and a **commit** whose result is a **receipt** that
+reports — from operation-bound evidence — whether the landed change
+matches what was authorized:
+
+- `VERIFIED` / reconciliation `OK` — the committed effect is
+  established and agrees with the quote.
+- `VIOLATED` — the landed effect is established, attributable, and
+  **wrong** (outside the authorized envelope or state).
+- `UNVERIFIED` — the effect cannot be attributed to this operation
+  (for example, a third-party change broke the validation bracket);
+  figures may be retained only as non-establishing candidates.
+- `INDETERMINATE` — the mutation's outcome is unknown (for example,
+  its response was lost). Retrying is refused; reconciliation must be
+  by independent observation.
+
+Financial figures carry explicit **determinacy**: `DETERMINED` (an
+established value, possibly a verified zero), `NOT_APPLICABLE`
+(licensed by the spec's applicability table), or `UNKNOWN` (no
+established value — never a synonym for zero).
+
+## Install (from a locally built tarball)
+
+This package is not on npm. Build the artifact from the repository
+and install the tarball into your own project:
 
 ```bash
-cd reference
+git clone https://github.com/agorail-labs/subscription-change-quote
+cd subscription-change-quote/reference
 npm ci
-npm run smoke:pack
+npm pack            # produces agorail-labs-scq-reference-0.6.2-experimental.1.tgz
+
+cd /path/to/your/project
+npm install /path/to/agorail-labs-scq-reference-0.6.2-experimental.1.tgz
 ```
 
-The smoke test builds the package, creates a local tarball, installs it into an isolated temporary consumer directory in offline mode, imports the public entry point, and type-checks it with TypeScript.
+Requires Node.js 20 or newer. The optional `better-sqlite3`
+dependency is needed only for the durable (SQLite) store; the
+in-memory simulator paths never load it, and if its native binding is
+unavailable the durable store fails with an explicit message rather
+than degrading silently.
 
-The public package entry point exposes `SubscriptionProvider`, proposal/quote/receipt types, `SCQError`, `QuoteStore`, and simulator-backed reference adapters. It is intended for experimentation and independent adapter development. For the complete protocol and evidence levels, see the [repository](https://github.com/arjun2075/subscription-change-quote) and [evidence register](https://github.com/arjun2075/subscription-change-quote/blob/main/research/EVIDENCE.md).
+## Quick start
 
-**Security and consent:** An SCQ `acceptanceEnvelope` permits quote-relative variation; it is not a total spending limit or authorization grant. Real integrations must perform independent identity, approval, absolute budget and contractual/entitlement checks. All simulated adapters report best-effort precondition/commit concurrency; no atomic provider compare-and-swap guarantee is implied.
+Three runnable scenarios ship in `examples/` (simulator only):
 
-**Idempotency and durability:** SCQ's rule that a repeated commit returns the original receipt without a second mutation (§6.10) presumes durable persistence of the quote, its request identity, its outcome, and its receipt, plus reconciliation of provider state after an indeterminate outcome. The `QuoteStore` shipped here is an in-memory `Map`: it does **not** establish that guarantee across process crashes (after a restart it can only fail closed). Provider-native idempotency is not indefinite either — Chargebee's documented native idempotency window is 30 minutes. See `spec/ERRATA-v0.6.1.md` ER-4.
+```bash
+node node_modules/@agorail-labs/scq-reference/examples/scenario-a-verified.mjs
+node node_modules/@agorail-labs/scq-reference/examples/scenario-b-divergence.mjs
+node node_modules/@agorail-labs/scq-reference/examples/scenario-c-indeterminate.mjs
+```
 
-The npm package remains `private: true` and is not published to a registry. It can be built and tested locally as a simulator-backed reference package. Apache-2.0 licensed.
+- **A** — an authorized change that commits and verifies.
+- **B** — divergence: a provably wrong landing (`VIOLATED`) versus an
+  unattributable one (`UNVERIFIED`), and why the difference matters.
+- **C** — a lost mutation response (`INDETERMINATE`): no blind retry,
+  reconciliation by observation, and durable receipt replay after a
+  restart.
+
+See `DEVELOPER-GUIDE.md` (included in this package) for concepts,
+JavaScript and TypeScript examples, receipt interpretation, and the
+limits below in full.
+
+## Hard limits
+
+- **Simulator only.** The exported adapters run against in-memory
+  Stripe-, Paddle-, Zuora-, and Chargebee-shaped simulators. They do
+  not connect to any real provider. The env-gated live Chargebee
+  pilot code is **excluded from this artifact** and remains
+  repository-only; live commit functionality is disabled by design
+  and no real-provider guarantee of any kind is offered or implied.
+- **Best-effort concurrency.** All simulated adapters report
+  best-effort precondition/commit consistency; no atomic provider
+  compare-and-swap guarantee is implied.
+- **The acceptance envelope is not authorization.** An SCQ
+  `acceptanceEnvelope` permits quote-relative drift; it is not a
+  total spending limit or an authorization grant. Real integrations
+  must independently perform identity, approval, absolute-budget, and
+  contractual/entitlement checks.
+- **Determinacy is only as strong as its provenance.** Established
+  figures rest on adapter-produced evidence; the core trusts the
+  adapter's classification and does not independently authenticate
+  provider events (spec section 6.15, register item G-01). Candidate
+  figures come only from the mutating call's own response (spec
+  section 3.10) and establish nothing by themselves.
+- **Durability has preconditions.** The section 6.10 rule that a
+  repeated commit returns the original receipt without a second
+  mutation presumes durable persistence (use `DurableQuoteStore`)
+  plus reconciliation of provider state after an indeterminate
+  outcome. The in-memory `QuoteStore` cannot establish that guarantee
+  across process crashes; after a restart it can only fail closed.
+  Provider-native idempotency is not indefinite either — Chargebee's
+  documented native idempotency window is 30 minutes (see
+  `spec/ERRATA-v0.6.1.md` ER-4 in the repository).
+
+## Support and security
+
+This is an experimental artifact maintained on a best-effort basis.
+Report issues at
+https://github.com/agorail-labs/subscription-change-quote/issues and
+see the repository's `SECURITY.md` and `SUPPORT.md`. Apache-2.0
+licensed.
