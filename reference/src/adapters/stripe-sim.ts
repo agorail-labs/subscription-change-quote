@@ -89,6 +89,26 @@ export type StripeSubscription = {
    * lifecycle is out of scope for this model).
    */
   customer_balance?: number;
+  /**
+   * Issue #44 (R2′): the unique identity of the individual
+   * mutation operation whose application produced this artifact —
+   * present ONLY on the object RETURNED by `update()`/`cancel()`
+   * when that call actually applied a state transition, and equal
+   * to the `operationId` journaled for that transition. It is the
+   * simulator's model of an operation-bound result artifact: the
+   * means by which a caller binds "the state my operation
+   * produced" to the specific call it dispatched, rather than to
+   * any operation of the same kind.
+   *
+   * It is NEVER persisted into the stored subscription record
+   * (`seedSubscription` strips it; `retrieve()` clones the stored
+   * record, which never carries it) and NEVER enters
+   * `fingerprint()` material. A response whose operation applied
+   * no transition (a fault-skipped update/cancel) carries NO
+   * identity — that absence is itself the signal that the call
+   * landed nothing.
+   */
+  operationId?: string;
 };
 
 export type UpcomingInvoicePreview = {
@@ -129,6 +149,58 @@ export type UpcomingInvoicePreview = {
 /** An invoice object as persisted by `update()` and read back via `retrieveInvoice()`. */
 export type StripeInvoice = UpcomingInvoicePreview & { id: string };
 
+/**
+ * One entry in the simulator's state-transition journal — its
+ * model of Stripe's subscription event stream
+ * (`customer.subscription.updated`): every state transition the
+ * modeled provider applies to a subscription, in order, with
+ * the fingerprint of the state the transition produced.
+ *
+ * `kind` distinguishes the transitions an adapter's own dispatch
+ * makes ("update" / "cancel") from out-of-band changes applied
+ * by other actors (`_debugMutateDirectly` — a webhook, another
+ * system, a dashboard edit), which Stripe would equally surface
+ * as events. The journal is what lets a consumer build an
+ * OPERATION-ATTRIBUTION chain (issue #44 correction round, R2):
+ * a bare current-state read cannot say WHICH operation produced
+ * the observed state; the journal can say which transitions
+ * occurred, in which order, and what state each produced.
+ *
+ * `operationId` (R2′ follow-up) binds an entry to the INDIVIDUAL
+ * operation that applied it: `kind` alone cannot distinguish
+ * this caller's dispatch from another actor's ordinary call of
+ * the same public method, so each `update()`/`cancel()`
+ * application mints a unique identity, journals it here, and
+ * stamps it on the response artifact it returns. "external"
+ * entries carry no operationId — they were not applied by a
+ * mutation call whose response any consumer holds.
+ *
+ * Stated limit: this is the SIMULATOR's model of the event
+ * stream — complete and ordered by construction. A live adapter
+ * would have to bind the provider's real event/artifact stream
+ * with the same discipline; nothing here demonstrates that
+ * binding. The journal never enters `fingerprint()` material
+ * and changes no existing behaviour.
+ */
+export type StripeStateTransition = {
+  /** Monotonically increasing sequence number within this simulator instance. */
+  seq: number;
+  subscriptionId: string;
+  kind: "update" | "cancel" | "external";
+  /** Simulator clock (unix seconds) at the moment the transition was applied. */
+  at: number;
+  /** `fingerprint()` of the persisted state immediately after the transition. */
+  resultingFingerprint: string;
+  /**
+   * The unique identity of the individual operation that applied
+   * this transition (`op_<n>`, minted per `update()`/`cancel()`
+   * application within this simulator instance) — the same value
+   * stamped on that call's returned subscription artifact.
+   * Absent on "external" entries (see the type doc above).
+   */
+  operationId?: string;
+};
+
 type ProrationBehavior = "create_prorations" | "none" | "always_invoice";
 
 const PRICE_CATALOG: Record<string, StripePrice> = {
@@ -142,6 +214,60 @@ export class StripeSim {
   private invoices = new Map<string, StripeInvoice>();
   private now: number; // unix seconds, mutable so tests can simulate time passing
 
+  // State-transition journal (see StripeStateTransition):
+  // append-only, in application order. Seeding a subscription
+  // records NO entry — it establishes the initial state rather
+  // than transitioning it.
+  private transitions: StripeStateTransition[] = [];
+  private transitionCounter = 0;
+
+  // Per-operation identities (R2′): a sim-wide monotonic counter,
+  // minted once per update()/cancel() APPLICATION. Deterministic
+  // by design — tests and attribution chains can reason about
+  // exactly which call an identity belongs to from the response
+  // that carries it, never from the counter's value.
+  private operationCounter = 0;
+
+  private mintOperationId(): string {
+    this.operationCounter += 1;
+    return `op_${this.operationCounter}`;
+  }
+
+  private recordTransition(subscriptionId: string, kind: StripeStateTransition["kind"], operationId?: string): void {
+    this.transitionCounter += 1;
+    this.transitions.push({
+      seq: this.transitionCounter,
+      subscriptionId,
+      kind,
+      at: this.now,
+      resultingFingerprint: this.fingerprint(subscriptionId),
+      ...(operationId !== undefined ? { operationId } : {}),
+    });
+  }
+
+  /**
+   * The current journal watermark for a subscription: the `seq`
+   * of its most recent recorded transition, or 0 if none. A
+   * consumer captures this immediately before dispatching an
+   * operation so it can afterwards attribute exactly the
+   * transitions that followed. Read-only.
+   */
+  transitionSeq(subscriptionId: string): number {
+    for (let i = this.transitions.length - 1; i >= 0; i--) {
+      if (this.transitions[i].subscriptionId === subscriptionId) return this.transitions[i].seq;
+    }
+    return 0;
+  }
+
+  /**
+   * The transitions recorded for a subscription after `afterSeq`
+   * (exclusive), in application order. Read-only: entries are
+   * copies, and the journal itself is append-only.
+   */
+  listTransitions(subscriptionId: string, afterSeq = 0): StripeStateTransition[] {
+    return this.transitions.filter((t) => t.subscriptionId === subscriptionId && t.seq > afterSeq).map((t) => ({ ...t }));
+  }
+
   // v0.6.2 (PR-3) fault-injection hooks (migration matrix F-6: the
   // conformance suite needs negative cases the happy-path model
   // cannot produce). All default off; tests set them explicitly.
@@ -151,6 +277,34 @@ export class StripeSim {
   _debugFailInvoiceReads = false;
   /** When true, the next `update()` fully applies the mutation and persists its invoice, then throws an `api_connection_error` — a response lost AFTER the mutation landed. One-shot: the flag clears itself. */
   _debugLoseNextUpdateResponse = false;
+
+  // Issue #44 (G-21 item 1) misexecution faults — modelled on the
+  // Chargebee simulator's wrong-state hooks. Each is opt-in and
+  // ONE-SHOT. The shared shape: the mutation's RESPONSE still
+  // reports the requested state (the returned subscription is the
+  // artifact as requested), while the PERSISTED record diverges —
+  // a provider that applied the wrong change but answered as if it
+  // had applied the right one. The fault alters persisted state
+  // only; it never touches the adapter, never injects a verdict,
+  // and the generated invoice keeps the figures computed for the
+  // dispatched request (what the provider charged for the call it
+  // received — the state, not the billing, is what diverged).
+  /** Next `update()` persists THIS quantity for its id-matched mutated item(s) instead of the requested quantity. */
+  _debugWrongQuantityOnNextUpdate: number | undefined = undefined;
+  /** Next `update()` persists THIS price id for its id-matched mutated item(s) instead of the requested price. */
+  _debugWrongPriceOnNextUpdate: string | undefined = undefined;
+  /** Next TERM_END `cancel()` lands as an IMMEDIATE cancellation instead (persisted status canceled, no schedule), while the returned subscription reports the requested schedule. One-shot. */
+  _debugCancelImmediatelyOnNextCancel = false;
+  /** Next `cancel()` returns success reporting the requested cancellation but persists NO cancellation at all (status stays active, no schedule). One-shot. */
+  _debugSkipCancelOnNextCancel = false;
+  /** Next `update()` returns success reporting the requested change (artifact + generated invoice) but persists NO change at all — the persisted record is restored to its pre-update state and, as with a skipped cancel, NO transition is journaled for the skipped effect. One-shot. Mirrors `_debugSkipCancelOnNextCancel` for the update path (issue #44, R2′). */
+  _debugSkipUpdateOnNextUpdate = false;
+  /** Next `cancel()` persists `current_period_end` shifted by this many seconds — a TERM_END schedule whose effective date is not the authorized term boundary. One-shot. */
+  _debugShiftPeriodEndOnNextCancel: number | undefined = undefined;
+  /** Next mutation (`update()` or `cancel()`) lands and returns its artifact, then the persisted subscription record is REMOVED — post-mutation state is missing to any later read. One-shot. */
+  _debugDropSubscriptionOnNextMutation = false;
+  /** When true, the next `cancel()` fully applies the cancellation, then throws an `api_connection_error` — a response lost AFTER the cancellation landed. One-shot: the flag clears itself. */
+  _debugLoseNextCancelResponse = false;
 
   constructor(nowUnixSeconds = Math.floor(Date.now() / 1000)) {
     this.now = nowUnixSeconds;
@@ -165,7 +319,12 @@ export class StripeSim {
   }
 
   seedSubscription(sub: StripeSubscription): void {
-    this.subs.set(sub.id, sub);
+    // The stored record never carries an operation identity: the
+    // stamp belongs to a mutation call's response artifact only
+    // (see StripeSubscription.operationId). Strip it defensively
+    // so a returned artifact seeded back cannot smuggle one in.
+    const { operationId: _stripped, ...record } = sub;
+    this.subs.set(sub.id, record);
   }
 
   retrieve(id: string): StripeSubscription {
@@ -180,6 +339,11 @@ export class StripeSim {
     const sub = this.subs.get(id);
     if (!sub) throw new StripeSimError("resource_missing", `No such subscription: ${id}`);
     mutator(sub);
+    // An out-of-band change is still a provider-visible
+    // transition: Stripe would surface it on the same event
+    // stream. Journaled as "external" so an operation-attribution
+    // chain can distinguish it from an adapter's own dispatch.
+    this.recordTransition(id, "external");
   }
 
   /**
@@ -254,6 +418,11 @@ export class StripeSim {
 
     const invoice = this.computeInvoice(sub, proposedItems, prorationBehavior, prorationDate);
 
+    // Issue #44 (R2′): snapshot the persisted record before any
+    // application so the skip-update fault below can restore it
+    // wholesale — a skipped update persists nothing at all.
+    const preUpdate = structuredClone(sub);
+
     // Apply item changes.
     for (const proposed of proposedItems) {
       if (proposed.id) {
@@ -278,6 +447,61 @@ export class StripeSim {
     this.invoices.set(invoiceId, structuredClone(generated));
     sub.latest_invoice = invoiceId;
 
+    // Issue #44 misexecution faults: the returned artifact is the
+    // subscription AS REQUESTED (captured before the fault is
+    // applied); the persisted record then diverges. With no fault
+    // armed this is exactly the historical return value.
+    const artifact = structuredClone(sub);
+    if (this._debugWrongQuantityOnNextUpdate !== undefined || this._debugWrongPriceOnNextUpdate !== undefined) {
+      for (const proposed of proposedItems) {
+        if (!proposed.id) continue;
+        const persisted = sub.items.find((i) => i.id === proposed.id);
+        if (!persisted) continue;
+        if (this._debugWrongQuantityOnNextUpdate !== undefined) persisted.quantity = this._debugWrongQuantityOnNextUpdate;
+        if (this._debugWrongPriceOnNextUpdate !== undefined) {
+          const wrongPrice = PRICE_CATALOG[this._debugWrongPriceOnNextUpdate];
+          if (wrongPrice) persisted.price = wrongPrice;
+        }
+      }
+      this._debugWrongQuantityOnNextUpdate = undefined;
+      this._debugWrongPriceOnNextUpdate = undefined;
+    }
+    // Issue #44 (R2′) skip fault: the response above (artifact +
+    // generated invoice) reports the requested change, but the
+    // persisted record is restored to its pre-update state and
+    // NO transition is journaled — exactly as a skipped cancel
+    // journals nothing. The generated invoice remains readable
+    // by id: it is part of the response artifact the caller
+    // received, and its existence must not be mistaken for a
+    // landed state change.
+    let skipReverted = false;
+    if (this._debugSkipUpdateOnNextUpdate) {
+      this._debugSkipUpdateOnNextUpdate = false;
+      this.subs.set(subscriptionId, preUpdate);
+      skipReverted = true;
+    }
+    // Journal the transition with the PERSISTED state's
+    // fingerprint: under a wrong-quantity/price fault the wrong
+    // landing IS this operation's own transition, so the entry
+    // records the wrong fingerprint — attribution must be able
+    // to convict the operation, not just excuse it. The entry
+    // carries this call's freshly minted operation identity
+    // (R2′), and the SAME identity is stamped on the returned
+    // artifact only — never on the persisted record — so the
+    // caller can bind the journal entry to the exact call it
+    // dispatched. A skipped update reaches neither: it applied
+    // no transition, so there is no identity for its response
+    // to carry.
+    if (!skipReverted) {
+      const operationId = this.mintOperationId();
+      this.recordTransition(subscriptionId, "update", operationId);
+      artifact.operationId = operationId;
+    }
+    if (this._debugDropSubscriptionOnNextMutation) {
+      this._debugDropSubscriptionOnNextMutation = false;
+      this.subs.delete(subscriptionId);
+    }
+
     if (this._debugLoseNextUpdateResponse) {
       // Fault injection: everything above HAS landed (items applied,
       // invoice persisted) — only the response is lost. The caller
@@ -290,19 +514,76 @@ export class StripeSim {
       );
     }
 
-    return { subscription: structuredClone(sub), invoice: generated };
+    return { subscription: artifact, invoice: generated };
   }
 
   cancel(subscriptionId: string, atPeriodEnd: boolean): StripeSubscription {
     const sub = this.subs.get(subscriptionId);
     if (!sub) throw new StripeSimError("resource_missing", `No such subscription: ${subscriptionId}`);
+    const preCancel = { status: sub.status, cancel_at_period_end: sub.cancel_at_period_end, canceled_at: sub.canceled_at };
     if (atPeriodEnd) {
       sub.cancel_at_period_end = true;
     } else {
       sub.status = "canceled";
       sub.canceled_at = this.now;
     }
-    return structuredClone(sub);
+    // Issue #44 misexecution faults: as in update(), the returned
+    // artifact reports the requested cancellation; the persisted
+    // record diverges per the armed fault.
+    const artifact = structuredClone(sub);
+    if (this._debugCancelImmediatelyOnNextCancel) {
+      this._debugCancelImmediatelyOnNextCancel = false;
+      if (atPeriodEnd) {
+        sub.status = "canceled";
+        sub.canceled_at = this.now;
+        sub.cancel_at_period_end = false;
+      }
+    }
+    let skipReverted = false;
+    if (this._debugSkipCancelOnNextCancel) {
+      this._debugSkipCancelOnNextCancel = false;
+      sub.status = preCancel.status;
+      sub.cancel_at_period_end = preCancel.cancel_at_period_end;
+      sub.canceled_at = preCancel.canceled_at;
+      skipReverted = true;
+    }
+    if (this._debugShiftPeriodEndOnNextCancel !== undefined) {
+      sub.current_period_end += this._debugShiftPeriodEndOnNextCancel;
+      this._debugShiftPeriodEndOnNextCancel = undefined;
+    }
+    // Journal the transition with the PERSISTED state's
+    // fingerprint — including the immediate/shifted wrong
+    // landings, which are this operation's own transitions. The
+    // one exception is the skip fault: it restored the
+    // pre-cancel state, so NO transition occurred for the
+    // skipped effect and nothing is journaled — an attribution
+    // chain must find the operation's transition ABSENT, which
+    // is exactly what distinguishes a no-op landing from a
+    // landed one behind an identical success response. As in
+    // update(), the journaled entry carries this call's minted
+    // operation identity (R2′) and the returned artifact is
+    // stamped with the same value; a skipped cancel's artifact
+    // carries none.
+    if (!skipReverted) {
+      const operationId = this.mintOperationId();
+      this.recordTransition(subscriptionId, "cancel", operationId);
+      artifact.operationId = operationId;
+    }
+    if (this._debugDropSubscriptionOnNextMutation) {
+      this._debugDropSubscriptionOnNextMutation = false;
+      this.subs.delete(subscriptionId);
+    }
+    if (this._debugLoseNextCancelResponse) {
+      // Fault injection: the cancellation HAS landed (or diverged,
+      // if a misexecution fault above was also armed) — only the
+      // response is lost.
+      this._debugLoseNextCancelResponse = false;
+      throw new StripeSimError(
+        "api_connection_error",
+        "Simulated lost response: the cancellation was applied but its response never reached the caller (fault injection)"
+      );
+    }
+    return artifact;
   }
 
   /**
