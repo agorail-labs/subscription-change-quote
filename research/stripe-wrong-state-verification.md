@@ -188,13 +188,16 @@ arm's `establishCommittedEffect`):
 
 ## 6. Validation (Phase 4)
 
-- Full suite: **875/875 on Node v22.14.0** and **875/875 on Node
+- Full suite: **861/861 on Node v22.14.0** and **861/861 on Node
   v20.19.5** (better-sqlite3 rebuilt per Node version; Node 22 binding
-  restored last, suite re-run 875/875). Composition: 843 at the
-  original PR head; PR #53's merge brought the integrated baseline
-  to 871 (including main's own test60-i46 suite — the Stripe suite
-  renumbered test60 → test61 to avoid the identifier collision);
-  the correction round (§8) adds tests 61.14–61.17 for 875.
+  restored last, suite re-run 861/861; all final runs from a clean
+  `dist/`). Composition, each figure measured on its own tree: 829
+  at the original baseline (`b00e74b`); main at `e2a44f2` is 843
+  (PR #53 added 14); the original PR head was 843 (829 + this
+  suite's 14); the integrated baseline is 857 (843 + this suite's
+  14, renumbered test60 → test61 to avoid the identifier collision
+  with main's own test60-i46 suite); the correction round (§8)
+  adds tests 61.14–61.17 for 861.
 - test61: **18/18**. Existing Stripe regressions (test17 incl. 17.12,
   test4, test12, test35, test49, test54) all pass unmodified, as does
   the REVALIDATE arm's pinned concurrent-write discipline
@@ -245,8 +248,8 @@ in review and added its own `test60` suite on main. The branch
 merged `origin/main` (`e2a44f2`; merge commit, no rebase — the PR
 carries review history) and this suite renumbered
 **test60 → test61** (file, test names, traceability and this
-note). Integrated baseline before the R1/R2 work: **871 tests,
-all passing** (843 at the original head + PR #53's 28).
+note). Integrated baseline before the R1/R2 work: **857 tests,
+all passing** (main's 843 + this suite's 14).
 
 **R1 — UNVERIFIABLE receipts must name the undetermined
 dimensions (§3.10/§6.15).** The state-UNVERIFIABLE branch of
@@ -328,6 +331,19 @@ Validation for this round: failing-first record
 `P1-52-R12-FAILING-FIRST` (test61 vs the integrated unfixed
 code: 18 tests, 13 pass / 5 fail — 61.5 and 61.14 for R1;
 61.15–61.17 for R2); after the fix, test61 **18/18** and the
-full suite **875/875 on Node v22.14.0 and v20.19.5**, all runs
+full suite **861/861 on Node v22.14.0 and v20.19.5**, all runs
 against the committed tree. Freeze footprint empty; neutrality
 OK. All results SIMULATED_PASS.
+
+**Count-integrity note.** This round's first full-suite runs
+read 871 (integrated) and 875 (final): the worktree's `dist/`
+still held the pre-rename compiled `test60` suite alongside
+`test61`, so the Stripe suite ran twice under two names. `dist/`
+is gitignored build output — the committed tree was never
+affected, and CI (clean checkout) never saw the phantom suite.
+The discrepancy was caught by measuring each baseline tree
+separately (829 / 843 / 843 / 857) before anything was posted;
+the binding figures above are from clean-`dist/` rebuilds of
+the committed tree. Lesson recorded with the original delivery's
+slip: validate the committed tree *as a clean checkout*, not
+the worktree.
