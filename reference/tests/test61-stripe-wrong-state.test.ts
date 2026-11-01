@@ -2,6 +2,7 @@ import { test } from "node:test";
 import assert from "node:assert/strict";
 import { QuoteStore } from "../src/store/quote-store.js";
 import { StripeAdapter } from "../src/adapters/stripe-adapter.js";
+import { StripeSim, type StripeSubscription } from "../src/adapters/stripe-sim.js";
 import { determinacyOf } from "../src/core/scq-engine.js";
 import { SCQError } from "../src/core/types.js";
 import { freshStripeFixture } from "./fixtures.js";
@@ -47,6 +48,20 @@ import { freshStripeFixture } from "./fixtures.js";
 //     backed by an independently verified STATE. The G-01 trust
 //     limitation stands: none of this authenticates provider
 //     origin.
+//
+// Correction round (PR #52 review, R1/R2): a current-state read
+// is not an operation-keyed observation. Tests 61.14–61.17 pin
+// the two refinements: (R1) every UNVERIFIED receipt whose
+// figures are unestablished candidates names BOTH undetermined
+// dimensions (§3.10/§6.15) — including the state-UNVERIFIABLE
+// branch, which returned []; and (R2) classification is gated on
+// an operation-attribution chain built from the simulator's
+// transition journal (its model of Stripe's subscription event
+// stream): an intervening transition, a missing own transition,
+// or state moved past the attributed transition downgrades the
+// commit to COMMITTED_UNVERIFIED / UNVERIFIED with the observed
+// state as context — never VIOLATED, never VERIFIED/OK — while
+// the provider's OWN wrong landing (61.1–61.4) stays VIOLATED.
 
 const GENEROUS_ENVELOPE = {
   maxImmediateNetIncrease: 1_000_000,
@@ -182,6 +197,11 @@ test("Test 61.5: TERM_END CANCEL whose schedule never lands is COMMITTED_UNVERIF
   assert.equal(persisted.cancel_at_period_end, false, "no cancellation was persisted behind the success response");
   assert.equal(receipt.outcome, "COMMITTED_UNVERIFIED", "the response was received (landing of the CALL is established) but the intended state is not observed and cannot be verified");
   assert.equal(receipt.reconciliation.status, "UNVERIFIED", "an absent schedule is UNVERIFIABLE under §6.12 — never OK, and not an established contradiction either");
+  assert.deepEqual(
+    receipt.reconciliation.undeterminedDimensions,
+    ["immediateFinancialEffect", "recurringFinancialEffect"],
+    "R1 (§3.10/§6.15): the recorded figures are unestablished candidates in BOTH dimensions, so the UNVERIFIED reconciliation must NAME both undetermined dimensions — an empty list falsely implies every dimension was determined"
+  );
 });
 
 test("Test 61.6: EXACT update whose post-mutation state is MISSING is COMMITTED_UNVERIFIED with unestablished candidates", async () => {
@@ -304,6 +324,171 @@ test("Test 61.13 (boundary pin): EXACT-mode UPDATE quotes are refused at quote c
       }),
     (err: unknown) => err instanceof SCQError && err.code === "UNSUPPORTED_CHANGE" && /termEffect/.test(err.message)
   );
+});
+
+test("Test 61.14 (R1): EXACT update whose landed state is UNVERIFIABLE names BOTH undetermined dimensions", async () => {
+  // The shape used: the persisted subscription carries an item
+  // entry with NO identifier alongside the target item. Under
+  // §6.12 (SV3/SV5) an unidentifiable observed entry could be a
+  // contradictory duplicate of the target, so the item dimension
+  // is UNVERIFIABLE even though the identified entry agrees with
+  // intent and the update itself landed exactly as authorized.
+  // (Test 61.6's missing-state shape takes the missing-read
+  // branch instead, which already names both dimensions; this
+  // case is constructed to flow through the state-UNVERIFIABLE
+  // branch itself.) The entry is part of the seeded state — no
+  // third party intervenes, so this is not an attribution case.
+  const nowSec = Math.floor(new Date("2026-08-01T00:00:00Z").getTime() / 1000);
+  const sim = new StripeSim(nowSec);
+  const sub: StripeSubscription = {
+    id: "sub_test1",
+    status: "active",
+    items: [
+      { id: "si_1", price: { id: "price_seat_basic", unitAmount: 1000, currency: "usd", interval: "month" }, quantity: 100 },
+      { id: "", price: { id: "price_seat_basic", unitAmount: 1000, currency: "usd", interval: "month" }, quantity: 5 },
+    ],
+    current_period_start: nowSec,
+    current_period_end: nowSec + 30 * 24 * 3600,
+    cancel_at_period_end: false,
+  };
+  sim.seedSubscription(sub);
+  const store = new QuoteStore();
+  const adapter = new StripeAdapter(sim, store);
+  const quoteId = await exactQuantityQuote(adapter, store, sub.id, 120);
+  const receipt = await adapter.commitChangeQuote(quoteId);
+  assert.equal(sim.retrieve(sub.id).items[0].quantity, 120, "the update landed as authorized — only its verifiability is in question");
+  assert.equal(receipt.outcome, "COMMITTED_UNVERIFIED", "an UNVERIFIABLE landed state is not a verified commit");
+  assert.equal(receipt.reconciliation.status, "UNVERIFIED");
+  assert.equal(receipt.committedEffect.provenance?.committedSource, "unestablished", "the recorded figures are candidates, not established actuals");
+  assert.deepEqual(determinacyOf(receipt.committedEffect), {
+    immediateFinancialEffect: "UNKNOWN",
+    recurringFinancialEffect: "UNKNOWN",
+  });
+  assert.deepEqual(
+    receipt.reconciliation.undeterminedDimensions,
+    ["immediateFinancialEffect", "recurringFinancialEffect"],
+    "R1 (§3.10/§6.15): both dimensions are unestablished candidates, so both must be NAMED as undetermined — the UNVERIFIABLE branch returned [] before the correction"
+  );
+});
+
+test("Test 61.15 (R2/S1): a third party rewriting the schedule between dispatch and verification breaks attribution — UNVERIFIED, never VIOLATED", async () => {
+  // The cancel dispatches and correctly schedules TERM_END. A
+  // third party then rewrites the schedule (wrapper interposition
+  // on the sim's cancel: after the real cancel returns, before
+  // the adapter's verification read). The observed state
+  // contradicts intent — but it is the THIRD PARTY's state, not
+  // this operation's landing, so it cannot be recorded as this
+  // operation's verified violation (the Chargebee broken-bracket
+  // boundary, §6.15: attribution precedes classification).
+  const nowSec = Math.floor(new Date("2026-08-01T00:00:00Z").getTime() / 1000);
+  class InterposingSim extends StripeSim {
+    private interposed = false;
+    override cancel(id: string, atPeriodEnd: boolean): StripeSubscription {
+      const result = super.cancel(id, atPeriodEnd);
+      if (!this.interposed) {
+        this.interposed = true;
+        this._debugMutateDirectly(id, (s) => {
+          s.current_period_end += 7 * 24 * 3600;
+        });
+      }
+      return result;
+    }
+  }
+  const sim = new InterposingSim(nowSec);
+  const { sub } = freshStripeFixture();
+  sim.seedSubscription(structuredClone(sub));
+  const adapter = new StripeAdapter(sim, new QuoteStore());
+  const quote = await termEndCancelQuote(adapter, sub.id);
+  const receipt = await adapter.commitChangeQuote(quote.id);
+  const persisted = sim.retrieve(sub.id);
+  assert.equal(persisted.cancel_at_period_end, true, "a schedule is persisted");
+  assert.equal(persisted.current_period_end, sub.current_period_end + 7 * 24 * 3600, "but the observed schedule is the third party's rewrite, not what this operation landed");
+  assert.equal(receipt.outcome, "COMMITTED_UNVERIFIED", "the observed state cannot be attributed to this operation, so its landing is not established as verified — in either direction");
+  assert.equal(receipt.reconciliation.status, "UNVERIFIED", "never VIOLATED: a state this operation did not produce is not its determined violation");
+  assert.equal(receipt.committedEffect.provenance?.committedSource, "unestablished", "no figures are recorded as this operation's determined actuals");
+  assert.deepEqual(determinacyOf(receipt.committedEffect), {
+    immediateFinancialEffect: "UNKNOWN",
+    recurringFinancialEffect: "UNKNOWN",
+  });
+  assert.deepEqual(receipt.reconciliation.undeterminedDimensions, ["immediateFinancialEffect", "recurringFinancialEffect"]);
+});
+
+test("Test 61.16 (R2/S2): a third party installing the intended schedule after a SKIPPED cancel does not verify — the operation never landed", async () => {
+  // The mirror image of 61.15: the dispatched cancel is a no-op
+  // (skip fault — the response claims the schedule, nothing is
+  // persisted), and a third party then installs exactly the
+  // intended schedule before the verification read. The observed
+  // state MATCHES intent, but this operation produced none of
+  // it: a current-state read is not operation attribution, so
+  // the commit must not verify (no COMMITTED_AND_VERIFIED / OK,
+  // no defined_equal_exact).
+  const nowSec = Math.floor(new Date("2026-08-01T00:00:00Z").getTime() / 1000);
+  class InstallAfterSkipSim extends StripeSim {
+    private interposed = false;
+    override cancel(id: string, atPeriodEnd: boolean): StripeSubscription {
+      const result = super.cancel(id, atPeriodEnd);
+      if (!this.interposed) {
+        this.interposed = true;
+        this._debugMutateDirectly(id, (s) => {
+          s.cancel_at_period_end = true;
+        });
+      }
+      return result;
+    }
+  }
+  const sim = new InstallAfterSkipSim(nowSec);
+  const { sub } = freshStripeFixture();
+  sim.seedSubscription(structuredClone(sub));
+  sim._debugSkipCancelOnNextCancel = true;
+  const adapter = new StripeAdapter(sim, new QuoteStore());
+  const quote = await termEndCancelQuote(adapter, sub.id);
+  const receipt = await adapter.commitChangeQuote(quote.id);
+  const persisted = sim.retrieve(sub.id);
+  assert.equal(persisted.cancel_at_period_end, true, "the observed state matches intent — installed by the third party");
+  assert.equal(receipt.resultingSnapshot.term?.autoRenew, false, "the observed schedule is recorded as context");
+  assert.equal(receipt.outcome, "COMMITTED_UNVERIFIED", "state matching intent is not enough: this cancel never landed, so its outcome is not established");
+  assert.equal(receipt.reconciliation.status, "UNVERIFIED", "never OK: the matching state is not attributable to this operation");
+  assert.equal(receipt.committedEffect.provenance?.committedSource, "unestablished", "never defined_equal_exact for a landing this operation did not produce");
+  assert.deepEqual(receipt.reconciliation.undeterminedDimensions, ["immediateFinancialEffect", "recurringFinancialEffect"]);
+});
+
+test("Test 61.17 (R2/S3): an intervening EXACT update replacing latest_invoice and landing a mismatch breaks attribution BEFORE classification — UNVERIFIED, not VIOLATED", async () => {
+  // An intervening operation on the same subscription lands a
+  // state mismatch and replaces latest_invoice between this
+  // commit's dispatch and its verification read (wrapper
+  // interposition on the sim's update). Before the correction,
+  // the MISMATCH branch fired first and recorded the intervening
+  // state as THIS operation's verified violation; the
+  // latest_invoice (M3) check sat behind it and never ran.
+  const nowSec = Math.floor(new Date("2026-08-01T00:00:00Z").getTime() / 1000);
+  class InterveningUpdateSim extends StripeSim {
+    private interposed = false;
+    override update(...args: Parameters<StripeSim["update"]>): ReturnType<StripeSim["update"]> {
+      const result = super.update(...args);
+      if (!this.interposed) {
+        this.interposed = true;
+        super.update(args[0], [{ id: "si_1", price: "price_seat_basic", quantity: 150 }], "create_prorations");
+      }
+      return result;
+    }
+  }
+  const sim = new InterveningUpdateSim(nowSec);
+  const { sub } = freshStripeFixture();
+  sim.seedSubscription(structuredClone(sub));
+  const store = new QuoteStore();
+  const adapter = new StripeAdapter(sim, store);
+  const quoteId = await exactQuantityQuote(adapter, store, sub.id, 120);
+  const receipt = await adapter.commitChangeQuote(quoteId);
+  assert.equal(sim.retrieve(sub.id).items[0].quantity, 150, "the observed state is the intervening operation's landing");
+  assert.equal(receipt.resultingSnapshot.items[0].quantity, 150, "the observed state is recorded as context");
+  assert.equal(receipt.outcome, "COMMITTED_UNVERIFIED", "the mismatch is not attributable to this operation, so it is not this operation's verified violation");
+  assert.equal(receipt.reconciliation.status, "UNVERIFIED", "attribution precedes classification: never VIOLATED from an intervening operation's state");
+  assert.equal(receipt.committedEffect.provenance?.committedSource, "unestablished", "no figures are recorded as this operation's determined actuals");
+  assert.deepEqual(determinacyOf(receipt.committedEffect), {
+    immediateFinancialEffect: "UNKNOWN",
+    recurringFinancialEffect: "UNKNOWN",
+  });
+  assert.deepEqual(receipt.reconciliation.undeterminedDimensions, ["immediateFinancialEffect", "recurringFinancialEffect"]);
 });
 
 test("Test 61.12: a VIOLATED receipt replays verbatim (no re-dispatch), and the one-shot fault does not leak into the next commit", async () => {
