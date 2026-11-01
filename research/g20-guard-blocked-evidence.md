@@ -81,7 +81,7 @@ that misrepresents the adapter's capability).
   artifact-priced immediate under a broken bracket should be recorded as
   DETERMINED at all. No behavior was changed by this PR.
 - **Resolution (Issue #46 audit, decision B — NARROW):** the flagged question
-  was audited in `research/i46-immediate-attribution-audit.md` (suite test58).
+  was audited in `research/i46-immediate-attribution-audit.md` (suite test60).
   The maintainer question is answered: NO — where the artifact's BEGIN
   binding fails (the operation did not begin on the state the commit
   validated, or the artifact's recorded request is not the dispatched

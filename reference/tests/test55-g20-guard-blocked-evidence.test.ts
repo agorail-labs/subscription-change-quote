@@ -65,7 +65,9 @@ import { SCQError } from "../src/core/types.js";
 // change to that pricing basis is deliberate and reviewed; the
 // G-20 note flags it for maintainer attention.
 //
-// ISSUE #46 AUDIT RESOLUTION (test58): the flagged nuance was
+// ISSUE #46 AUDIT RESOLUTION (test60; delivered as test58 and
+// renumbered on PR #53 review — test58 was already PR #50's
+// suite): the flagged nuance was
 // audited and the classification below was CORRECTED — this is a
 // disclosed modification of a pre-existing test, made because the
 // audit (decision B — NARROW) established that the figure's
@@ -81,6 +83,17 @@ import { SCQError } from "../src/core/types.js";
 // The test's original safety purpose — an execution affected by a
 // never-authorized concurrent change is never reported verified —
 // is retained and strengthened.
+//
+// PR #53 REVIEW CORRECTION (2026-10-31, disclosed): §3.10 permits
+// a committed candidate ONLY from the mutating call's own
+// response (or the stored quote for cancellations) — never from
+// a further provider read after the mutation landed. The audit's
+// first delivery sourced the candidate from the post-mutation
+// artifact read; the correction sources it from the response.
+// The response in this scenario reports the same 12500 (the
+// simulator computes both from the same execution), so NO
+// assertion below changed — only the comments naming the
+// figure's source, and the suite references (test58 -> test60).
 
 const START = new Date("2026-08-01T00:00:00.000Z");
 
@@ -200,19 +213,24 @@ test("Test 55.2 (G-20, repro43 window 2): an unrelated addition landing after va
   // actual (unattributed context lives only in the snapshot).
   assert.equal(receipt.committedEffect.recurring?.resultingAmount, undefined);
   assert.equal(receipt.committedEffect.determinacy?.recurringFinancialEffect, "UNKNOWN");
-  // The recorded immediate is the bound artifact's own figure. Its
-  // value (12500) is priced by the simulator off the state the
-  // operation BEGAN on — already including the concurrent addition
+  // The recorded immediate is the figure the mutating call's own
+  // response reported. Its value (12500) is priced by the
+  // simulator off the state the operation BEGAN on — already
+  // including the concurrent addition
   // (begin recurring 107500 -> end 120000) — not off the validated
   // state (authorized delta alone: 20000). ISSUE #46 AUDIT
-  // (test58, decision B): because the operation did not begin on
+  // (test60, decision B): because the operation did not begin on
   // the state this commit validated, that figure nets the third
   // party's effect and is NOT this commit's determined actual
   // (spec §6.15). It is recorded as a §3.10 CANDIDATE — the value
   // is retained as the original figure for a later independent
   // verification, under UNKNOWN determinacy with its source
-  // disclosed. (Before the audit this assertion read DETERMINED;
-  // see the file header for the disclosed modification.)
+  // disclosed. The candidate's SOURCE is the response itself
+  // (§3.10, PR #53 review correction): the post-mutation artifact
+  // read serves attribution diagnostics only and never supplies
+  // the candidate's figure. (Before the audit this assertion read
+  // DETERMINED; see the file header for the disclosed
+  // modifications.)
   assert.equal(receipt.committedEffect.immediate?.net, 12500);
   assert.equal(receipt.committedEffect.determinacy?.immediateFinancialEffect, "UNKNOWN");
   assert.equal(receipt.committedEffect.provenance?.committedSource, "unestablished");

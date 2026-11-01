@@ -208,29 +208,29 @@ AFTER: 5000 retained as candidate (UNKNOWN).
 
 ---
 
-## 4. Adversarial suite — test58 (12 cases)
+## 4. Adversarial suite — test60 (12 cases)
 
 Failing-first record, measured against unmodified main `b00e74b`:
-**FAIL (defect reproductions):** 58.1, 58.2, 58.3, 58.4, 58.5, 58.7, 58.9,
-58.10 — each on its classification assertions.
-**PASS (characterization pins):** 58.6, 58.8.
-**PASS (positive controls):** 58.11, 58.12.
+**FAIL (defect reproductions):** 60.1, 60.2, 60.3, 60.4, 60.5, 60.7, 60.9,
+60.10 — each on its classification assertions.
+**PASS (characterization pins):** 60.6, 60.8.
+**PASS (positive controls):** 60.11, 60.12.
 After the fix: **12/12 pass**, pins and controls unchanged.
 
 | Case | Scenario | Before (main) | After (this branch) |
 |---|---|---|---|
-| 58.1 (a) | Third-party item added, validate → dispatch | 12500 **DETERMINED** | 12500 candidate (UNKNOWN, unestablished, source disclosed); COMMITTED_UNVERIFIED / UNVERIFIED; both dimensions undetermined |
-| 58.2 (a2) | Same, third-party quantity 10 | 5000 **DETERMINED** | 5000 candidate — figure tracks the third party's input, retained for later verification |
-| 58.3 (b) | Concurrent price-id swap (monthly → annual) in the gap | −880000 credit **DETERMINED** | −880000 candidate, full shape retained (credit 880000) |
-| 58.4 (c) | Two different third-party configurations, equal begin totals (107500) | Both record 12500 **DETERMINED** | Both record 12500 as candidates — identical figure, different third-party facts |
-| 58.5 (d) | Mutating call's response carries a DIFFERENT operation's id (artifact read-back is operation A's) | A's figure 20000 recorded **DETERMINED** on B's receipt | 20000 candidate on B's receipt — a different operation's figure establishes nothing for this commit |
-| 58.6 (e) | Preview-sourcing probe [PIN] | Recorded figure is the artifact's (12500 ≠ preview's 20000); figureless artifact → response candidates UNKNOWN | Unchanged — previews are never the committed source |
-| 58.7 (f) | Foreign post-commit record (different subscription id) + broken begin bracket | Artifact figure 12500 **DETERMINED** | 12500 candidate; the foreign record contributes no figure and verifies nothing |
-| 58.8 (g) | Artifact persists a net figure but NO line items [PIN] | Verification-unavailable branch: response candidates only, both dimensions UNKNOWN | Unchanged |
-| 58.9 (h) | Evidence lifecycle over the candidate receipt | Recorded immediate labeled DETERMINED (fails at the audit classification) | Independent evidence establishes the dimension in the derived view (receipt stays COMMITTED_UNVERIFIED — recurring unestablished); a conflicting established actual is appended and flagged (view UNVERIFIED naming the conflict; accepted actual stays 12500); `commit_receipt_recorded` never rewritten |
-| 58.10 (i) | Bundled change, wrong-quantity partial application, begin-window write | UNVERIFIED but figure 36000 **DETERMINED** | UNVERIFIED (explicitly NOT VIOLATED — an unattributable contradiction is context, Z1) with 36000 as candidate |
-| 58.11 (j) | **Positive control:** clean bracket, wrong landing (×130) exceeding the envelope (max 25000) | 30000 DETERMINED + VIOLATED, `provider_actual` | **Unchanged** — independently established violations are never suppressed |
-| 58.12 | **Positive control:** mutate → verify window interference only | 20000 DETERMINED, undetermined = [recurring] | **Unchanged** — the narrowing does not overcorrect |
+| 60.1 (a) | Third-party item added, validate → dispatch | 12500 **DETERMINED** | 12500 candidate (UNKNOWN, unestablished, source disclosed); COMMITTED_UNVERIFIED / UNVERIFIED; both dimensions undetermined |
+| 60.2 (a2) | Same, third-party quantity 10 | 5000 **DETERMINED** | 5000 candidate — figure tracks the third party's input, retained for later verification |
+| 60.3 (b) | Concurrent price-id swap (monthly → annual) in the gap | −880000 credit **DETERMINED** | −880000 candidate, full shape retained (credit 880000) |
+| 60.4 (c) | Two different third-party configurations, equal begin totals (107500) | Both record 12500 **DETERMINED** | Both record 12500 as candidates — identical figure, different third-party facts |
+| 60.5 (d) | Mutating call's response carries a DIFFERENT operation's id (artifact read-back is operation A's) | A's figure 20000 recorded **DETERMINED** on B's receipt | 20000 candidate on B's receipt — a different operation's figure establishes nothing for this commit |
+| 60.6 (e) | Preview-sourcing probe [PIN] | Recorded figure is the artifact's (12500 ≠ preview's 20000); figureless artifact → response candidates UNKNOWN | Unchanged — previews are never the committed source |
+| 60.7 (f) | Foreign post-commit record (different subscription id) + broken begin bracket | Artifact figure 12500 **DETERMINED** | 12500 candidate; the foreign record contributes no figure and verifies nothing |
+| 60.8 (g) | Artifact persists a net figure but NO line items [PIN] | Verification-unavailable branch: response candidates only, both dimensions UNKNOWN | Unchanged |
+| 60.9 (h) | Evidence lifecycle over the candidate receipt | Recorded immediate labeled DETERMINED (fails at the audit classification) | Independent evidence establishes the dimension in the derived view (receipt stays COMMITTED_UNVERIFIED — recurring unestablished); a conflicting established actual is appended and flagged (view UNVERIFIED naming the conflict; accepted actual stays 12500); `commit_receipt_recorded` never rewritten |
+| 60.10 (i) | Bundled change, wrong-quantity partial application, begin-window write | UNVERIFIED but figure 36000 **DETERMINED** | UNVERIFIED (explicitly NOT VIOLATED — an unattributable contradiction is context, Z1) with 36000 as candidate |
+| 60.11 (j) | **Positive control:** clean bracket, wrong landing (×130) exceeding the envelope (max 25000) | 30000 DETERMINED + VIOLATED, `provider_actual` | **Unchanged** — independently established violations are never suppressed |
+| 60.12 | **Positive control:** mutate → verify window interference only | 20000 DETERMINED, undetermined = [recurring] | **Unchanged** — the narrowing does not overcorrect |
 
 For every case the recorded tuple (mutation attribution, immediate
 determinacy, committed source, state verification, reconciliation
@@ -275,19 +275,19 @@ audit is that review. No other pre-existing test is modified.
 
 | # | Property | Evidence |
 |---|---|---|
-| (i) | Quote-side estimates never treated as committed actuals | test58.6 pin: recorded figure is the artifact's, never the preview's; figureless artifacts yield labeled response candidates only |
-| (ii) | UNKNOWN never reclassified as zero | Candidates retain their figures verbatim (58.1: net 12500 present under UNKNOWN; 58.3: credit 880000 retained) |
-| (iii) | Recorded receipts never rewritten | test50 family green; 58.9 asserts `commit_receipt_recorded` unchanged after two evidence appends |
-| (iv) | Append-only verification unbroken | 58.9: establishment composes over the candidate (judged, not matched — A-17-1); conflicts appended + flagged, accepted actual not replaced; test50 family green |
-| (v) | Unauthorized ≠ unknown | 58.10: unattributable contradiction stays UNVERIFIED, explicitly not VIOLATED; 58.11: attributable exceedance is VIOLATED |
-| (vi) | Independently established violations not suppressed | 58.11 positive control (30000 DETERMINED + VIOLATED) before and after |
+| (i) | Quote-side estimates never treated as committed actuals | test60.6 pin: recorded figure is the artifact's, never the preview's; figureless artifacts yield labeled response candidates only |
+| (ii) | UNKNOWN never reclassified as zero | Candidates retain their figures verbatim (60.1: net 12500 present under UNKNOWN; 60.3: credit 880000 retained) |
+| (iii) | Recorded receipts never rewritten | test50 family green; 60.9 asserts `commit_receipt_recorded` unchanged after two evidence appends |
+| (iv) | Append-only verification unbroken | 60.9: establishment composes over the candidate (judged, not matched — A-17-1); conflicts appended + flagged, accepted actual not replaced; test50 family green |
+| (v) | Unauthorized ≠ unknown | 60.10: unattributable contradiction stays UNVERIFIED, explicitly not VIOLATED; 60.11: attributable exceedance is VIOLATED |
+| (vi) | Independently established violations not suppressed | 60.11 positive control (30000 DETERMINED + VIOLATED) before and after |
 | (vii) | Authorization-preservation refusal unloosened | test47 family green; the live adapter is untouched (the fix is in the simulator adapter only) |
-| (viii) | No duplicate dispatch after uncertain outcomes | 58.1 asserts exactly one mutation; test27/test29 families green in the full suite |
+| (viii) | No duplicate dispatch after uncertain outcomes | 60.1 asserts exactly one mutation; test27/test29 families green in the full suite |
 
 Validation: full suite **841/841 on Node 22.14 and Node 20.19.5** (fresh
 per-toolchain `npm ci` + build on Node 20); research **11 pass / 7 fail**
 (unchanged, by design). Targeted families run individually: test25, test47,
-test49, test50, test55, test57, test58 — all green. Spec integrity:
+test49, test50, test55, test57, test60 — all green. Spec integrity:
 `scq-v0.6.2-spec.md` sha256 identical to main
 (`4100d2492a92ab430fd0190382ddadd287d25cf07edbf3f5d40df2e27bb4951f`);
 `scq-v0.6.1-spec.md` sha256
@@ -305,7 +305,7 @@ decide."
 ## 7. Remaining assumptions / unresolved provider questions
 
 - **Operation-id binding rests on the mutating call's response id**
-  (§3.11: the label is not itself the authentication). test58.5 shows the
+  (§3.11: the label is not itself the authentication). test60.5 shows the
   consequence when that id is wrong: the read-back artifact's figure becomes
   a candidate for the receiving commit rather than its determined actual —
   fail-closed, but a real provider's artifact-identity guarantees remain a
@@ -323,3 +323,141 @@ decide."
   prices a full-replacement update against its execution-time begin state,
   and what its persisted artifacts record, are live-provider questions —
   unexamined here by design (no live mutation is authorized).
+
+---
+
+## 8. Correction — §3.10 candidate-source compliance (PR #53 maintainer review, 2026-10-31)
+
+The sections above are the audit as delivered (branch head `5d8f4df`,
+Draft PR #53). The maintainer's independent review of PR #53 confirmed
+decision B — NARROW and the validation results, but identified one
+remaining defect **in the audit's own fix**. This section records the
+correction; the original analysis is not rewritten.
+
+### 8.1 The defect
+
+Published §3.10 ("Candidates (committed role only)") restricts a
+committed candidate's source to exactly two: the mutating call's own
+response, or — for cancellation constructions — the stored quote's
+post-cancellation level, and states verbatim: *"a candidate is never
+derived from a further provider read performed after the mutation
+landed."* The delivered begin-unbound branch built
+`candidateEffect.immediate` from `readArtifact`
+(`invoiceEstimateLineItems` / `netImmediate`) obtained via
+`this.sim.retrieveMutation(mutation.operationId)` — a separate
+post-mutation read, not `mutation.result`. The classification
+(UNKNOWN / UNVERIFIED / candidate) was correct; the value's SOURCE
+was forbidden. Test 60.5 (delivered as 58.5) proved it observably:
+operation B's receipt retained the 20000 figure retrieved from
+operation A's artifact.
+
+### 8.2 The fix (adapter-local, begin-unbound branch only)
+
+- The candidate is now derived ONLY from the already-held
+  `mutation.result` (`netImmediate` / `invoiceEstimateLineItems`),
+  and its provenance names the mutating call's own response as the
+  source (`provImmediateCandidateBeginUnbound` rewritten; the
+  reconciliation reason states the same, conditionally).
+- If the response cannot supply an admissible finite figure, the
+  candidate number is ABSENT (§3.10: candidates are optional) —
+  never filled from `retrieveMutation` or any preview.
+- `readArtifact` remains in service for state/attribution
+  diagnostics and the begin-bound vs begin-unbound determination;
+  it no longer populates any UNKNOWN candidate. COMMITTED_UNVERIFIED,
+  both undetermined dimensions, source disclosure, and immutable
+  recorded-receipt semantics are preserved. The begin-BOUND branch's
+  outputs are byte-identical (established actuals from bound
+  post-commit evidence are a different, permitted path — untouched).
+
+### 8.3 Response-object facts (probe-verified against the simulator)
+
+The mutating call's response (`mutation.result`, an `EstimateResult`)
+carries `netImmediate` and `invoiceEstimateLineItems` computed at
+execution from the operation's begin state; the sim persists the
+artifact FROM that same result. Consequently:
+
+- 60.1's **12500** and 60.2's **5000** survive unchanged as
+  RESPONSE-sourced figures (values identical; source corrected).
+- In 60.5's geometry, B's own response carries **10000** (B's
+  execution priced from its begin state: level 120000 → dispatched
+  130000). The delivered test's aside "(30000 priced off B's begin
+  state...)" was wrong and is corrected in the test. The amended
+  expectation is therefore the exact B-response candidate, 10000 —
+  not A's 20000, and not absence.
+- test55.2's candidate assertions are unaffected (its response
+  reports the same 12500); only its comments naming the figure's
+  source and the suite references were corrected — disclosed in
+  that file's header.
+
+### 8.4 Test deltas
+
+- **Renumber:** the suite was delivered as `test58`, colliding with
+  PR #50's `test58-indeterminate-recovery-evidence.test.ts`; test59
+  was also taken. The suite is renamed
+  `test60-i46-immediate-attribution.test.ts`, IDs 58.x → 60.x, and
+  references renumbered in this note, the G-20 resolution note,
+  test55, and the adapter comments. (Sections 1–7 above were
+  renumbered token-wise only; their substance stands as delivered,
+  except where this section supersedes it — notably §4's row for
+  case (d), whose delivered "After" cell read "20000 candidate on
+  B's receipt" and is superseded by §8.3/8.4 below.)
+- **Amended 60.5:** expects B's response candidate 10000, asserts
+  A's 20000 appears nowhere on B's receipt, and asserts the §3.10
+  source restriction via the shared candidate assertions
+  (provenance names the mutating call's own response; never names
+  the artifact read).
+- **New 60.13 (case k):** response-versus-artifact disagreement —
+  the artifact read is corrupted to claim 999999 (attribution data
+  intact); the candidate must be the response's 12500.
+- **New 60.14 (case l):** response figure omitted, and separately
+  nonfinite (NaN) — the candidate stays ABSENT although the
+  retrievable artifact carries a finite 12500 (asserted in the
+  test as a scenario check).
+- **60.6 (pin) amended:** its Part 1 provenance assertion now names
+  the response as the governing source; the pin's substance
+  (never a preview) is unchanged, as is the figure's value.
+- `assertCandidate` now carries the §3.10 source assertions for
+  every candidate case.
+
+### 8.5 Failing-first record for the correction (against `5d8f4df`)
+
+The amended suite was run against the unmodified delivered code
+before the source fix: **11 fail / 3 pass**.
+
+- 60.5 FAILS on value: expected 10000, actual 20000 (A's artifact
+  figure).
+- 60.13 FAILS on value: expected 12500, actual 999999 (the artifact
+  read's substituted figure).
+- 60.14 FAILS on presence: candidate recorded (12500, backfilled
+  from the artifact) where absence is required.
+- 60.1, 60.2, 60.3, 60.4, 60.7, 60.9, 60.10 FAIL on the new §3.10
+  source assertions only (provenance named the artifact read via
+  `retrieveMutation`); their figure values and classifications
+  already passed — the B — NARROW decision was never in question.
+- 60.6 FAILS on its amended provenance assertion.
+- PASS throughout: 60.8 (pin), 60.11 and 60.12 (positive controls —
+  the begin-bound DETERMINED outputs are untouched by the defect
+  and by the correction).
+
+After the fix: test60 **14/14**; full suite **843/843 on Node 22.14
+and Node 20.19.5** (fresh per-toolchain `npm ci` + clean build on
+both; baseline at `5d8f4df` was 841/841 — the delta is exactly the
+two new tests); research **11 pass / 7 fail** unchanged; targeted
+families test25, test47, test49, test50, test55, test57, test60 all
+green individually. Spec integrity unchanged: v0.6.2 sha256
+`4100d249…`, v0.6.1 sha256 `0d32e584…`; zero freeze-guarded paths
+touched; no `package.json` change.
+
+### 8.6 Disclosed pre-existing-test modifications in this correction
+
+- `test55-g20-guard-blocked-evidence.test.ts`: comments only —
+  suite references (test58 → test60) and the candidate-source
+  wording in test55.2's comment block and file header. NO assertion
+  changed (verified: the suite passed before and after with
+  identical assertions; the figure 12500 is response-sourced with
+  the same value).
+- This note (§§1–7): suite-number tokens renumbered; §4's case-(d)
+  "After" cell and §5's implementation description are superseded
+  by this section, not edited.
+- `research/g20-guard-blocked-evidence.md`: the resolution note's
+  "(suite test58)" reference renumbered to test60.
