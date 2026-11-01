@@ -80,6 +80,19 @@ that misrepresents the adapter's capability).
   recurring unattributed), but a maintainer should decide whether an
   artifact-priced immediate under a broken bracket should be recorded as
   DETERMINED at all. No behavior was changed by this PR.
+- **Resolution (Issue #46 audit, decision B — NARROW):** the flagged question
+  was audited in `research/i46-immediate-attribution-audit.md` (suite test60).
+  The maintainer question is answered: NO — where the artifact's BEGIN
+  binding fails (the operation did not begin on the state the commit
+  validated, or the artifact's recorded request is not the dispatched
+  request), the figure nets third-party effects and is now recorded as a
+  §3.10 candidate (UNKNOWN determinacy, `committedSource: "unestablished"`,
+  source disclosed), per spec §6.15. Where only the bracket's END equality
+  fails (interference after execution; the begin binding holds), the figure
+  remains DETERMINED — it is priced from the validated state and the
+  dispatched request alone. test55.2's classification assertion was updated
+  accordingly (disclosed in that suite's header); its scenario mechanics and
+  the figure's value are unchanged.
 
 ### repro43.2 — F1 control: no concurrent write
 

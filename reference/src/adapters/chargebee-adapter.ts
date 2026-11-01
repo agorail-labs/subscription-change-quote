@@ -267,6 +267,51 @@ function provImmediateCommitted(artifactId: string): string {
     `not an estimate and not the mutation response); no latest-mutation pointer was used`
   );
 }
+
+/**
+ * Issue #46 audit (decision B — NARROW), as corrected on PR #53
+ * review: the immediate provenance when the bound artifact's
+ * BEGIN binding fails. The candidate — when one is recorded —
+ * is sourced from the mutating call's OWN RESPONSE: §3.10
+ * permits a committed candidate only from data already in hand
+ * at recording time ("the mutating call's own response", or the
+ * stored quote for cancellations) and forbids deriving one
+ * "from a further provider read performed after the mutation
+ * landed". The post-mutation artifact read serves attribution
+ * diagnostics ONLY (the begin binding itself is computed from
+ * it); it never supplies the candidate's figure — the first
+ * delivery of this branch sourced the figure from that read,
+ * which the maintainer review identified as a §3.10 source
+ * violation (test60.5 carried another operation's figure).
+ * When the response carries no admissible finite figure, NO
+ * candidate number is recorded (candidates are optional under
+ * §3.10) — the dimension is UNKNOWN with no figure.
+ */
+function provImmediateCandidateBeginUnbound(hasFigure: boolean, requestMismatch: boolean): string {
+  const bindingFailure = requestMismatch
+    ? `the bound artifact's recorded request differs from the request this commit dispatched`
+    : `the bound artifact's recorded begin fingerprint differs from the fingerprint this commit validated`;
+  if (!hasFigure) {
+    return (
+      `UNESTABLISHED — no candidate figure is recorded: the mutating call's own response carried no admissible ` +
+      `finite immediate figure, and §3.10 permits a committed candidate ONLY from that response (or, for ` +
+      `cancellations, the stored quote) — never from a further provider read performed after the mutation landed, ` +
+      `so the post-mutation artifact read was not used to supply a number. The operation began on a state this ` +
+      `commit did not validate (begin binding failed: ${bindingFailure}), so nothing about this dimension is ` +
+      `attributable to this commit; the dimension is UNKNOWN with no figure`
+    );
+  }
+  return (
+    `CANDIDATE (not an established actual): the immediate figure reported by the mutating call's own response. ` +
+    `The operation priced its execution from the state it began on, which is NOT the state this commit validated ` +
+    `(begin binding failed: ${bindingFailure}), so the figure its response reports nets the effects of state this ` +
+    `commit never authorized and is not attributable to this commit as a determined actual. Recorded under ` +
+    `§3.10's candidate rule (committedSource: unestablished), sourced from the mutating call's own response — ` +
+    `the only post-dispatch source §3.10 permits; NO figure was derived from the post-mutation artifact read, ` +
+    `which served attribution diagnostics only — so a later independent verification (§6.15) has the original ` +
+    `figure to judge`
+  );
+}
 /**
  * Z3 (PR #14 doctrine, applied here): the recurring provenance on a
  * BROKEN-attribution receipt. The re-read post-commit recurring
@@ -277,6 +322,15 @@ function provImmediateCommitted(artifactId: string): string {
  */
 const PROV_RECURRING_UNATTRIBUTED =
   "UNESTABLISHED for this commit: the fingerprint bracket around this commit's operation is broken, so the recurring level read back from the post-commit subscription was not produced by this commit alone — it is third-party-influenced observed state, retained only as unattributed context in the resulting snapshot and the reconciliation reason. No committed recurring figure is established for this commit; the bound mutation artifact establishes this commit's IMMEDIATE actual only (see the immediate provenance)";
+/**
+ * Issue #46 audit: the recurring provenance on a broken-BEGIN-
+ * binding receipt — as PROV_RECURRING_UNATTRIBUTED, except the
+ * immediate is NOT established either: the mutating call's own
+ * response figure survives only as a §3.10 candidate, when the
+ * response carries one (see the immediate provenance).
+ */
+const PROV_RECURRING_UNATTRIBUTED_BEGIN_UNBOUND =
+  "UNESTABLISHED for this commit: the fingerprint bracket around this commit's operation is broken, so the recurring level read back from the post-commit subscription was not produced by this commit alone — it is third-party-influenced observed state, retained only as unattributed context in the resulting snapshot and the reconciliation reason. No committed recurring figure is established for this commit, and the mutating call's own response immediate figure is recorded only as a candidate, when it carries one (see the immediate provenance)";
 const PROV_RECURRING_COMMITTED =
   "post-commit actual: sum over the re-read post-commit subscription's items (modeled catalog unit price x quantity), read back behind the closed fingerprint attribution bracket";
 const PROV_CANCEL_RECURRING_COMMITTED =
@@ -1003,6 +1057,15 @@ export class ChargebeeAdapter implements SubscriptionProvider {
    * the bound artifact's immediate stays (the scope that operation
    * establishes), while the recurring dimension is UNKNOWN with NO
    * figure, because the re-read level is third-party-influenced.
+   * Issue #46 audit narrowing: the immediate half of Z3 holds only
+   * under the artifact's BEGIN binding (recorded request matches
+   * and the operation began on the state this commit validated);
+   * where the begin binding fails the operation priced its
+   * execution from unvalidated state, and the immediate is
+   * recorded as a §3.10 candidate under UNKNOWN determinacy
+   * instead (see the beginBound branch in the code) — sourced,
+   * per §3.10, from the mutating call's own response, never from
+   * the post-mutation artifact read (PR #53 review correction).
    *
    * Outcomes:
    *  - bracket closed + state matches intent: COMMITTED /
@@ -1210,6 +1273,22 @@ export class ChargebeeAdapter implements SubscriptionProvider {
     const requestMatches = canonicalJson(readArtifact.request) === canonicalJson({ items: input.input.items, prorate: input.input.prorate });
     const attributable =
       requestMatches && readArtifact.fingerprintBefore === validatedFingerprint && readArtifact.fingerprintAfter === currentFingerprint;
+    // BEGIN BINDING (issue #46 audit, decision B — NARROW): the
+    // artifact is bound to this commit at its BEGIN when its
+    // recorded request is the dispatched request AND the state it
+    // began on is exactly the state this commit validated. The
+    // artifact's execution figure is priced from its begin state
+    // (the simulator's pricing nets price(dispatched list) against
+    // price(begin state)), so the begin binding is what makes the
+    // figure a function of (validated state, dispatched request)
+    // alone. Where the begin binding fails, a third-party write in
+    // the validate -> dispatch window entered the pricing basis
+    // and the figure nets effects this commit never authorized —
+    // it is not attributable to this commit (see the candidate
+    // branch below). Where ONLY the end equality fails
+    // (interference after execution), the figure's basis is
+    // untouched and the begin-bound branch keeps it DETERMINED.
+    const beginBound = requestMatches && readArtifact.fingerprintBefore === validatedFingerprint;
     const latestId = this.sim.latestMutationId(subscriptionId);
 
     // The observed recurring level, strictly priced. Behind the
@@ -1251,6 +1330,108 @@ export class ChargebeeAdapter implements SubscriptionProvider {
     // A WHOLE is not an established set of actuals; the immediate
     // dimension's own determinacy and provenance carry its narrower
     // claim.
+    //
+    // ISSUE #46 AUDIT AMENDMENT (decision B — NARROW): Z3's
+    // immediate carve-out holds only where the artifact's BEGIN
+    // binding holds (see beginBound above). The execution's figure
+    // is priced from its begin state; when the operation began on
+    // state this commit never validated — a third-party write in
+    // the validate -> dispatch window — the figure nets that
+    // write's effects (measured: it moves 1:1 with the third
+    // party's quantity, test60.2) and is a third-party-influenced
+    // figure within §6.15's rule ("no third-party or unattributed
+    // figure may be recorded as this commit's determined actual").
+    // The branch below therefore splits on the begin binding:
+    // begin-bound (only the end equality failed) keeps the
+    // immediate DETERMINED; begin-unbound records it as a §3.10
+    // CANDIDATE — figure retained as the original figure for a
+    // later §6.15 verification, determinacy UNKNOWN, source
+    // disclosed — establishing nothing.
+    //
+    // §3.10 SOURCE RULE (PR #53 review correction): the candidate
+    // below is built ENTIRELY from the mutating call's own
+    // response (mutation.result) — the only post-dispatch source
+    // §3.10 permits besides the stored quote for cancellations.
+    // The artifact read above (readArtifact) is a further
+    // provider read performed after the mutation landed: it
+    // legitimately serves attribution diagnostics — the begin
+    // binding itself is computed from it — but it must NOT
+    // populate the candidate, even where its number coincides
+    // with the response's (the source, not the value, is what
+    // §3.10 governs; test60.5's wrong-operation geometry and
+    // test60.13's disagreement regression pin this). When the
+    // response carries no admissible finite figure the candidate
+    // number is ABSENT (candidates are optional, §3.10) — never
+    // backfilled from the artifact read or any preview
+    // (test60.14).
+    if (!attributable && !beginBound) {
+      const responseNet = (mutation.result as { netImmediate?: unknown } | undefined)?.netImmediate;
+      const responseFigure = typeof responseNet === "number" && Number.isFinite(responseNet) ? responseNet : undefined;
+      const candidateEffect: CommercialEffect = {
+        ...(responseFigure !== undefined
+          ? {
+              immediate: Array.isArray(mutation.result?.invoiceEstimateLineItems)
+                ? immediateFromLineItems(mutation.result.invoiceEstimateLineItems, responseFigure)
+                : immediateParts(responseFigure),
+            }
+          : {}),
+        recurring: {
+          previousAmount: quoted.recurring?.previousAmount,
+          // NO resultingAmount (Z3): the observed post-commit
+          // recurring level was not produced by this commit alone
+          // and is not recorded as this commit's figure.
+          currency: quoted.recurring?.currency ?? "usd",
+          ...(quoted.recurring?.cadence ? { cadence: quoted.recurring.cadence } : {}),
+        },
+        ...(quoted.term ? { term: quoted.term } : {}),
+        effectiveAt: quoted.effectiveAt,
+        determinacy: { immediateFinancialEffect: "UNKNOWN", recurringFinancialEffect: "UNKNOWN" },
+        provenance: {
+          immediate: provImmediateCandidateBeginUnbound(responseFigure !== undefined, !requestMatches),
+          recurring: PROV_RECURRING_UNATTRIBUTED_BEGIN_UNBOUND,
+          committedSource: "unestablished",
+        },
+      };
+      return {
+        effect: candidateEffect,
+        reconciliation: {
+          status: "UNVERIFIED",
+          reason:
+            `a competing change intervened around this commit's operation: this commit validated state fingerprint ` +
+            `${validatedFingerprint}, artifact ${readArtifact.id} recorded fingerprint ${readArtifact.fingerprintBefore} when it began ` +
+            `and ${readArtifact.fingerprintAfter} when it completed, and the re-read subscription state fingerprints ` +
+            `${currentFingerprint}` +
+            (latestId && latestId !== readArtifact.id ? ` with latest mutation ${latestId}` : "") +
+            (!requestMatches ? `; the artifact's recorded request also differs from the request this commit dispatched` : "") +
+            ` — the fingerprint bracket does not close around this commit alone, and the operation did not begin on the ` +
+            `state this commit validated, so the operation priced its execution from an unvalidated begin state, netting ` +
+            `effects this commit never authorized: neither the observed post-commit state nor the execution figure is ` +
+            `attributable to this commit. ` +
+            (responseFigure !== undefined
+              ? `The immediate figure reported by the mutating call's own response is recorded as a CANDIDATE under ` +
+                `UNKNOWN determinacy (the immediate dimension is named undetermined): it is retained as the original ` +
+                `figure for a later independent verification, and establishes nothing; no figure was derived from the ` +
+                `post-mutation artifact read, which served attribution diagnostics only. `
+              : `No immediate candidate figure is recorded: the mutating call's own response carried no admissible ` +
+                `finite figure, and §3.10 permits a candidate from no other post-dispatch source, so the post-mutation ` +
+                `artifact read was not used to supply a number. `) +
+            `NO committed recurring figure is recorded ` +
+            `for this commit (the recurring dimension is UNKNOWN): the recurring level in the observed state was not ` +
+            `produced by this commit alone, so it is retained only as unattributed context in the resulting snapshot — ` +
+            `not as this commit's determined actual. No figure was taken from any intervening operation.` +
+            (problems.length > 0
+              ? ` The observed state ALSO contradicts the dispatched request (${problems.join("; ")}), but because ` +
+                `attribution is broken that contradiction is recorded as unattributed context only — it is NOT ` +
+                `classified as a verified failure of this commit, since the intervening change may have caused it.`
+              : ``),
+          undeterminedDimensions: ["immediateFinancialEffect", "recurringFinancialEffect"],
+        },
+        status: "COMMITTED_UNVERIFIED",
+        outcome: "COMMITTED_UNVERIFIED",
+        snapshot: snap,
+      };
+    }
+
     if (!attributable) {
       const unattributedEffect: CommercialEffect = {
         immediate: immediateFromLineItems(readArtifact.invoiceEstimateLineItems ?? [], committedImmediateNet),
