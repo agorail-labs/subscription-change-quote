@@ -62,6 +62,21 @@ import { freshStripeFixture } from "./fixtures.js";
 // commit to COMMITTED_UNVERIFIED / UNVERIFIED with the observed
 // state as context — never VIOLATED, never VERIFIED/OK — while
 // the provider's OWN wrong landing (61.1–61.4) stays VIOLATED.
+//
+// Focused follow-up (PR #52 review, R2′): the journal's kind is
+// not an operation identity. A second actor can call the SAME
+// public mutation method — if the dispatched cancel/update is
+// skipped (journals nothing) and another actor's ordinary
+// same-kind call then lands exactly the intended state, the
+// window holds exactly one transition of the expected kind with
+// a matching fingerprint, and a kind-only gate attributes the
+// other operation's landing to this one. Tests 61.18/61.19 pin
+// the identity binding: journal transitions carry the unique
+// operation identity minted for the call that applied them, the
+// dispatched call's RESPONSE artifact carries that same
+// identity, and attribution requires the two to be equal — a
+// skipped dispatch's response carries no identity at all, so a
+// same-kind interposition can never verify it.
 
 const GENEROUS_ENVELOPE = {
   maxImmediateNetIncrease: 1_000_000,
@@ -489,6 +504,125 @@ test("Test 61.17 (R2/S3): an intervening EXACT update replacing latest_invoice a
     recurringFinancialEffect: "UNKNOWN",
   });
   assert.deepEqual(receipt.reconciliation.undeterminedDimensions, ["immediateFinancialEffect", "recurringFinancialEffect"]);
+});
+
+test("Test 61.18 (R2′): a SKIPPED cancel followed by another actor's ordinary SAME-KIND cancel landing the intended schedule must not verify — kind is not operation identity", async () => {
+  // The reviewer's exact construction, on the public sim
+  // surface. The adapter's dispatched cancel is SKIPPED (skip
+  // fault: nominal scheduled response, nothing persisted,
+  // nothing journaled). A distinct actor then issues an ordinary
+  // sim.cancel() — the same public method, the same kind — which
+  // lands exactly the intended TERM_END schedule and journals
+  // exactly one kind:"cancel" transition whose fingerprint
+  // matches the verification read. A gate that binds only
+  // {kind, fingerprint} attributes the OTHER operation's landing
+  // to this commit and reports COMMITTED_AND_VERIFIED / OK for
+  // an operation that did nothing. Attribution must bind the
+  // journal transition to THIS dispatch by the operation
+  // identity its response carries — a skipped dispatch's
+  // response carries none, so the chain is absent and the
+  // commit is UNVERIFIED (never OK, never VIOLATED: the observed
+  // state is not this operation's violation either).
+  const nowSec = Math.floor(new Date("2026-08-01T00:00:00Z").getTime() / 1000);
+  class SameKindCancelSim extends StripeSim {
+    private interposed = false;
+    override cancel(id: string, atPeriodEnd: boolean): StripeSubscription {
+      if (this.interposed) return super.cancel(id, atPeriodEnd);
+      this.interposed = true;
+      // (1)+(2) THIS dispatch, with the skip fault armed: the
+      // response reports the requested schedule, the persisted
+      // record is reverted, and NO transition is journaled.
+      this._debugSkipCancelOnNextCancel = true;
+      const dispatched = super.cancel(id, atPeriodEnd);
+      // (3) A distinct actor's ordinary cancellation of the same
+      // kind: persists the intended TERM_END schedule and
+      // journals exactly one kind:"cancel" transition.
+      super.cancel(id, atPeriodEnd);
+      // (4) The adapter receives the FIRST call's response.
+      return dispatched;
+    }
+  }
+  const sim = new SameKindCancelSim(nowSec);
+  const { sub } = freshStripeFixture();
+  sim.seedSubscription(structuredClone(sub));
+  const adapter = new StripeAdapter(sim, new QuoteStore());
+  const quote = await termEndCancelQuote(adapter, sub.id);
+  const receipt = await adapter.commitChangeQuote(quote.id);
+  const persisted = sim.retrieve(sub.id);
+  assert.equal(persisted.cancel_at_period_end, true, "the intended schedule IS persisted — by the third party's cancel");
+  assert.equal(persisted.current_period_end, sub.current_period_end, "at exactly the authorized boundary");
+  const transitions = sim.listTransitions(sub.id, 0);
+  assert.equal(transitions.length, 1, "construction precondition: the journal window holds exactly one transition");
+  assert.equal(transitions[0].kind, "cancel", "construction precondition: of the dispatched kind — kind alone cannot distinguish it from this dispatch");
+  assert.equal(receipt.outcome, "COMMITTED_UNVERIFIED", "the matching landing was produced by a DIFFERENT operation of the same kind — it does not verify this commit");
+  assert.equal(receipt.reconciliation.status, "UNVERIFIED", "never OK, and never VIOLATED: the observed state is not this operation's determined violation either");
+  assert.equal(receipt.committedEffect.provenance?.committedSource, "unestablished", "never defined_equal_exact for a landing this operation did not produce");
+  assert.deepEqual(determinacyOf(receipt.committedEffect), {
+    immediateFinancialEffect: "UNKNOWN",
+    recurringFinancialEffect: "UNKNOWN",
+  });
+  assert.deepEqual(receipt.reconciliation.undeterminedDimensions, ["immediateFinancialEffect", "recurringFinancialEffect"]);
+});
+
+test("Test 61.19 (R2′): the EXACT-update analogue — a SKIPPED update followed by another actor's ordinary SAME-KIND update landing the intended state must not be established as this operation's", async () => {
+  // The symmetric construction on the update path, via the
+  // store-seeded EXACT record (as in 61.1/61.2) and the mirrored
+  // skip hook `_debugSkipUpdateOnNextUpdate`: the dispatched
+  // update returns a nominal success (artifact + generated
+  // invoice) but persists nothing and journals nothing; a
+  // distinct actor's ordinary update() then lands exactly the
+  // intended quantity and journals exactly one kind:"update"
+  // transition with a matching fingerprint. On the pre-fix code
+  // the kind-only journal gate passes this foreign transition;
+  // the receipt is then capped at COMMITTED_UNVERIFIED only by
+  // the downstream M3 invoice check — which records the SKIPPED
+  // call's invoice figures as this operation's DETERMINED
+  // provider_actuals, i.e. it establishes an operation that
+  // applied nothing. With identity binding the attribution gate
+  // itself denies the chain (the skipped response carries no
+  // operation identity; the journal's transition carries the
+  // third party's), and the figures stay unestablished
+  // candidates with both dimensions named.
+  const nowSec = Math.floor(new Date("2026-08-01T00:00:00Z").getTime() / 1000);
+  class SameKindUpdateSim extends StripeSim {
+    private interposed = false;
+    override update(...args: Parameters<StripeSim["update"]>): ReturnType<StripeSim["update"]> {
+      if (this.interposed) return super.update(...args);
+      this.interposed = true;
+      // THIS dispatch, with the skip fault armed: nominal success
+      // response, nothing persisted, nothing journaled.
+      this._debugSkipUpdateOnNextUpdate = true;
+      const dispatched = super.update(...args);
+      // A distinct actor's ordinary update of the same kind lands
+      // exactly the intended state.
+      super.update(...args);
+      // The adapter receives the FIRST call's result.
+      return dispatched;
+    }
+  }
+  const sim = new SameKindUpdateSim(nowSec);
+  const { sub } = freshStripeFixture();
+  sim.seedSubscription(structuredClone(sub));
+  const store = new QuoteStore();
+  const adapter = new StripeAdapter(sim, store);
+  const quoteId = await exactQuantityQuote(adapter, store, sub.id, 120);
+  const receipt = await adapter.commitChangeQuote(quoteId);
+  assert.equal(sim.retrieve(sub.id).items[0].quantity, 120, "the intended state IS persisted — by the third party's update");
+  const transitions = sim.listTransitions(sub.id, 0);
+  assert.equal(transitions.length, 1, "construction precondition: the journal window holds exactly one transition");
+  assert.equal(transitions[0].kind, "update", "construction precondition: of the dispatched kind");
+  assert.equal(receipt.outcome, "COMMITTED_UNVERIFIED", "the matching landing was produced by a DIFFERENT operation of the same kind");
+  assert.equal(receipt.reconciliation.status, "UNVERIFIED");
+  assert.equal(receipt.committedEffect.provenance?.committedSource, "unestablished", "the skipped call's invoice figures must NOT be recorded as this operation's determined actuals — the operation applied nothing");
+  assert.deepEqual(determinacyOf(receipt.committedEffect), {
+    immediateFinancialEffect: "UNKNOWN",
+    recurringFinancialEffect: "UNKNOWN",
+  });
+  assert.deepEqual(
+    receipt.reconciliation.undeterminedDimensions,
+    ["immediateFinancialEffect", "recurringFinancialEffect"],
+    "an attribution-denied receipt whose figures are candidates names BOTH undetermined dimensions"
+  );
 });
 
 test("Test 61.12: a VIOLATED receipt replays verbatim (no re-dispatch), and the one-shot fault does not leak into the next commit", async () => {
