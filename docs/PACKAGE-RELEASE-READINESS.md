@@ -401,3 +401,36 @@ This section supersedes earlier pending/UNKNOWN labels in this document:
   command. Then verify the published registry artifact and its
   simulator examples in a fresh environment. Issue #31 remains open
   until the registry release is verified.
+
+## 13. Coordinated Agorail MSE–SCQ integration boundary (November 1, 2026)
+
+PR #56 merged as `78b52797fcf9b6f2ccbf3afa6d66e7ebacac3337`.
+Experimental integration PR #57 subsequently merged with the distinct
+v0.7 business-intent fence, MSE v0.4 admission-only API and cross-repository
+adversarial tests. The frozen v0.6.2 specification remains unchanged.
+The SCQ v0.6.2 **npm** artifact must **exclude**
+`dist/src/integration/` alongside `dist/src/live/`:
+the v0.7 bridge is experimental source integration, **not**
+part of the v0.6.2 standalone package's advertised runtime API.
+
+**New final package candidate (supersedes the earlier e47349d1 checksum):**
+at PR #57 reconciled head `e4f1819c7ff2acfe2b3d3b165005aa0085fcd4c7`,
+Node 20/22 each packed
+`agorail-labs-scq-reference-0.6.2-experimental.1.tgz`
+with **37 files / 296,718 bytes / SHA-256
+`9d2974411b536975f7121b1222e6dfc6fb6e3b84354196c2e27d6b96de127f45`**.
+The two CI jobs also passed external npm artifact installation,
+TypeScript imports and simulated scenarios. See SCQ PR #57 check evidence.
+
+Release controls remain:
+- This is simulator-only. No live provider mechanism is certified; Issue #30
+  and the known conformance PARTIAL rows remain disclosed.
+- The integration bridge has its own separate source and tests, not a
+  new claim inside SCQ v0.6.2. MSE admission does not guarantee durable
+  idempotency or provider-side exactly-once execution.
+- Registry publishing and clean-room **registry** installation are
+  separate, not established by local tarball tests. Do not mark Issue #31
+  done until both registry operations are independently verified.
+- A subsequent source-only or docs-only commit that changes none of the
+  packed files does not change this candidate; if any packed file changes,
+  obtain a new exact-head manifest and SHA-256 before publishing.
