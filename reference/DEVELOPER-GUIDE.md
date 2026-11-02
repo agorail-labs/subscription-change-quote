@@ -5,9 +5,10 @@ does, how to install the locally built artifact, and how to read what
 it tells you. It is deliberately precise about limits: several things
 SCQ does **not** do are listed in section 13, and they matter.
 
-**Status:** experimental, unpublished (`private: true`), simulator
-only. Not a replacement billing API, not a production-certified
-payment SDK, and not certified provider conformance of any kind.
+**Status:** experimental and simulator-only. Not a replacement billing
+API, not a production-certified payment SDK, and not certified provider
+conformance of any kind. Publication is separately authorized; do not
+interpret this guide as an instruction to enable live billing.
 
 ## 1. What SCQ solves
 
@@ -48,9 +49,17 @@ three disciplines around that mutation:
 Not supported: connecting to a real billing provider, moving money,
 or relying on any figure this package produces for accounting.
 
-## 3. Installation from the generated package artifact
+## 3. Installation
 
-The package is not published to npm. From a repository checkout:
+When the experimental version has been published to npm, install that
+specific prerelease version (not the default dist-tag):
+
+```bash
+npm install @agorail-labs/scq-reference@0.6.2-experimental.1
+```
+
+Before registry publication, or for a reproducible local artifact,
+build a tarball from a repository checkout:
 
 ```bash
 cd reference
@@ -359,11 +368,15 @@ in this release:
   is not fully supported. No affected population is known outside
   this repository's fixtures.
 
-The audit records six maintainer decisions (D-1..D-6) arising from
-these rows — including whether issues #45 and #51 are accepted as
-class-B experimental limitations or corrected before any registry
-publication. Those decisions are pending; nothing in this guide
-pre-empts them.
+The maintainer has **accepted decisions D-1..D-6 for this simulator-only
+experimental package**. In particular, D-3 accepts Issue #51 and D-4
+accepts Issue #45 as **Class B, disclosed, fail-closed limitations**;
+neither defect is fixed or closed. D-1 retains V62-DET-08 PARTIAL,
+D-2 accepts the current trusted-adapter evidence boundary only for this
+experimental release, and D-5 defers the normative §6.16 amendment.
+D-6 permits preparation of a separately reviewed release configuration,
+**not** registry publication or live billing. Any registry publish
+requires a later explicit approval of the final artifact (Issue #31).
 
 ## 15. Compatibility and migration notes
 
