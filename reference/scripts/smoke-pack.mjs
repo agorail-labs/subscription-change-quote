@@ -44,7 +44,7 @@ try {
   // dist/src/live/ (the env-gated Chargebee live pilot) must NOT ship:
   // the published artifact is simulator-only. The exports map already
   // encapsulates it; the files allowlist now excludes it outright.
-  const excludedPrefixes = ["dist/tests/", "dist/demo/", "dist/scripts/", "dist/src/live/", "tests/", "demo/", "scripts/"];
+  const excludedPrefixes = ["dist/tests/", "dist/demo/", "dist/scripts/", "dist/src/live/", "dist/src/integration/", "tests/", "demo/", "scripts/"];
   for (const file of packedFiles) {
     if (excludedPrefixes.some((prefix) => file.startsWith(prefix)) ||
         (file.endsWith(".ts") && !file.endsWith(".d.ts"))) {
