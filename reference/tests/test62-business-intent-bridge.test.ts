@@ -1,6 +1,7 @@
 import { after, test } from "node:test";
 import assert from "node:assert/strict";
 import { mkdtempSync, rmSync } from "node:fs";
+import { spawn } from "node:child_process";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { DurableQuoteStore } from "../src/store/durable-store.js";
@@ -179,5 +180,55 @@ test("v0.7-intent-07: untrusted or malformed business-operation identity fails c
   assert.throws(() => ledger.claim({ ...business(), operation: { qty: undefined } }, admission), BusinessIntentConflict);
   assert.throws(() => ledger.claim({ ...business(), actorId: " " }, admission), BusinessIntentConflict);
   assert.throws(() => ledger.claim({ ...business(), operation: Number.NaN }, admission), BusinessIntentConflict);
+  ledger.close(); store.close();
+});
+
+test("v0.7-intent-08: separate processes race one intent and only one wins durable claim", async () => {
+  const x = setup();
+  x.ledger.close();
+  x.store.close();
+  const child = new URL("./helpers/business-intent-child.js", import.meta.url).pathname;
+  function claim(quoteId: string): Promise<{ acquired: boolean; originalQuoteId: string }> {
+    return new Promise((resolve, reject) => {
+      const p = spawn(process.execPath, [child, x.intentPath, quoteId], { stdio: ["ignore", "pipe", "pipe"] });
+      let out = ""; let err = "";
+      p.stdout.setEncoding("utf8").on("data", data => { out += data; });
+      p.stderr.setEncoding("utf8").on("data", data => { err += data; });
+      p.on("error", reject);
+      p.on("close", code => {
+        if (code !== 0) return reject(Error("Child claim failed " + code + ": " + err));
+        try { resolve(JSON.parse(out.trim())); } catch (e) { reject(e); }
+      });
+    });
+  }
+  const claims = await Promise.all([claim("q-child-a"), claim("q-child-b")]);
+  assert.equal(claims.filter(c => c.acquired).length, 1);
+  assert.equal(claims[0].originalQuoteId, claims[1].originalQuoteId);
+  const after = new BusinessIntentLedger(x.intentPath);
+  assert.equal(after.lookup({
+    tenantId: "tenant-x", businessIntentId: "single-customer-approval",
+    actorId: "customer-a", authorizationRef: "approval-a", provider: "chargebee",
+    site: "test-site", subscriptionId: "sub_1",
+    operation: { action: "CHANGE_QUANTITY", itemId: "addon-1", quantity: 120 }, quoteId: "yet-another-quote",
+  })?.quoteId, claims[0].originalQuoteId);
+  after.close();
+});
+
+test("v0.7-intent-09: process crash between separate intent claim and SCQ beginDispatch fails closed, no blind reissue", async () => {
+  const x = setup();
+  x.store.put(makeStoredQuote("q1"));
+  assert.equal(x.ledger.claim(business(), admission).acquired, true);
+  assert.equal(x.store.allAttempts().length, 0, "crash gap has NO SCQ attempt, not proof of non-execution");
+  x.ledger.close(); x.store.close();
+  const store = new DurableQuoteStore(x.storePath, { recoveryGraceMs: 0 });
+  const ledger = new BusinessIntentLedger(x.intentPath);
+  const bridge = new MseScqIntentBridge(ledger, new DurableMutationCoordinator(store));
+  let dispatchCount = 0;
+  const retry = await bridge.execute(business("q-fresh"), mutation("q-fresh"), hooks(), async () => {
+    dispatchCount++; return { type: "receipt", receipt: makeReceipt("q-fresh") };
+  });
+  assert.equal(retry.kind, "BLOCKED");
+  assert.equal(dispatchCount, 0);
+  assert.equal(store.allAttempts().length, 0, "do not rewrite an unknown gap as confirmed non-execution");
   ledger.close(); store.close();
 });
