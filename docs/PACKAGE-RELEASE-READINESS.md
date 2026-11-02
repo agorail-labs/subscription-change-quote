@@ -123,10 +123,14 @@ both Node 20 and Node 22 (section 5).
 ## 4. Tarball (from the PR head)
 
 - Filename: `agorail-labs-scq-reference-0.6.2-experimental.1.tgz`
-- **sha256: `a9b603053f76c57f213d4fbdfcbb2e69dc39a5842dd26ba506d21715d334e4dc`**
-  — identical across three independent `npm pack` runs (Node 22,
-  Node 20, and a repeat Node 22 pack), i.e. the artifact is
-  reproducible from the head. Size: 294,521 bytes. **37 files**:
+- **sha256: `501ddbd72ed3cc206f227ff5621ae5ad58224bffecca55696233942e1a5d0f04`**
+  — identical across independent `npm pack` runs on Node 22 and
+  Node 20 from the corrected head, i.e. the artifact is
+  reproducible from the head. Size: 296,433 bytes. **37 files**.
+  (This checksum supersedes `a9b60305…` from the original readiness
+  head: the artifact changed because the shipped `README.md` and
+  `DEVELOPER-GUIDE.md` gained the conformance disclosures —
+  the file count is unchanged and no code changed.) Contents:
   28 built JS/declaration files under `dist/src/` (adapters, core,
   store, index — no `live/`), `examples/` (3 scenarios), `README.md`,
   `DEVELOPER-GUIDE.md`, `LICENSE`, `package.json`.
@@ -183,6 +187,15 @@ installed copy — and passes on both toolchains.
 | Full suite, Node 20 | 863/863 | **863/863** |
 | Full suite, Node 22 | 863/863 | **863/863** |
 | Research repro suite | 11 pass / 7 fail | **11 pass / 7 fail** (unchanged, by design) |
+
+**Correction revalidation.** After merging main `e4df68f` (PR #54 —
+docs/research-only; the suite baseline is unchanged) and the
+shipped-documentation correction, the full suite, research suite,
+and `npm run smoke:pack` were re-run on the corrected head with a
+fresh per-toolchain `npm ci`: **863/863 on Node 20.19.5 and on
+Node 22.14.0**, research suite **11 pass / 7 fail** on both, and
+smoke:pack **PASS** on both. The artifact was then re-packed from
+a clean tree (section 4).
 
 Spec integrity: `spec/scq-v0.6.2-spec.md` sha256 `4100d249…`,
 `spec/scq-v0.6.1-spec.md` sha256 `0d32e584…` — both identical to
