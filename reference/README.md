@@ -1,12 +1,10 @@
 # @agorail-labs/scq-reference — experimental reference package
 
-> **Experimental — not published on npm, not for production billing.**
-> This package is a simulator-backed reference implementation of the
-> Subscription Change Quote (SCQ) protocol. It carries `private: true`
-> and exists so developers can install it from a locally built tarball
-> and evaluate the protocol's behavior. Nothing in it is certified
-> provider conformance, and it is not a replacement billing API or a
-> production payment SDK.
+> **Experimental — simulator-only; not for production billing.**
+> This is a reference implementation of the Subscription Change Quote
+> (SCQ) protocol for evaluation from a released npm artifact or a locally
+> built tarball. Nothing in it is certified provider conformance, and it
+> is not a replacement billing API or a production payment SDK.
 
 This package implements the **published SCQ v0.6.2 experimental
 specification** (`spec/scq-v0.6.2-spec.md` in the repository). The
@@ -40,10 +38,17 @@ established value, possibly a verified zero), `NOT_APPLICABLE`
 (licensed by the spec's applicability table), or `UNKNOWN` (no
 established value — never a synonym for zero).
 
-## Install (from a locally built tarball)
+## Install
 
-This package is not on npm. Build the artifact from the repository
-and install the tarball into your own project:
+After the experimental package is published to npm under its
+`experimental` dist-tag, install the exact version in your project:
+
+```bash
+npm install @agorail-labs/scq-reference@0.6.2-experimental.1
+```
+
+Before registry publication, or to reproduce the candidate artifact,
+build and install a local tarball from the repository:
 
 ```bash
 git clone https://github.com/agorail-labs/subscription-change-quote
@@ -155,9 +160,12 @@ fixed in this release:
   The behavior fails closed. No affected population is known outside
   this repository's fixtures.
 
-Both are recorded as accepted experimental limitations, pending
-maintainer decisions in the audit record
-(`research/v0.6.2-release-readiness.md` section G in the repository).
+Both are **accepted Class B limitations for this simulator-only
+experimental release** under maintainer decisions D-3 and D-4; neither
+issue is closed or fixed. The full conformance decision and conditions
+are recorded in `research/v0.6.2-release-readiness.md` section G and
+Issue #31 in the repository. This is not an approval for live billing,
+production or multi-site deployment.
 
 ## Support and security
 
