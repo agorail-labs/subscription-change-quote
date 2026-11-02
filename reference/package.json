@@ -42,7 +42,6 @@
   "optionalDependencies": {
     "better-sqlite3": "^11.10.0"
   },
-  "private": true,
   "repository": {
     "directory": "reference",
     "type": "git",
