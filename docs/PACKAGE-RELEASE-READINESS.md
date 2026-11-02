@@ -10,6 +10,13 @@ Prepared against main `f7e9360` (PR #52 merged). All results below
 were measured on the branch `package/agorail-experimental-readiness`;
 commands and outputs are reproducible from the PR head (section 10).
 
+**Update (maintainer-review correction):** the branch has since
+merged main `e4df68f` (PR #54, the consolidated conformance audit),
+and the shipped documentation now carries the audit's conformance
+disclosures (sections 10 and 11 record the audit's outcome). The
+artifact was re-packed after the documentation correction; the
+current checksum is in section 4.
+
 ## 1. Proposed package identity
 
 | Field | Value |
@@ -208,7 +215,15 @@ authorization; determinacy rests on adapter-produced evidence (core
 trust limitation, register G-01); candidates are response-sourced
 only (§3.10); durability requires the durable store and does not
 create exactly-once provider execution; INDETERMINATE resolution is a
-manual, evidence-based operator act.
+manual, evidence-based operator act. Conformance (merged audit,
+PR #54): 72 of 75 Appendix B rules IMPLEMENTED, 3 PARTIAL
+(V62-DET-08, V62-EVD-01, V62-SV-02), 0 BLOCKED, on simulator-level
+evidence — plus two disclosed fail-closed limitations, issue #45
+(durable exclusion over-blocks identical subscription IDs across
+provider/site boundaries) and issue #51 (a pre-v4 ASSERTED migrated
+landing reconciliation cannot be superseded by a new VERIFIED
+barrier); full text in the shipped README and in section 14 of the
+developer guide.
 
 ## 9. Gated publication checklist — NOT executed
 
@@ -218,8 +233,15 @@ is taken; nothing here pre-authorizes any of them.
 1. **Scope**: create or confirm the `@agorail-labs` npm organization;
    confirm ownership; enable organization 2FA; grant the publishing
    account access. *(Blocker until done — currently UNKNOWN.)*
-2. **Conformance dependency**: obtain Agent 1's final issue-#29
-   conformance recommendation (section 10). *(Pending.)*
+2. **Conformance dependency**: Agent 1's consolidated issue-#29
+   conformance audit has been delivered and merged (PR #54, main
+   `e4df68f`) with a **CONDITIONAL GO** recommendation for a
+   simulator-only experimental package (section 10). Remaining
+   before publication: the maintainer's acceptance of decisions
+   D-1..D-6 — in particular, D-3 (issue #51) and D-4 (issue #45)
+   must be explicitly accepted as class B or resolved before any
+   registry publication. *(Audit delivered and merged; acceptance
+   outstanding.)*
 3. In a **separate, approved change**: remove `private: true` from
    `reference/package.json` (and only that), re-run the full suites
    and `npm run smoke:pack`, re-pack, and confirm the tarball sha256
@@ -235,18 +257,76 @@ is taken; nothing here pre-authorizes any of them.
    readiness document; keep the `experimental` dist-tag until a
    stable line is separately approved.
 
-## 10. Conformance dependency (Phase 7)
+## 10. Conformance dependency (Phase 7) — audit delivered and merged
 
-Agent 1 is concurrently auditing conformance under issue #29. This
-branch modifies **no** conformance traceability, gap-register, or
-research files. **Explicit dependency: the conformance recommendation
-from Agent 1's issue-#29 final audit is PENDING.** Package smoke
-tests and clean-room installs demonstrate that the artifact installs
-and behaves as its own suites specify; they are **not** conformance
-evidence, and nothing in the shipped documentation claims IMPLEMENTED
-conformance on their basis. If that audit identifies a genuine
-release-blocking defect, it is to be recorded as a blocker here
-rather than worked around in the package.
+This branch modifies **no** conformance traceability, gap-register,
+or research files. The dependency recorded as pending in the
+original readiness pass is no longer pending: Agent 1's
+consolidated conformance audit under issue #29 was delivered as
+PR #54 and **merged into `main` as `e4df68f`**, and this branch has
+merged that main. Full record: `research/v0.6.2-conformance-audit.md`;
+decisions and the npm recommendation are in section G of
+`research/v0.6.2-release-readiness.md`, which is the normative
+source for the conformance disclosures now carried in the shipped
+`README.md` and `DEVELOPER-GUIDE.md`.
+
+**Audit result.** The full 75-rule matrix (spec Appendix B) was
+re-verified — no status changes: **72 IMPLEMENTED / 3 PARTIAL /
+0 BLOCKED**, from simulator-level evidence (full suite 863/863 on
+Node 20 and 22 at the audited head; research suite 11 pass / 7 fail,
+all guard-blocked by design). The three PARTIAL rows are
+**V62-DET-08** (snapshot determinacy is descriptive — no enforcement
+consumer of the field), **V62-EVD-01** (G-01 — provider-origin
+authenticity not demonstrated; the core trusts adapter-established
+classification and does not independently authenticate provider
+events), and **V62-SV-02** (G-08 narrowed — the shared hook is
+consumed by the store, Chargebee-live, Chargebee-sim UPDATE, and
+Stripe EXACT/CANCEL; Chargebee-sim CANCEL, Paddle CANCEL, and Zuora
+remain adapter-owned specializations). The audit classified **no
+class-A (release-blocking) items** for a simulator-only package;
+issues #45 and #51 are class B, and its NO-GO stands for any live or
+test-site commit, any production use, and any unqualified
+conformance claim.
+
+**Audit recommendation: CONDITIONAL GO** — for a simulator-only
+experimental npm package only — on these exact conditions (§G):
+
+1. Release notes and the package README carry the three PARTIAL
+   rows and the Issue #45 / #51 limitations in substance, and make
+   no unqualified conformance or provider-authentication claim.
+   *(Status: satisfied by this PR's documentation correction — the
+   shipped README and developer guide carry all three PARTIAL rows
+   and both limitations, and disclaim any blanket conformance
+   claim.)*
+2. The release-candidate PR (D-6) re-runs, on its exact head:
+   `npm ci`, build, the full suite, and `npm run smoke:pack`, on
+   Node 20 and Node 22 — the audit's 863/863 + smoke-pack pass at
+   `f7e9360` is baseline evidence, not a substitute. *(Status:
+   satisfied for this PR's corrected head — the re-run results are
+   recorded in sections 5 and 6.)*
+3. The package ships with no live commit path enabled; the live
+   adapter remains experimental and preservation-refusing, and the
+   package text says so. *(Status: satisfied — the re-packed
+   artifact contains no live code (section 4) and the shipped text
+   states the live adapter's status.)*
+4. D-3 and D-4 are either resolved or explicitly accepted as
+   class B in the release record by the maintainer. *(Status:
+   OUTSTANDING — a maintainer act; see below.)*
+
+**Decisions D-1..D-6.** The audit records six maintainer decisions:
+D-1 (V62-DET-08 closure route), D-2 (G-01 trust posture), D-3
+(issue #51), D-4 (issue #45), D-5 (§6.16 recovery-evidence text),
+and D-6 (package governance). They are **recommendations pending
+the maintainer's acceptance** — none is approved by the audit, by
+this document, or by this PR. In particular, **D-3 (issue #51) and
+D-4 (issue #45) must be explicitly accepted as class B or resolved
+before any registry publication.**
+
+Package smoke tests and clean-room installs remain what they always
+were: evidence that the artifact installs and behaves as its own
+suites specify. They are **not** conformance evidence, and nothing
+in the shipped documentation claims IMPLEMENTED conformance on
+their basis.
 
 ## 11. Recommendation
 
@@ -259,8 +339,11 @@ unchanged at 863/863, artifact reproducible (single sha256 across
 toolchains), and the security audit clean. The conditions are
 external to the package, and each is a hard gate, not a formality:
 (1) npm scope ownership/permissions are unverified and must be
-established by a maintainer; (2) Agent 1's issue-#29 conformance
-recommendation is still pending; (3) publication itself — including
+established by a maintainer; (2) the conformance audit is delivered
+and merged with a CONDITIONAL GO, but decisions D-1..D-6 are
+recommendations pending the maintainer's acceptance — including
+D-3/D-4, which must be accepted as class B or resolved before
+registry publication (section 10); (3) publication itself — including
 the `private: true` removal — requires the maintainer's separate,
 explicit approval under the checklist in section 9. Readiness is not
 authorization.

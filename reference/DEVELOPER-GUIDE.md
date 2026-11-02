@@ -294,7 +294,78 @@ mirrors of the real providers' full catalogs.
 - **No production readiness.** Error surfaces, catalogs, and edge
   cases are experimental. Do not bill anyone with this.
 
-## 14. Compatibility and migration notes
+## 14. Conformance status and limitations
+
+A consolidated conformance audit of the merged repository
+(PR #54, issue #29; record in `research/v0.6.2-conformance-audit.md`
+and section G of `research/v0.6.2-release-readiness.md`) assessed
+the 75 rules of spec Appendix B at **72 IMPLEMENTED / 3 PARTIAL /
+0 BLOCKED**. All of that evidence is simulator-level: no live
+provider commit has ever been executed, and no provider has
+reviewed or endorsed SCQ. This package is therefore **not** fully
+v0.6.2-conformant, and no "v0.6.2-conformant" or certification claim
+is made for it. Package smoke tests are install/behavior checks,
+not conformance evidence. The three PARTIAL rules:
+
+- **V62-DET-08** — snapshot determinacy is informative. Every
+  adapter emits the snapshot's determinacy fields honestly, but
+  there is no enforcement consumer of the field: the published
+  section 3.10 text imposes a prohibition on consumers (satisfied
+  by non-use) and no consumption duty. Effect determinacy — the
+  determinacy that gates commit and reconciliation — is established
+  independently at effect construction, so this PARTIAL is about
+  the snapshot metadata, not about whether committed figures are
+  established. Closure would be a governance act (an informative
+  spec amendment or a named enforcement consumer), not an
+  implementation fix.
+- **V62-EVD-01 (G-01)** — provider-origin authenticity is not
+  demonstrated. The core judges adapter-established classifications
+  — the record-internal half, a label judged against the record's
+  own figures, is pinned by tests — but it does not independently
+  authenticate provider events: trusted-adapter provenance is not
+  authenticated provider-origin proof. The durable-recovery
+  verifier adds caller-independence, bounded by deployment trust
+  in its configured source; it is not an origin authenticator
+  either. This limitation is ratified — the spec states the
+  non-claim itself (see also section 9).
+- **V62-SV-02 (G-08)** — the shared post-commit state-verification
+  hook (spec section 6.12) is consumed by the store, the Chargebee
+  live adapter, Chargebee-sim UPDATE, and Stripe EXACT/CANCEL —
+  but shared-hook consumption is not universal. Three adapter-owned
+  specializations remain: **Chargebee-sim CANCEL**, **Paddle
+  CANCEL**, and **Zuora**, because the hook's contract cannot
+  express checks they perform (schedule-absence decisions,
+  bound-artifact financial gates, `cancelledDate`/sequence-derived
+  expectations). Equivalence with the hook path is by per-adapter
+  pinning tests, disclosed in the audit — not by shared code.
+
+Two further limitations are disclosed and accepted for the
+experimental line. Both are fail-closed, and **neither is fixed**
+in this release:
+
+- **Issue #45 — cross-site exclusion over-block.** The durable
+  store's unresolved-attempt exclusion is keyed by subscription
+  identity alone, so an unresolved attempt over-blocks: the same
+  subscription ID is refused across provider/site boundaries even
+  where the attempts are unrelated. This is an availability
+  limitation (the keying is stated in spec section 6.16); do not
+  assume multi-site use of one subscription ID is fully supported.
+  The failure direction is refusal, never a silent second dispatch.
+- **Issue #51 — migrated ASSERTED reconciliation cannot be
+  superseded.** In a store migrated from a pre-v4 schema, an
+  ASSERTED migrated landing reconciliation cannot be superseded by
+  a new VERIFIED barrier, so the affected attempt stays blocked
+  rather than recovering. Migrated-store recovery for such attempts
+  is not fully supported. No affected population is known outside
+  this repository's fixtures.
+
+The audit records six maintainer decisions (D-1..D-6) arising from
+these rows — including whether issues #45 and #51 are accepted as
+class-B experimental limitations or corrected before any registry
+publication. Those decisions are pending; nothing in this guide
+pre-empts them.
+
+## 15. Compatibility and migration notes
 
 - The package implements the **v0.6.2** specification. v0.6.1
   payloads (no determinacy record) read every dimension as UNKNOWN
@@ -309,7 +380,7 @@ mirrors of the real providers' full catalogs.
 - Repository, issues, and the evidence register:
   https://github.com/agorail-labs/subscription-change-quote
 
-## 15. Contribution and issue reporting
+## 16. Contribution and issue reporting
 
 Contributions and issue reports go through the repository:
 https://github.com/agorail-labs/subscription-change-quote/issues —

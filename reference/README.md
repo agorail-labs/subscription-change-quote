@@ -114,6 +114,51 @@ limits below in full.
   documented native idempotency window is 30 minutes (see
   `spec/ERRATA-v0.6.1.md` ER-4 in the repository).
 
+## Conformance status and limitations
+
+This package is a reference implementation of the published SCQ
+v0.6.2 experimental specification. A consolidated conformance audit
+of the merged repository (PR #54, issue #29) assessed the 75 rules
+of spec Appendix B at **72 IMPLEMENTED / 3 PARTIAL / 0 BLOCKED**,
+entirely from simulator-level evidence — no live provider commit has
+ever been executed, and no provider has reviewed or endorsed SCQ.
+This package is **not** fully v0.6.2-conformant, and no certification
+claim is made. The three PARTIAL rules are:
+
+- **V62-DET-08** — snapshot determinacy is informative metadata:
+  adapters emit it honestly, but there is no enforcement consumer of
+  the field. Effect determinacy is established independently when
+  the committed effect is constructed.
+- **V62-EVD-01 (G-01)** — evidence provenance is trusted-adapter
+  provenance, not authenticated provider-origin proof: the core
+  trusts adapter-established classification and does not
+  independently authenticate provider events.
+- **V62-SV-02 (G-08)** — shared-hook consumption for post-commit
+  state verification is not universal: three adapter-owned
+  specializations remain (Chargebee-sim CANCEL, Paddle CANCEL, and
+  Zuora). Equivalence rests on per-adapter pinning tests, disclosed
+  in the audit.
+
+Two further disclosed limitations, both fail-closed and neither
+fixed in this release:
+
+- **Issue #45** — the durable store's unresolved-attempt exclusion
+  is keyed by subscription identity alone, so it over-blocks: the
+  same subscription ID is refused across provider/site boundaries
+  even where the attempts are unrelated. This is an availability
+  limitation — multi-site use of one subscription ID is not fully
+  supported — and the behavior fails closed (refusal), never open.
+- **Issue #51** — in a store migrated from a pre-v4 schema, an
+  ASSERTED migrated landing reconciliation cannot be superseded by
+  a new VERIFIED barrier, so the affected attempt stays blocked;
+  migrated-store recovery for such attempts is not fully supported.
+  The behavior fails closed. No affected population is known outside
+  this repository's fixtures.
+
+Both are recorded as accepted experimental limitations, pending
+maintainer decisions in the audit record
+(`research/v0.6.2-release-readiness.md` section G in the repository).
+
 ## Support and security
 
 This is an experimental artifact maintained on a best-effort basis.
