@@ -1,10 +1,12 @@
 # SCQ Package Release Readiness — @agorail-labs/scq-reference
 
-**Status of this document:** release-*readiness* assessment for the
-first experimental npm package candidate (issue #31, package half).
-It is **not** publication authorization. The package remains
-`private: true`, unpublished, and unpublishable from this branch
-without the separate gated steps in section 9.
+**Status of this document:** release-readiness and release-configuration
+assessment for the first experimental npm package candidate (Issue #31).
+This release-configuration PR removes the prior `private: true` npm
+publication guard **only in a review-gated branch**; the package remains
+unpublished. This document and PR do **not** authorize registry
+publication, creating tags/releases, or enabling live billing. Final
+artifact approval and a separate manual npm publish are required.
 
 Prepared against main `f7e9360` (PR #52 merged). All results below
 were measured on the branch `package/agorail-experimental-readiness`;
@@ -41,14 +43,15 @@ was stale on all three axes: scope, versioning, and spec version.)
 - `GET registry.npmjs.org/@agorail-labs%2fscq-reference` → **404**: the
   package name is **not registered** (verified 2026-11-01). The old
   `@arjun2075/scq-reference` name is likewise unregistered.
-- **Scope ownership and publish permissions: UNKNOWN.** There are no
-  npm credentials in the build environment, so whether the
-  `@agorail-labs` npm organization exists, who controls it, and who
-  may publish under it **cannot be verified from here**. "Not
-  registered" must not be read as "available to us": a maintainer
-  must create or confirm the npm organization and grant publish
-  rights before any release step (section 9, step 1). This is a
-  publication blocker, not a package defect.
+- **Scope ownership — resolved after the original readiness assessment.**
+  On November 1, 2026, the maintainer reported authenticated-session
+  evidence that npm user `agorail` created the npm organization
+  `agorail-labs` on its free public-package plan and is its sole
+  owner. Ownership evidence is from the signed-in npm settings pages;
+  unauthenticated access is bot-blocked. The maintainer also confirmed
+  **account 2FA enabled**. Do not record secrets or recovery codes.
+  Publishing rights must still be checked with the authenticated npm
+  CLI at release time; no registry publication has occurred.
 
 ## 3. Phase 1 audit findings
 
@@ -240,29 +243,39 @@ developer guide.
 
 ## 9. Gated publication checklist — NOT executed
 
-Each step requires the maintainer's explicit approval at the time it
-is taken; nothing here pre-authorizes any of them.
+Maintainer decisions D-1..D-6 and the 2FA prerequisite are now accepted,
+as recorded in Issue #31. They authorize preparation and review of a
+release-configuration PR, **not** the registry publish action. Publishing
+still requires the maintainer's separate explicit approval of the final
+artifact and its verification record.
 
-1. **Scope**: create or confirm the `@agorail-labs` npm organization;
-   confirm ownership; enable organization 2FA; grant the publishing
-   account access. *(Blocker until done — currently UNKNOWN.)*
-2. **Conformance dependency**: Agent 1's consolidated issue-#29
-   conformance audit has been delivered and merged (PR #54, main
-   `e4df68f`) with a **CONDITIONAL GO** recommendation for a
-   simulator-only experimental package (section 10). Remaining
-   before publication: the maintainer's acceptance of decisions
-   D-1..D-6 — in particular, D-3 (issue #51) and D-4 (issue #45)
-   must be explicitly accepted as class B or resolved before any
-   registry publication. *(Audit delivered and merged; acceptance
-   outstanding.)*
-3. In a **separate, approved change**: remove `private: true` from
-   `reference/package.json` (and only that), re-run the full suites
-   and `npm run smoke:pack`, re-pack, and confirm the tarball sha256
-   is unchanged apart from the manifest.
-4. `npm publish agorail-labs-scq-reference-0.6.2-experimental.1.tgz --access public --tag experimental`
-   from the verified artifact of step 3, using a granular access
-   token with publish rights to the scope, from a maintainer's
-   environment (no CI publishing).
+1. **Scope**: **DONE (maintainer-confirmed)** — npm organization
+   `agorail-labs` exists; npm user `agorail` owns it and has enabled
+   account 2FA. Confirm current authenticated CLI identity and
+   publishing rights immediately before manual publication.
+2. **Conformance and governance**: **DONE** — the consolidated audit
+   PR #54 was merged as `e4df68f` (72 IMPLEMENTED / 3 PARTIAL /
+   0 BLOCKED; simulator evidence). The maintainer accepted decisions
+   D-1..D-6, including **D-3 / Issue #51** and **D-4 / Issue #45**
+   as disclosed **Class B** fail-closed limitations only for this
+   simulator-only experimental package; neither issue is fixed.
+   The ratified G-01 trust limitation is accepted for this release
+   only; normative proposals remain deferred.
+3. **Release configuration (THIS DRAFT PR; NOT MERGED):** remove
+   `private: true` from `reference/package.json`, update shipped
+   distribution documentation, and re-run `npm ci`, full suite and
+   `npm run smoke:pack` on Node 20/22. Confirm the tarball contents
+   include **no `dist/src/live/`**, record the complete SHA-256 and
+   file count **from the final release commit**, and independently
+   reproduce them before publish. The checksum will differ from
+   the historical readiness artifact because metadata/docs changed.
+4. **REQUIRES A SECOND, EXPLICIT PUBLICATION APPROVAL:** from an
+   authenticated maintainer environment, verify `npm whoami`, inspect
+   the exact final tarball and integrity checksum, and only then run
+   `npm publish agorail-labs-scq-reference-0.6.2-experimental.1.tgz --access public --tag experimental`
+   through npm's required interactive 2FA or a currently permitted
+   secure authentication method. Never share OTPs, recovery codes,
+   or tokens in GitHub comments or PRs. No CI publishing.
 5. Verify the registry page, install the published package into a
    fresh project, and re-run the three scenarios from the registry
    artifact.
@@ -324,16 +337,17 @@ experimental npm package only — on these exact conditions (§G):
    states the live adapter's status.)*
 4. D-3 and D-4 are either resolved or explicitly accepted as
    class B in the release record by the maintainer. *(Status:
-   OUTSTANDING — a maintainer act; see below.)*
+   SATISFIED — maintainer accepted both issues as Class B for
+   simulator-only experimental release preparation; neither fixed.
+   Recorded on Issue #31.)*
 
-**Decisions D-1..D-6.** The audit records six maintainer decisions:
-D-1 (V62-DET-08 closure route), D-2 (G-01 trust posture), D-3
-(issue #51), D-4 (issue #45), D-5 (§6.16 recovery-evidence text),
-and D-6 (package governance). They are **recommendations pending
-the maintainer's acceptance** — none is approved by the audit, by
-this document, or by this PR. In particular, **D-3 (issue #51) and
-D-4 (issue #45) must be explicitly accepted as class B or resolved
-before any registry publication.**
+**Decisions D-1..D-6: accepted by the maintainer.** D-1 retains
+V62-DET-08 PARTIAL; D-2 accepts the trusted-adapter boundary only
+for this experimental release; D-3 and D-4 accept Issues #51 and #45
+as Class B disclosed fail-closed limitations, not fixes; D-5 defers
+the §6.16 normative amendment; D-6 approves preparing this separate
+release-configuration PR. The decision record is Issue #31. **The
+actual npm publication still requires its own explicit approval.**
 
 Package smoke tests and clean-room installs remain what they always
 were: evidence that the artifact installs and behaves as its own
@@ -349,14 +363,39 @@ The artifact itself is ready: metadata corrected, live code excluded,
 documentation and runnable examples shipped, clean-room installation
 and all three scenarios verified on Node 20 and Node 22, suites
 unchanged at 863/863, artifact reproducible (single sha256 across
-toolchains), and the security audit clean. The conditions are
-external to the package, and each is a hard gate, not a formality:
-(1) npm scope ownership/permissions are unverified and must be
-established by a maintainer; (2) the conformance audit is delivered
-and merged with a CONDITIONAL GO, but decisions D-1..D-6 are
-recommendations pending the maintainer's acceptance — including
-D-3/D-4, which must be accepted as class B or resolved before
-registry publication (section 10); (3) publication itself — including
-the `private: true` removal — requires the maintainer's separate,
-explicit approval under the checklist in section 9. Readiness is not
-authorization.
+toolchains), and the security audit clean. The external prerequisites (npm ownership, owner-confirmed 2FA and
+D-1..D-6 governance acceptance) are now satisfied for **preparing**
+the release configuration. The remaining hard gates are: (1)
+review/merge of this release-only PR after exact-head Node 20/22,
+neutrality and freeze checks, smoke-pack, and final-artifact hash and
+contents audit; (2) re-verify npm CLI scope rights; and (3) a
+**separate explicit approval of registry publication** before any
+manual publish. Readiness is not authorization.
+
+## 12. Post-governance release-configuration handoff (November 1, 2026)
+
+This section supersedes earlier pending/UNKNOWN labels in this document:
+
+- npm org ownership was confirmed by the maintainer in authenticated npm
+  settings; account 2FA was subsequently reported **enabled**. No npm
+  credential or authenticator secret is stored in this repository.
+- Maintainer **accepted D-1..D-6**. V62-DET-08 and the other two PARTIAL
+  rows remain PARTIAL. The G-01 adapter-trust boundary is an explicit
+  experimental-only limitation. Issues #45 and #51 are **Class B for
+  simulator-only evaluation**, still open and still fail-closed.
+  The §6.16 amendment remains separately governed and deferred.
+- The current PR changes **only distribution metadata and release-facing
+  documentation**. It removes `private: true` to permit a *future*
+  npm registry submission, not to initiate one. Neither a CI publishing
+  job nor a tag/release is added. Simulator-only exports and the
+  `!dist/src/live/` packaging exclusion remain intact.
+- At the PR's final exact head, record CI results, tarball SHA-256,
+  file count, and absence of live files. A tarball built before these
+  changes, including the former readiness checksum, is **not** the
+  authorized candidate. The final hash must be independently
+  reproducible.
+- **STOP before registry publication.** The maintainer must separately
+  approve the exact final artifact and the manual npm publication
+  command. Then verify the published registry artifact and its
+  simulator examples in a fresh environment. Issue #31 remains open
+  until the registry release is verified.
