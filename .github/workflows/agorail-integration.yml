@@ -19,7 +19,7 @@ jobs:
         uses: actions/checkout@v4
         with:
           repository: agorail-labs/mutation-safety-envelope
-          ref: 8157075708a077457230c7bf4d1a3c613111c48d
+          ref: 389a7f87f1a5743c6542950d07b5244bc127e011
           path: mse-dependency
           persist-credentials: false
       - uses: actions/setup-node@v4
