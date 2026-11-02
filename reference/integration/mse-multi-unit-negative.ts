@@ -63,7 +63,7 @@ assert.equal(outcomes.get("addon-change"), "REFUSED");
 assert.equal(outcomes.get("invoice-ledger"), "INDETERMINATE");
 assert.equal(outcomes.get("support-entitlement"), "APPLIED");
 assert.equal(effectDispatches, 2, "only the units actually applied simulate committed effects");
-assert.equal(response.commitResult.aggregateHint, "PARTIAL");
+assert.equal(response.commitResult.aggregateHint, "MIXED");
 
 const receipt = provider.receipt(quote.quoteId);
 const finalities = new Map(receipt.effectReceipts.map(e => [e.effectId, e.finality]));
