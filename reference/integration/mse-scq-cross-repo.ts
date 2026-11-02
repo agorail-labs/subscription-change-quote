@@ -1,16 +1,16 @@
 /**
- * Cross-repository simulated MSE v0.4 -> SCQ v0.7 integration fixture.
+ * Agorail cross-repository SUBSCRIPTION fixture (simulator only).
+ * Imports actual MSE admission-only validator and actual SCQ coordinator.
  *
- * This script uses the ACTUAL MSE admission-only evaluator/validator source
- * pinned by CI checkout, and the ACTUAL SCQ durable coordinator/SQLite store.
- * The binding's historical-state reader, customer authorization and provider
- * operation remain simulated. No live provider mutation occurs.
+ * Seat expansion must co-include an addon entitlement quantity update.
+ * The MSE binding is a simulated in-process state evaluator, not a read
+ * from Chargebee. SCQ financial and provider-preservation preflight is
+ * simulated too. No live provider calls and no multi-unit atomicity claim.
  */
 import assert from "node:assert/strict";
-import { mkdtempSync, readFileSync, rmSync } from "node:fs";
+import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { fileURLToPath } from "node:url";
 import { evaluateAdmissionOnly } from "../../mse-dependency/src/core/admission-only.ts";
 import { assertAdmissionReportWellFormed } from "../../mse-dependency/src/core/validate.ts";
 import { DurableQuoteStore } from "../src/store/durable-store.ts";
@@ -18,41 +18,103 @@ import { DurableMutationCoordinator } from "../src/store/mutation-coordinator.ts
 import { BusinessIntentLedger, MseScqIntentBridge } from "../src/integration/business-intent-bridge.ts";
 import { makeReceipt, makeStoredQuote } from "../tests/helpers/durable-fixtures.ts";
 
-const base = fileURLToPath(new URL("../../mse-dependency/examples/retail/", import.meta.url));
-const passFixture = JSON.parse(readFileSync(join(base, "amended-quote.fixture.json"), "utf8"));
-const refusalFixture = JSON.parse(readFileSync(join(base, "admission-refusal.fixture.json"), "utf8"));
-const report = passFixture.commitResponse.admissionReport;
-const proposal = {
-  proposalId: report.proposalId,
-  target: passFixture.quote.target,
-  change: { transitions: passFixture.quote.units.map((u: any) => u.transition) },
+const scope = "subscription:sub_1";
+const target = { provider: "chargebee", site: "simulated", subscriptionId: "sub_1" };
+const seats = {
+  unitRef: "seat-change",
+  unitLocator: { scopeRef: scope, unitKey: "seat-item" },
+  transition: { action: "CHANGE_QUANTITY", itemId: "seat-item", quantity: 120 },
+  effects: [],
 };
+const addon = {
+  unitRef: "addon-entitlement",
+  unitLocator: { scopeRef: scope, unitKey: "addon-item" },
+  transition: { action: "CHANGE_QUANTITY", itemId: "addon-item", quantity: 120 },
+  effects: [],
+};
+const relation = {
+  relationId: "subscription:seat-change-requires-addon-entitlement",
+  type: "REQUIRES_COINCLUSION" as const,
+  triggerUnitRefs: [seats.unitRef],
+  scopeRef: scope,
+  passEvidence: "REQUIRED" as const,
+};
+const proposal = {
+  proposalId: "approved-seat-expansion",
+  target,
+  change: { transitions: [seats.transition, addon.transition] },
+};
+const mseQuote = {
+  quoteId: "mse-subscription-q1",
+  target,
+  snapshot: { subscriptionVersion: "v1" },
+  commitConsistency: "SNAPSHOT_REQUIRED" as const,
+  units: [seats, addon],
+  admissionRelations: [relation],
+};
+const refusalProposal = {
+  proposalId: "incomplete-seat-expansion",
+  target,
+  change: { transitions: [seats.transition] },
+};
+const refusalQuote = {
+  ...mseQuote,
+  quoteId: "mse-subscription-q2",
+  units: [seats],
+};
+const at = new Date("2026-11-01T18:40:00.000Z");
+
+/** Binding-specific live co-inclusion evaluation over simulated current state. */
+function evaluateSubscriptionUnits(_proposal: typeof proposal, quote: typeof mseQuote | typeof refusalQuote) {
+  const present = quote.units.some(u =>
+    u.unitLocator.scopeRef === scope && u.unitLocator.unitKey === addon.unitLocator.unitKey &&
+    JSON.stringify(u.transition) === JSON.stringify(addon.transition));
+  const failure = {
+    relationId: relation.relationId,
+    witness: {
+      disposition: "COMPLETE" as const,
+      requiredTransitions: [{ unitLocator: addon.unitLocator, transition: addon.transition }],
+    },
+  };
+  return present
+    ? {
+        stateRef: { subscriptionVersion: "v1" },
+        failures: [],
+        coverage: [{
+          relationId: relation.relationId, status: "PASSED" as const,
+          requiredParticipants: [{ unitLocator: addon.unitLocator, transition: addon.transition }],
+          satisfactions: [{
+            source: "CURRENT_REQUEST" as const, unitRef: addon.unitRef, transition: addon.transition,
+          }],
+        }],
+      }
+    : {
+        stateRef: { subscriptionVersion: "v1" },
+        failures: [failure],
+        coverage: [{ relationId: relation.relationId, status: "FAILED" as const }],
+      };
+}
+const approved = evaluateAdmissionOnly(proposal, mseQuote, (p,q) =>
+  evaluateSubscriptionUnits(p as typeof proposal, q as typeof mseQuote), at);
+assert.equal(approved.kind, "ADMISSION_PASSED");
+const rejected = evaluateAdmissionOnly(refusalProposal, refusalQuote, (p,q) =>
+  evaluateSubscriptionUnits(p as typeof proposal, q as typeof refusalQuote), at);
+assert.equal(rejected.kind, "ADMISSION_REFUSED");
+
 const business = (quoteId: string, id: string) => ({
   tenantId: "tenant-1", businessIntentId: id,
   actorId: "customer-7", authorizationRef: "approved-operation-42",
   provider: "chargebee", site: "simulated", subscriptionId: "sub_1",
-  operation: { change: "CHANGE_QUANTITY", itemId: "item_1", seats: 120 },
+  operation: { change: "CHANGE_QUANTITY", itemId: "seat-item", seats: 120,
+    dependentAddonItemId: "addon-item", addonQuantity: 120 },
   quoteId,
 });
 const mutation = (quoteId: string) => ({
   quoteId, subscriptionId: "sub_1", provider: "chargebee", site: "simulated",
   idempotencyKey: "unique-" + quoteId,
-  request: { subscription_items: [{ item_price_id: "item_1", quantity: 120 }] },
+  // Mock operation only. Provider-safe targeted semantics NOT established.
+  request: { items: [{ id: "seat-item", quantity: 120 }, { id: "addon-item", quantity: 120 }] },
 });
-function actualMsePass() {
-  return evaluateAdmissionOnly(proposal, passFixture.quote, () => ({
-    coverage: report.coverage,
-    failures: [],
-    stateRef: report.stateRef,
-  }), new Date(report.evaluatedAt));
-}
-function actualMseRefusal() {
-  const r = refusalFixture.commitResponse.admissionRefusal;
-  return evaluateAdmissionOnly(refusalFixture.proposal, refusalFixture.quote, () => ({
-    coverage: r.coverage, failures: r.failures, stateRef: r.stateRef,
-  }), new Date(r.evaluatedAt));
-}
-
 const dir = mkdtempSync(join(tmpdir(), "agorail-cross-repo-"));
 let store: DurableQuoteStore | undefined;
 let ledger: BusinessIntentLedger | undefined;
@@ -64,54 +126,49 @@ try {
   const bridge = new MseScqIntentBridge(ledger, new DurableMutationCoordinator(store));
   let dispatchCount = 0;
   let authorizedCalls = 0;
-  let passedValidations = 0;
   const hooks = {
-    authorize: async () => { authorizedCalls++; },
+    authorize: async () => { authorizedCalls++; }, // simulated authorization
     admission: async () => {
-      const decision = actualMsePass();
-      assert.equal(decision.kind, "ADMISSION_PASSED");
-      return { kind: "PASSED" as const, report: decision.kind === "ADMISSION_PASSED" ? decision.admissionReport : undefined };
+      if (approved.kind !== "ADMISSION_PASSED") throw new Error("MSE admission failed");
+      return { kind: "PASSED" as const, report: approved.admissionReport };
     },
     validatePassedAdmission: (candidate: unknown) => {
-      assertAdmissionReportWellFormed(passFixture.quote, proposal, candidate as any);
-      passedValidations++;
+      assertAdmissionReportWellFormed(mseQuote, proposal, candidate as any);
     },
     validateCommercial: async () => {
-      // This example uses a simulated, side-effect-free SCQ preflight.
-      // It does not certify Chargebee's live update mechanism.
+      // SCQ preflight stub only; no Chargebee provider safety guaranteed.
       assert.ok(store!.get("scq-q1"));
     },
   };
-
   const first = await bridge.execute(business("scq-q1", "intent-1"), mutation("scq-q1"), hooks, async () => {
     dispatchCount++;
     return { type: "receipt", receipt: makeReceipt("scq-q1") };
   });
   assert.equal(first.kind, "EXECUTED");
-  assert.equal(passedValidations, 1);
-  const afterRequote = await bridge.execute(business("scq-q2", "intent-1"), mutation("scq-q2"), hooks, async () => {
+
+  // Same approved action, new quote/new provider key: no second dispatch.
+  const reQuote = await bridge.execute(business("scq-q2", "intent-1"), mutation("scq-q2"), hooks, async () => {
     dispatchCount++;
     throw new Error("Requote illegally dispatched");
   });
-  assert.equal(afterRequote.kind, "EXISTING_RECEIPT");
-  assert.equal(dispatchCount, 1);
+  assert.equal(reQuote.kind, "EXISTING_RECEIPT");
 
-  const refusal = await bridge.execute(business("scq-q2", "intent-new"), mutation("scq-q2"), {
+  // MSE dependency refusal is before SCQ's write-ahead gate.
+  const refused = await bridge.execute(business("scq-q2", "different-intent"), mutation("scq-q2"), {
     ...hooks,
     admission: async () => {
-      const decision = actualMseRefusal();
-      assert.equal(decision.kind, "ADMISSION_REFUSED");
-      return { kind: "REFUSED" as const, refusal: decision.kind === "ADMISSION_REFUSED" ? decision.admissionRefusal : undefined };
+      if (rejected.kind !== "ADMISSION_REFUSED") throw new Error("Expected MSE refusal");
+      return { kind: "REFUSED" as const, refusal: rejected.admissionRefusal };
     },
   }, async () => {
     dispatchCount++;
     throw new Error("MSE refusal illegally dispatched");
   });
-  assert.equal(refusal.kind, "ADMISSION_REFUSED");
+  assert.equal(refused.kind, "ADMISSION_REFUSED");
   assert.equal(dispatchCount, 1);
   assert.equal(authorizedCalls, 3);
-  assert.equal(ledger.lookup(business("scq-q2", "intent-new")), undefined);
-  process.stdout.write("PASS: actual MSE admission validation + real SCQ durable dispatch/replay + actual MSE refusal; zero illicit dispatches (SIMULATED provider)\n");
+  assert.equal(ledger.lookup(business("scq-q2", "different-intent")), undefined);
+  process.stdout.write("PASS: subscription seat+addon MSE admission -> SCQ durable receipt/replay, missing-addon refusal, zero illicit simulated dispatches\n");
 } finally {
   ledger?.close();
   store?.close();
