@@ -384,9 +384,11 @@ This section supersedes earlier pending/UNKNOWN labels in this document:
   experimental-only limitation. Issues #45 and #51 are **Class B for
   simulator-only evaluation**, still open and still fail-closed.
   The §6.16 amendment remains separately governed and deferred.
-- The current PR changes **only distribution metadata and release-facing
-  documentation**. It removes `private: true` to permit a *future*
-  npm registry submission, not to initiate one. Neither a CI publishing
+- The current PR changes **only distribution metadata, package-smoke
+  audit logging, and release-facing documentation**. The smoke script
+  prints the candidate tarball's SHA-256, bytes and file count in CI;
+  it does not publish or change runtime behavior. Removing `private:
+  true` permits a *future* npm registry submission, not one now. Neither a CI publishing
   job nor a tag/release is added. Simulator-only exports and the
   `!dist/src/live/` packaging exclusion remain intact.
 - At the PR's final exact head, record CI results, tarball SHA-256,
