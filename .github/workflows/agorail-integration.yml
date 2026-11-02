@@ -33,3 +33,6 @@ jobs:
         working-directory: reference
       - name: Execute actual MSE -> SCQ simulator-only integration fixture
         run: ./mse-dependency/node_modules/.bin/tsx reference/integration/mse-scq-cross-repo.ts
+
+      - name: Verify MSE multi-unit partial outcomes and no unearned finality
+        run: ./mse-dependency/node_modules/.bin/tsx reference/integration/mse-multi-unit-negative.ts
