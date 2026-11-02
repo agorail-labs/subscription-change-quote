@@ -1,0 +1,68 @@
+name: Attest immutable Agorail experimental tarballs
+on:
+  pull_request:
+    branches: [main]
+  push:
+    branches: [main]
+permissions:
+  contents: read
+jobs:
+  attest:
+    name: Audit Node ${{ matrix.node }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        node: [20, 22]
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          path: scq
+      - uses: actions/checkout@v4
+        with:
+          repository: agorail-labs/mutation-safety-envelope
+          ref: 7703f27b4fd1477d8ee614d11b6507f3c37650ee
+          path: mse
+          persist-credentials: false
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ matrix.node }}
+      - run: mkdir -p audited
+      - name: MSE test, schema and package install
+        working-directory: mse
+        run: |
+          npm ci
+          npm test && npm run build && npm run validate-schema
+          cd package
+          npm run smoke:pack
+          npm pack --json --pack-destination ../../audited > ../../audited/mse-pack.json
+      - name: SCQ test, demos and package install
+        working-directory: scq/reference
+        run: |
+          npm ci
+          npm test && npm run demo && npm run demo:commit
+          npm run smoke:pack
+          npm pack --json --pack-destination ../../audited > ../../audited/scq-pack.json
+      - name: Require exact pre-approved tarball bytes, manifests and no live code
+        working-directory: audited
+        run: |
+          set -euo pipefail
+          printf '%s\n' 'edcef7c9b43eb3a63ddd27154c34535975d6458674ea31c610bcd1553d1925a9  agorail-labs-mse-reference-0.4.0-experimental.1.tgz' '9d2974411b536975f7121b1222e6dfc6fb6e3b84354196c2e27d6b96de127f45  agorail-labs-scq-reference-0.6.2-experimental.1.tgz' > expected.sha256
+          sha256sum -c expected.sha256
+          sha256sum ./*.tgz > observed.sha256
+          for file in ./*.tgz; do
+            tar -tzf "$file" | grep -Fx 'package/package.json'
+            if tar -tzf "$file" | grep -E '(^package/dist/src/live/|^package/dist/src/integration/|^package/scripts/|(^|/)\.npmrc$|(^|/)\.env$)'; then
+              echo "::error::Disallowed file in $file"; exit 1
+            fi
+          done
+          echo "SCQ source: $GITHUB_SHA" > build-environment.txt
+          echo "MSE source: 7703f27b4fd1477d8ee614d11b6507f3c37650ee" >> build-environment.txt
+          node -v >> build-environment.txt
+          npm -v >> build-environment.txt
+      - uses: actions/upload-artifact@v4
+        with:
+          name: agorail-experimental-node-${{ matrix.node }}
+          path: audited/
+          retention-days: 14
+          if-no-files-found: error
