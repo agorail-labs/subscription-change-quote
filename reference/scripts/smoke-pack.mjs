@@ -4,6 +4,7 @@
  * npm's local tarball install uses --offline and --ignore-scripts.
  */
 import { execFileSync } from "node:child_process";
+import { createHash } from "node:crypto";
 import { mkdtempSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
@@ -54,6 +55,9 @@ try {
   mkdirSync(consumerDir);
   writeFileSync(join(consumerDir, "package.json"), JSON.stringify({ name: "scq-external-smoke", private: true, type: "module" }));
   const tarball = resolve(dir, entry.filename);
+  const archive = readFileSync(tarball);
+  const sha256 = createHash("sha256").update(archive).digest("hex");
+  console.log(`Packed artifact: ${entry.filename} | files=${entry.files.length} | bytes=${archive.length} | sha256=${sha256}`);
   run(npm, ["install", "--offline", "--ignore-scripts", "--no-audit", "--no-fund", tarball], consumerDir);
 
   const runtime = `import { StripeAdapter, StripeSim, QuoteStore, SCQError } from ${JSON.stringify(name)};
