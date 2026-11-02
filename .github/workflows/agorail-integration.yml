@@ -1,0 +1,35 @@
+name: Agorail MSE-SCQ cross-repository integration
+
+on:
+  pull_request:
+    branches: [main]
+
+jobs:
+  integration:
+    name: MSE admission -> SCQ durable execution (Node ${{ matrix.node }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        node: [20, 22]
+    steps:
+      - name: Checkout SCQ change
+        uses: actions/checkout@v4
+      - name: Checkout pinned MSE admission-only candidate
+        uses: actions/checkout@v4
+        with:
+          repository: agorail-labs/mutation-safety-envelope
+          ref: 8157075708a077457230c7bf4d1a3c613111c48d
+          path: mse-dependency
+          persist-credentials: false
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ matrix.node }}
+      - name: Install MSE dependencies and validate MSE candidate
+        run: npm ci && npm test && npm run build && npm run validate-schema
+        working-directory: mse-dependency
+      - name: Install SCQ dependencies
+        run: npm ci && npm run build
+        working-directory: reference
+      - name: Execute actual MSE -> SCQ simulator-only integration fixture
+        run: ./mse-dependency/node_modules/.bin/tsx reference/integration/mse-scq-cross-repo.ts
