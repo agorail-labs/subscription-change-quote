@@ -193,6 +193,8 @@ For v0.6.2's scope and known limitations, see the [release notes](research/v0.6.
 
 Start with the [simulator-only seat-expansion walkthrough](docs/QUICKSTART.md). It shows quote inspection, separate business spending caps, a default no-mutation path, and an explicitly simulated commit. The reference project is **not yet published as an npm package** and its adapters are not production billing SDK integrations.
 
+For the published experimental npm package (`npm install @agorail-labs/scq-reference@experimental`), start with the [developer onboarding guide](docs/ONBOARDING.md) — install, runnable consumer examples, outcome semantics, and the guarantees the package does and does not provide.
+
 
 ## Experimental reference package
 
