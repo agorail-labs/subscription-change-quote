@@ -44,9 +44,17 @@ import { makeStoredQuote } from "./helpers/durable-fixtures.js";
 // a maintainer decision item (see the PR body), never enacted here.
 //
 // Item map (G-21 register entry, research/v0.6.2-release-gaps.md):
-//   (3) Exclusion keying — findBlockingAttempt keys on
+//   (3) Exclusion keying — findBlockingAttempt keyed on
 //       (quote_id OR subscription_id) with no provider/site
-//       predicate (§6.16 as implemented): 56.1, 56.2.
+//       predicate (§6.16 as implemented): 56.1, 56.2. That
+//       limitation (G-21(3)) is now FIXED by the Issue #45 change:
+//       exclusion is namespace-aware — a subscription-id match in a
+//       provably distinct (provider, site) namespace no longer
+//       blocks, while same-tuple, incomplete-namespace, and
+//       legacy-row cases keep the fail-closed behavior. 56.1/56.2
+//       below pin the FIXED semantics at this suite's level (they
+//       were LIMITATION PINs of the over-broad block before the
+//       fix); the exhaustive matrix is test64.
 //   (2) resolveAttempt attestation — an INDETERMINATE attempt was
 //       unblocked by an operator's free-text note alone: 56.3–56.5.
 //       That limitation (G-21(2)) is now FIXED by the P0 issue-#43
@@ -127,12 +135,15 @@ const INTENT = (quoteId: string, subscriptionId: string, site: string, key: stri
 });
 
 // ---------------------------------------------------------------------------
-// (3) Exclusion keying — the over-broad cross-site block (§6.16 as
-// implemented). LIMITATION PIN: the behaviour pinned here is the
-// documented divergence tracked in G-21, not a conformance claim.
+// (3) Exclusion keying — namespace-aware since the Issue #45 fix
+// (previously a LIMITATION PIN of the over-broad cross-site block,
+// the documented G-21 divergence). The pins below now hold the
+// FIXED semantics: distinct verified sites proceed independently;
+// the same site still blocks; a namespace-less lookup keeps the
+// historical conservative answer.
 // ---------------------------------------------------------------------------
 
-test("Test 56.1 (G-21(3), LIMITATION PIN): a DISPATCHING attempt under one Chargebee site blocks a dispatch for the same subscription id under a DIFFERENT site", () => {
+test("Test 56.1 (G-21(3), FIXED by Issue #45): a DISPATCHING attempt under one Chargebee site no longer blocks a dispatch for the same subscription id under a DIFFERENT verified site — but still blocks its own site and any namespace-less lookup", () => {
   const store = openStore(tmpDb());
   store.put(makeStoredQuote("qA", "sub_xsite"));
   store.put(makeStoredQuote("qB", "sub_xsite"));
@@ -142,45 +153,53 @@ test("Test 56.1 (G-21(3), LIMITATION PIN): a DISPATCHING attempt under one Charg
   assert.equal(attA.state, "DISPATCHING");
   assert.equal(attA.site, "site-a");
 
-  // The site-b intent names a different quote AND a different site;
-  // only the subscription id matches. It is refused, and the
-  // blocking record it is refused BY is the site-a attempt — the
-  // site predicate's absence made observable.
-  assert.throws(
-    () => store.beginDispatch(INTENT("qB", "sub_xsite", "site-b", "key-b")),
-    (e: unknown) =>
-      e instanceof DispatchBlockedError &&
-      (e.details as { attemptId?: string } | undefined)?.attemptId === attA.attemptId &&
-      /DISPATCHING/.test(e.message),
-    "the cross-site intent must be refused by the site-a attempt",
+  // The site-b intent names a different quote AND a different
+  // site; only the subscription id matches. Since the Issue #45
+  // fix the namespace is part of the exclusion identity, so the
+  // two dispatches proceed independently.
+  const attB = store.beginDispatch(INTENT("qB", "sub_xsite", "site-b", "key-b"));
+  assert.equal(attB.state, "DISPATCHING", "a provably distinct (provider, site) namespace is not blocked by the site-a attempt");
+  assert.equal(attB.site, "site-b");
+
+  // The conservative defaults are unchanged: a lookup that states
+  // no namespace still sees the site-a attempt as blocking, and a
+  // lookup in site-a's own namespace is blocked by it.
+  assert.equal(store.findBlockingAttempt("qB", "sub_xsite")?.attemptId, attA.attemptId, "a namespace-less lookup keeps the historical fail-closed answer");
+  assert.equal(
+    store.findBlockingAttempt("qD", "sub_xsite", undefined, { provider: "chargebee", site: "site-a" })?.attemptId,
+    attA.attemptId,
+    "the same (provider, site, subscription) tuple still blocks",
   );
-  const blocking = store.findBlockingAttempt("qB", "sub_xsite");
-  assert.equal(blocking?.attemptId, attA.attemptId);
-  assert.equal(blocking?.site, "site-a", "the blocking attempt belongs to a different site than the refused intent");
-  assert.equal(store.attemptsForQuote("qB").length, 0, "the refusal records zero attempts for the blocked quote");
+  assert.equal(
+    store.findBlockingAttempt("qD", "sub_xsite", undefined, { provider: "chargebee", site: "site-b" })?.attemptId,
+    attB.attemptId,
+    "within site-b, a further quote is governed by attB (its own namespace's DISPATCHING attempt) — isolation is per-namespace, not per-quote",
+  );
 
   // Control: a different subscription id is NOT blocked by attA —
-  // the block above is the subscription keying, not a global lock.
+  // the keying was never a global lock.
   const attC = store.beginDispatch(INTENT("qC", "sub_other", "site-b", "key-c"));
   assert.equal(attC.state, "DISPATCHING");
   store.close();
 });
 
-test("Test 56.2 (G-21(3), boundary): once the blocking attempt reaches a terminal record, the other site's dispatch is no longer blocked", () => {
+test("Test 56.2 (G-21(3), FIXED by Issue #45): within the SAME site the block still holds until the blocking attempt reaches a terminal record", () => {
   const store = openStore(tmpDb());
   store.put(makeStoredQuote("qA", "sub_xsite"));
   store.put(makeStoredQuote("qB", "sub_xsite"));
 
   const attA = store.beginDispatch(INTENT("qA", "sub_xsite", "site-a", "key-a"));
-  assert.throws(() => store.beginDispatch(INTENT("qB", "sub_xsite", "site-b", "key-b")), DispatchBlockedError);
+  // Same site, same subscription id, different quote: blocked,
+  // exactly as before the fix.
+  assert.throws(() => store.beginDispatch(INTENT("qB", "sub_xsite", "site-a", "key-b")), DispatchBlockedError);
 
   store.recordAttemptOutcome(attA.attemptId, "CONFIRMED_NON_EXECUTION");
   assert.equal(store.getAttempt(attA.attemptId)?.state, "CONFIRMED_NON_EXECUTION");
   assert.equal(store.findBlockingAttempt("qB", "sub_xsite"), undefined, "a terminal attempt does not block");
 
-  const attB = store.beginDispatch(INTENT("qB", "sub_xsite", "site-b", "key-b"));
+  const attB = store.beginDispatch(INTENT("qB", "sub_xsite", "site-a", "key-b"));
   assert.equal(attB.state, "DISPATCHING");
-  assert.equal(attB.site, "site-b");
+  assert.equal(attB.site, "site-a");
   store.close();
 });
 

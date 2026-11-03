@@ -1971,6 +1971,30 @@ export class DurableQuoteStore extends QuoteStore {
   }
 
   /**
+   * Issue #45: two attempts are in the same dispatch-exclusion
+   * namespace only when their full identity tuples
+   * (provider, site, subscription_id) agree. They are PROVABLY
+   * DISTINCT — the only case where a subscription-id match does
+   * not block — when the candidate namespace and the recorded
+   * attempt BOTH carry complete provider and site values and at
+   * least one of them differs. Any missing, empty, or malformed
+   * value on either side is NOT distinct: legacy rows without a
+   * site, and callers that cannot state their namespace, keep the
+   * historical fail-closed behavior. Quotes are never
+   * namespace-compared: a matching quote id binds regardless of
+   * namespace (the quote branch in `findBlockingAttempt`).
+   */
+  private static namespacesProvablyDistinct(
+    candidate: { provider?: string | null; site?: string | null } | undefined,
+    attempt: StoredAttempt,
+  ): boolean {
+    const complete = (v: string | null | undefined): v is string => typeof v === "string" && v.trim().length > 0;
+    if (!candidate || !complete(candidate.provider) || !complete(candidate.site)) return false;
+    if (!complete(attempt.provider) || !complete(attempt.site)) return false;
+    return candidate.provider !== attempt.provider || candidate.site !== attempt.site;
+  }
+
+  /**
    * A blocking attempt is one that forbids a new dispatch for the
    * same quote or the same subscription: a non-terminal attempt
    * (PREPARED is NOT blocking — dispatch provably never occurred;
@@ -2003,13 +2027,39 @@ export class DurableQuoteStore extends QuoteStore {
    *    operator_review_state='RESOLVED' flag with NO record: the
    *    attempt BLOCKS. A legacy flag is never silently upgraded,
    *    and an asserted claim is never silently verified.
+   *
+   * Issue #45 namespace rule: when the caller states its namespace
+   * (the optional 4th parameter — `beginDispatch` always passes the
+   * intent's provider/site), a subscription-id-matched row whose
+   * (provider, site) is PROVABLY DISTINCT from the candidate's is
+   * skipped: the same subscription id under a different provider
+   * or site is a different subscription and its unresolved attempt
+   * is not this namespace's exclusion. Every other case — same
+   * tuple, incomplete candidate namespace, legacy row with no
+   * recorded site — behaves exactly as before (fail closed).
+   * Callers that pass no namespace get the historical behavior.
    */
-  findBlockingAttempt(quoteId: string, subscriptionId: string, excludeAttemptId?: string): StoredAttempt | undefined {
+  findBlockingAttempt(
+    quoteId: string,
+    subscriptionId: string,
+    excludeAttemptId?: string,
+    namespace?: { provider?: string | null; site?: string | null },
+  ): StoredAttempt | undefined {
     const rows = this.db.prepare(
       `SELECT * FROM attempts WHERE (quote_id = ? OR subscription_id = ?) AND state IN ('DISPATCHING','INDETERMINATE')${excludeAttemptId !== undefined ? " AND attempt_id != ?" : ""} ORDER BY created_at, attempt_id`,
     ).all(...(excludeAttemptId !== undefined ? [quoteId, subscriptionId, excludeAttemptId] : [quoteId, subscriptionId])) as Array<Record<string, unknown>>;
     for (const row of rows) {
       const attempt = this.rowToAttempt(row);
+      // Issue #45 namespace gate: a row matched ONLY by
+      // subscription id whose (provider, site) is provably
+      // distinct from the candidate's namespace does not govern
+      // the candidate — the same subscription id under another
+      // provider or site is a different subscription. Rows matched
+      // by quote id are never skipped (a quote's own unresolved
+      // attempt blocks it under any namespace claim), and rows
+      // whose namespace — or the candidate's — is incomplete are
+      // never skipped either (fail closed).
+      if (attempt.quoteId !== quoteId && DurableQuoteStore.namespacesProvablyDistinct(namespace, attempt)) continue;
       if (attempt.state === "DISPATCHING") return attempt;
       const terminal = this.terminalResolutionFor(attempt.attemptId);
       if (!terminal) return attempt;
@@ -2037,7 +2087,10 @@ export class DurableQuoteStore extends QuoteStore {
    * landing already replaced. The landed attempt's own quote never
    * reaches this check — `findBlockingAttempt` blocks it outright.
    */
-  private assertQuoteNotStaleAfterLanding(candidateQuoteId: string): void {
+  private assertQuoteNotStaleAfterLanding(
+    candidateQuoteId: string,
+    namespace?: { provider?: string | null; site?: string | null },
+  ): void {
     const row = this.db.prepare(`SELECT record_json FROM quotes WHERE quote_id = ?`).get(candidateQuoteId) as { record_json: string } | undefined;
     if (!row) return; // the D5 stored-quote check in beginDispatch refuses unknown quotes separately
     const candidate = decodeRecordJson<StoredQuote>(row.record_json);
@@ -2046,6 +2099,12 @@ export class DurableQuoteStore extends QuoteStore {
     ).all(candidate.subscription_id) as Array<Record<string, unknown>>;
     for (const landedRow of landedRows) {
       const landed = this.rowToAttempt(landedRow);
+      // Issue #45: a landing in a provably distinct namespace does
+      // not stale this candidate — its state version governs only
+      // its own (provider, site, subscription) tuple. A landed
+      // attempt with an incomplete namespace still stale-checks
+      // every candidate on the subscription id (fail closed).
+      if (DurableQuoteStore.namespacesProvablyDistinct(namespace, landed)) continue;
       const resolution = this.terminalResolutionFor(landed.attemptId);
       if (!resolution || resolution.classification !== "CONFIRMED_LANDING") continue;
       if (!this.landingReconciliationFor(landed.attemptId)) continue; // unreconciled landings block via findBlockingAttempt
@@ -2182,7 +2241,7 @@ export class DurableQuoteStore extends QuoteStore {
             // so a retry of a confirmed-non-executed attempt could
             // dispatch concurrently with another quote's unresolved
             // mutation of the same subscription.
-            const blocking = this.findBlockingAttempt(intent.quoteId, intent.subscriptionId, existing.attemptId);
+            const blocking = this.findBlockingAttempt(intent.quoteId, intent.subscriptionId, existing.attemptId, { provider: intent.provider, site: intent.site });
             if (blocking) {
               throw new DispatchBlockedError(
                 `Dispatch blocked: re-dispatch of the confirmed-non-execution attempt ${existing.attemptId} must wait — attempt ${blocking.attemptId} for quote ${blocking.quoteId} / subscription ${blocking.subscriptionId} is ${blocking.state}` +
@@ -2190,7 +2249,7 @@ export class DurableQuoteStore extends QuoteStore {
                 { attemptId: blocking.attemptId, state: blocking.state, rearmedAttemptId: existing.attemptId },
               );
             }
-            this.assertQuoteNotStaleAfterLanding(intent.quoteId);
+            this.assertQuoteNotStaleAfterLanding(intent.quoteId, { provider: intent.provider, site: intent.site });
             this.db.prepare(`UPDATE attempts SET state='DISPATCHING', outcome=NULL, recovery_classification=NULL, version=version+1, updated_at=? WHERE attempt_id=?`).run(now, existing.attemptId);
             this.db.prepare(`INSERT INTO attempt_history (attempt_id, state, at, note) VALUES (?,?,?,?)`).run(existing.attemptId, "DISPATCHING", now, "re-dispatch authorized: prior attempt terminally CONFIRMED_NON_EXECUTION with the identical request");
             result = this.getAttempt(existing.attemptId);
@@ -2202,7 +2261,7 @@ export class DurableQuoteStore extends QuoteStore {
           result = existing;
           return;
         }
-        const blocking = this.findBlockingAttempt(intent.quoteId, intent.subscriptionId);
+        const blocking = this.findBlockingAttempt(intent.quoteId, intent.subscriptionId, undefined, { provider: intent.provider, site: intent.site });
         if (blocking) {
           throw new DispatchBlockedError(
             `Dispatch blocked: attempt ${blocking.attemptId} for quote ${blocking.quoteId} / subscription ${blocking.subscriptionId} is ${blocking.state}` +
@@ -2210,7 +2269,7 @@ export class DurableQuoteStore extends QuoteStore {
             { attemptId: blocking.attemptId, state: blocking.state },
           );
         }
-        this.assertQuoteNotStaleAfterLanding(intent.quoteId);
+        this.assertQuoteNotStaleAfterLanding(intent.quoteId, { provider: intent.provider, site: intent.site });
         this.db.prepare(
           `UPDATE attempts SET state='SUPERSEDED', updated_at=? WHERE quote_id=? AND state='PREPARED'`,
         ).run(now, intent.quoteId);
