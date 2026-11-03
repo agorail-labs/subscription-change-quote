@@ -1,6 +1,6 @@
 # SCQ developer quick start — v0.6.2 (simulator only)
 
-Status: **adopter documentation for SCQ v0.6.2, published as an experimental specification.** The v0.6.2 specification was ratified and merged (PR #21) and is published as the project's current experimental specification by the publication change carrying this header; the `spec-v0.6.2` tag and GitHub Release are created by the maintainer at activation. SCQ v0.6.1 is the previous specification. The reference package is `private: true` and **not published on npm**; no live commit is authorized.
+Status: **adopter documentation for SCQ v0.6.2, published as an experimental specification.** The v0.6.2 specification was ratified and merged (PR #21); v0.6.1 is the previous specification. The simulator-only reference package is separately published as [`@agorail-labs/scq-reference@0.6.2-experimental.1`](https://www.npmjs.com/package/@agorail-labs/scq-reference) under the `experimental` dist-tag. This is not a production billing SDK; no live provider commit is authorized. For published-package installation and runnable consumer examples, see [ONBOARDING.md](ONBOARDING.md).
 
 ## Run without real billing credentials
 
@@ -24,7 +24,7 @@ npm run demo:commit
 
 This passes a **hypothetical external-approval flag for synthetic fixture data only**. The flag is not identity verification, consent for real subscriptions, or authorization to use any provider API.
 
-To validate that the package can be packed and consumed locally *without publishing it*:
+To validate a local build and consumer install *without performing any additional npm publication*:
 
 ```bash
 npm run smoke:pack
@@ -63,8 +63,8 @@ The recorded receipt remains immutable. Later verification is an **append-only e
 - [Publication and package decision gates](../research/v0.6.2-publication-decision.md)
 - [Reference package README](../reference/README.md)
 
-Existing v0.6.1 serialized quotes with absent determinacy are read as UNKNOWN for enforcement and must not be converted to DETERMINED by default. Do not treat the current 803 simulated tests as provider-backed conformance certification.
+Existing v0.6.1 serialized quotes with absent determinacy are read as UNKNOWN for enforcement and must not be converted to DETERMINED by default. Do not treat the reference implementation's simulated test suite as provider-backed conformance certification.
 
 ## Provider safety is separate
 
-This preview is useful for independently experimenting with semantics and writing simulator-backed adapters. The Chargebee live adapter's current full-list update is **refused** for OPERATION-scoped update commits because it cannot atomically preserve unrelated changes; see [G-17](../research/v0.6.2-release-gaps.md) and [provider mechanism research](https://github.com/agorail-labs/subscription-change-quote/issues/30). No live Chargebee commit, production integration, published npm package or independent provider adoption is claimed.
+This preview is useful for independently experimenting with semantics and writing simulator-backed adapters. The Chargebee live adapter's current full-list update is **refused** for OPERATION-scoped update commits because it cannot atomically preserve unrelated changes; see [G-17](../research/v0.6.2-release-gaps.md) and [provider mechanism research](https://github.com/agorail-labs/subscription-change-quote/issues/30). No live Chargebee commit, production integration, or independent provider adoption is claimed. The published npm reference package is simulator-only.
