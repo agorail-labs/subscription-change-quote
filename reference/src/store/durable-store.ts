@@ -45,7 +45,7 @@ import {
   type StoredQuote,
 } from "./quote-store.js";
 
-export const DURABLE_SCHEMA_VERSION = 4;
+export const DURABLE_SCHEMA_VERSION = 5;
 
 /**
  * Maximum age, at resolution time, of the provider observation a
@@ -1066,11 +1066,19 @@ const RESOLUTION_V3_COLUMNS: Array<readonly [string, string]> = [
  * verifier-established reconciliation record and names it; pre-v4
  * rows backfill to trust_tier 'ASSERTED' with a NULL reference and
  * never satisfy the barrier.
+ * Schema v5 (Issue #51) removes the table-level UNIQUE on
+ * attempt_id: the table is append-only HISTORY, so a preserved
+ * pre-v4 ASSERTED row and a later VERIFIED barrier row for the
+ * same attempt coexist. Uniqueness is re-scoped to the VERIFIED
+ * tier — at most one VERIFIED barrier per attempt, and one
+ * VERIFIED evidence reference establishes one attempt's barrier —
+ * via the partial unique indexes below, mirroring the
+ * attempt_resolutions replay index.
  */
 const LANDING_RECONCILIATION_SCHEMA_STATEMENTS = [
   `CREATE TABLE IF NOT EXISTS landing_reconciliations (
      reconciliation_id TEXT PRIMARY KEY,
-     attempt_id TEXT NOT NULL UNIQUE,
+     attempt_id TEXT NOT NULL,
      quote_id TEXT NOT NULL,
      subscription_id TEXT NOT NULL,
      landed_state_version TEXT NOT NULL,
@@ -1085,7 +1093,13 @@ const LANDING_RECONCILIATION_SCHEMA_STATEMENTS = [
      evidence_reference TEXT
    )`,
   `CREATE INDEX IF NOT EXISTS idx_landing_reconciliations_attempt ON landing_reconciliations(attempt_id)`,
+  `CREATE UNIQUE INDEX IF NOT EXISTS idx_landing_reconciliations_verified_attempt ON landing_reconciliations(attempt_id) WHERE trust_tier = 'VERIFIED'`,
+  `CREATE UNIQUE INDEX IF NOT EXISTS idx_landing_reconciliations_verified_ref ON landing_reconciliations(evidence_reference) WHERE trust_tier = 'VERIFIED' AND evidence_reference IS NOT NULL`,
 ];
+
+/** Column list shared by the v5 landing-reconciliation table rebuild (order matches the table definition). */
+const LANDING_RECONCILIATION_COLUMNS =
+  "reconciliation_id, attempt_id, quote_id, subscription_id, landed_state_version, landed_state_digest, financial_outcome_digest, operator_id, reconciled_at, justification, payload_json, record_hash, trust_tier, evidence_reference";
 
 export class DurableQuoteStore extends QuoteStore {
   private db: Db;
@@ -1147,7 +1161,7 @@ export class DurableQuoteStore extends QuoteStore {
       const version = row ? Number(row.value) : NaN;
       if (Number.isInteger(version) && version === DURABLE_SCHEMA_VERSION) return;
       if (Number.isInteger(version) && version === 1) {
-        // v1 → v4: ONE transaction creates the append-only
+        // v1 → v5: ONE transaction creates the append-only
         // attempt_resolutions table (at its v4 shape) and the
         // landing_reconciliations table and advances the version
         // marker. No existing row is touched: v1 attempts keep their
@@ -1165,7 +1179,7 @@ export class DurableQuoteStore extends QuoteStore {
         return;
       }
       if (Number.isInteger(version) && version === 2) {
-        // v2 → v4 (PR #50 correction rounds 1+3): ONE transaction
+        // v2 → v5 (PR #50 correction rounds 1+3; Issue #51): ONE transaction
         // adds the provider-finality / landed-version columns
         // (v3) and the trust_tier column (v4) to
         // attempt_resolutions, creates landing_reconciliations at
@@ -1186,7 +1200,7 @@ export class DurableQuoteStore extends QuoteStore {
         return;
       }
       if (Number.isInteger(version) && version === 3) {
-        // v3 → v4 (PR #50 correction round 3): ONE transaction adds
+        // v3 → v5 (PR #50 correction round 3; Issue #51): ONE transaction adds
         // trust_tier to attempt_resolutions and trust_tier +
         // evidence_reference to landing_reconciliations, backfills
         // EVERY pre-v4 row to 'ASSERTED', and re-scopes the replay
@@ -1199,13 +1213,31 @@ export class DurableQuoteStore extends QuoteStore {
           this.db.exec(`ALTER TABLE landing_reconciliations ADD COLUMN trust_tier TEXT`);
           this.db.exec(`ALTER TABLE landing_reconciliations ADD COLUMN evidence_reference TEXT`);
           this.migrateTrustTierV4();
+          this.rebuildLandingReconciliationsV5();
+          this.db.prepare(`UPDATE meta SET value = ? WHERE key = 'schema_version'`).run(String(DURABLE_SCHEMA_VERSION));
+        });
+        tx.immediate();
+        return;
+      }
+      if (Number.isInteger(version) && version === 4) {
+        // v4 → v5 (Issue #51): ONE transaction rebuilds
+        // landing_reconciliations without the table-level
+        // attempt_id UNIQUE constraint, copying every row
+        // verbatim (payloads and record hashes untouched — the
+        // rows re-verify on open exactly as before), and installs
+        // the VERIFIED-scoped partial unique indexes. No row is
+        // altered, promoted, or deleted: a v4 ASSERTED history row
+        // remains ASSERTED history; the rebuild only makes room
+        // for a later VERIFIED barrier to be APPENDED beside it.
+        const tx = this.db.transaction(() => {
+          this.rebuildLandingReconciliationsV5();
           this.db.prepare(`UPDATE meta SET value = ? WHERE key = 'schema_version'`).run(String(DURABLE_SCHEMA_VERSION));
         });
         tx.immediate();
         return;
       }
       throw new DurableRecoveryError(
-        `Recovery refused: unsupported durable schema version ${row?.value ?? "(missing)"}; this build supports ${DURABLE_SCHEMA_VERSION} (with in-place migrations from versions 1, 2 and 3). Nothing was adopted.`,
+        `Recovery refused: unsupported durable schema version ${row?.value ?? "(missing)"}; this build supports ${DURABLE_SCHEMA_VERSION} (with in-place migrations from versions 1, 2, 3 and 4). Nothing was adopted.`,
         { schemaVersion: row?.value ?? null },
       );
     }
@@ -1236,6 +1268,51 @@ export class DurableQuoteStore extends QuoteStore {
     this.db.exec(`DROP INDEX IF EXISTS idx_attempt_resolutions_evidence_ref`);
     this.db.exec(
       `CREATE UNIQUE INDEX idx_attempt_resolutions_evidence_ref ON attempt_resolutions(evidence_source, evidence_reference) WHERE classification != 'UNRESOLVED' AND trust_tier = 'VERIFIED'`,
+    );
+  }
+
+  /**
+   * The v5 landing-reconciliation table rebuild (runs INSIDE the
+   * caller's migration transaction, so a crash or failure anywhere
+   * in the migration rolls the whole migration back — the database
+   * is left at its prior version with every row intact, never
+   * partially migrated): copy every row verbatim into a new table
+   * whose only structural difference is the absence of the
+   * attempt_id UNIQUE constraint, swap it in, and install the
+   * attempt index plus the two VERIFIED-scoped partial unique
+   * indexes. SQLite cannot drop a table-level UNIQUE constraint in
+   * place; reconstruction is the documented route.
+   */
+  private rebuildLandingReconciliationsV5(): void {
+    this.db.exec(
+      `CREATE TABLE landing_reconciliations_v5 (
+         reconciliation_id TEXT PRIMARY KEY,
+         attempt_id TEXT NOT NULL,
+         quote_id TEXT NOT NULL,
+         subscription_id TEXT NOT NULL,
+         landed_state_version TEXT NOT NULL,
+         landed_state_digest TEXT NOT NULL,
+         financial_outcome_digest TEXT NOT NULL,
+         operator_id TEXT NOT NULL,
+         reconciled_at TEXT NOT NULL,
+         justification TEXT NOT NULL,
+         payload_json TEXT NOT NULL,
+         record_hash TEXT NOT NULL UNIQUE,
+         trust_tier TEXT,
+         evidence_reference TEXT
+       )`,
+    );
+    this.db.exec(
+      `INSERT INTO landing_reconciliations_v5 (${LANDING_RECONCILIATION_COLUMNS}) SELECT ${LANDING_RECONCILIATION_COLUMNS} FROM landing_reconciliations`,
+    );
+    this.db.exec(`DROP TABLE landing_reconciliations`);
+    this.db.exec(`ALTER TABLE landing_reconciliations_v5 RENAME TO landing_reconciliations`);
+    this.db.exec(`CREATE INDEX idx_landing_reconciliations_attempt ON landing_reconciliations(attempt_id)`);
+    this.db.exec(
+      `CREATE UNIQUE INDEX idx_landing_reconciliations_verified_attempt ON landing_reconciliations(attempt_id) WHERE trust_tier = 'VERIFIED'`,
+    );
+    this.db.exec(
+      `CREATE UNIQUE INDEX idx_landing_reconciliations_verified_ref ON landing_reconciliations(evidence_reference) WHERE trust_tier = 'VERIFIED' AND evidence_reference IS NOT NULL`,
     );
   }
 
@@ -1865,14 +1942,32 @@ export class DurableQuoteStore extends QuoteStore {
    * a pre-v4 (ASSERTED) reconciliation row never satisfies it.
    */
   landingReconciliationFor(attemptId: string): StoredLandingReconciliation | undefined {
-    const record = this.landingReconciliationRecordFor(attemptId);
-    return record && record.trustTier === "VERIFIED" ? record : undefined;
+    const row = this.db.prepare(
+      `SELECT * FROM landing_reconciliations WHERE attempt_id = ? AND trust_tier = 'VERIFIED' ORDER BY rowid LIMIT 1`,
+    ).get(attemptId) as Record<string, unknown> | undefined;
+    return row ? this.rowToLandingReconciliation(row) : undefined;
   }
 
-  /** The recorded landing reconciliation for an attempt at ANY trust tier (the preserved record, e.g. a pre-v4 ASSERTED row), or undefined. */
+  /**
+   * The effective recorded landing reconciliation for an attempt:
+   * its VERIFIED barrier record when one exists, otherwise the
+   * earliest preserved record at any tier (e.g. a pre-v4 ASSERTED
+   * row), or undefined. Deterministic since schema v5, where an
+   * attempt can carry BOTH a preserved ASSERTED history row and a
+   * VERIFIED barrier row.
+   */
   landingReconciliationRecordFor(attemptId: string): StoredLandingReconciliation | undefined {
-    const row = this.db.prepare(`SELECT * FROM landing_reconciliations WHERE attempt_id = ?`).get(attemptId) as Record<string, unknown> | undefined;
+    const row = this.db.prepare(
+      `SELECT * FROM landing_reconciliations WHERE attempt_id = ? ORDER BY (trust_tier = 'VERIFIED') DESC, rowid ASC LIMIT 1`,
+    ).get(attemptId) as Record<string, unknown> | undefined;
     return row ? this.rowToLandingReconciliation(row) : undefined;
+  }
+
+  /** Every landing reconciliation record for an attempt, in append order — the full preserved history (ASSERTED legacy rows and the VERIFIED barrier alike). */
+  landingReconciliationRecordsFor(attemptId: string): StoredLandingReconciliation[] {
+    return (this.db.prepare(`SELECT * FROM landing_reconciliations WHERE attempt_id = ? ORDER BY rowid`).all(attemptId) as Array<Record<string, unknown>>).map(
+      (r) => this.rowToLandingReconciliation(r),
+    );
   }
 
   /**
@@ -2347,7 +2442,7 @@ export class DurableQuoteStore extends QuoteStore {
           refuse(`the established provider observation is stale at resolution time: observed ${Math.round((resolvedMs - observedMs) / 1000)}s before resolution, beyond the ${RESOLUTION_EVIDENCE_MAX_AGE_MS / 1000}s freshness window — re-establish from a fresh provider record`);
         }
         const replay = this.db.prepare(
-          `SELECT resolution_id FROM attempt_resolutions WHERE evidence_source = ? AND evidence_reference = ? AND classification != 'UNRESOLVED' LIMIT 1`,
+          `SELECT resolution_id FROM attempt_resolutions WHERE evidence_source = ? AND evidence_reference = ? AND classification != 'UNRESOLVED' AND trust_tier = 'VERIFIED' LIMIT 1`,
         ).get(token!.source, token!.reference) as { resolution_id: string } | undefined;
         if (replay) {
           refuse(`evidence (${token!.source}, ${token!.reference}) was already used by resolution ${replay.resolution_id}; one provider evidence record establishes one attempt's resolution — replay is refused`);
@@ -2700,8 +2795,8 @@ export class DurableQuoteStore extends QuoteStore {
         if (!resolution || resolution.classification !== "CONFIRMED_LANDING") {
           refuse("the attempt carries no VERIFIED terminal CONFIRMED_LANDING resolution — there is no established landing to reconcile");
         }
-        if (this.landingReconciliationRecordFor(attemptId)) {
-          refuse("ALREADY_RECONCILED: a landing reconciliation is already recorded for this attempt; the barrier record is append-only and singular");
+        if (this.landingReconciliationFor(attemptId)) {
+          refuse("ALREADY_RECONCILED: a VERIFIED landing reconciliation already satisfies this attempt's barrier; the barrier is singular at the VERIFIED tier. Preserved ASSERTED history never blocks this append and is never overwritten by it (Issue #51).");
         }
         const operatorId = typeof input.operatorId === "string" ? input.operatorId.trim() : "";
         if (!operatorId) refuse("a non-empty operatorId is required — an unattributed reconciliation is not auditable");
@@ -2724,6 +2819,19 @@ export class DurableQuoteStore extends QuoteStore {
         }
         if (token.resolutionReference !== resolution!.evidenceReference || token.landedStateDigest !== resolution!.observedProviderStateDigest) {
           refuse("the reconciliation evidence is not bound to this attempt's established landing resolution");
+        }
+        // VERIFIED-tier replay scope (Issue #51), consistent with
+        // the partial unique index: one VERIFIED evidence reference
+        // establishes one attempt's barrier. ASSERTED history rows
+        // (which may carry the same reference from a pre-v5 record)
+        // do not consume the reference — only a VERIFIED row does.
+        if (token.evidenceReference) {
+          const refClash = this.db.prepare(
+            `SELECT reconciliation_id, attempt_id FROM landing_reconciliations WHERE evidence_reference = ? AND trust_tier = 'VERIFIED' LIMIT 1`,
+          ).get(token.evidenceReference) as { reconciliation_id: string; attempt_id: string } | undefined;
+          if (refClash) {
+            refuse(`evidence reference ${JSON.stringify(token.evidenceReference)} was already used by VERIFIED reconciliation ${refClash.reconciliation_id} for attempt ${refClash.attempt_id}; one provider reconciliation record establishes one attempt's barrier — replay is refused`);
+          }
         }
         const payloadFields = {
           reconciliationId: `rec_${sha256(`${attemptId}|${reconciledAt}|landing`).slice(0, 24)}`,

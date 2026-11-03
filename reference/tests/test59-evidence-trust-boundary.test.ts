@@ -627,7 +627,7 @@ test("Test 59.4 (R4'): caller digests are not a reconciliation path — the barr
 // can still lift the attempt.
 // ---------------------------------------------------------------------------
 
-test("Test 59.5: a hand-built v3 database migrates to schema v4 — terminal + reconciliation rows preserved as ASSERTED and NON-LIFTING; a fresh v4 resolution lifts", () => {
+test("Test 59.5: a hand-built v3 database migrates to schema v5 — terminal + reconciliation rows preserved as ASSERTED and NON-LIFTING; a fresh v4 resolution lifts", () => {
   const path = tmpDb();
   const db = rawDb(path);
   // Base schema (identical across versions).
@@ -782,11 +782,11 @@ test("Test 59.5: a hand-built v3 database migrates to schema v4 — terminal + r
   );
   db.close();
 
-  // Open with v4 code: migration runs.
+  // Open with current code: migration runs (v3 → v5).
   const store = new DurableQuoteStore(path, { recoveryGraceMs: 0 });
   const check = rawDb(path);
   const version = check.prepare(`SELECT value FROM meta WHERE key='schema_version'`).get() as { value: string };
-  assert.equal(version.value, "4", "the v3 database was migrated to schema v4");
+  assert.equal(version.value, "5", "the v3 database was migrated to schema v5 (the v4 trust-tier migration, then the Issue #51 v5 landing-reconciliation rebuild)");
   const tiers = check.prepare(`SELECT resolution_id, trust_tier FROM attempt_resolutions ORDER BY resolution_id`).all() as Array<{ resolution_id: string; trust_tier: string }>;
   assert.deepEqual(
     tiers.map((t) => [t.resolution_id, t.trust_tier]),
