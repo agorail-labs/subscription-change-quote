@@ -1,4 +1,4 @@
-name: Attest immutable Agorail experimental tarballs
+name: Attest immutable published Agorail experimental tarballs
 on:
   pull_request:
     branches: [main]
@@ -15,9 +15,16 @@ jobs:
       matrix:
         node: [20, 22]
     steps:
+      # This job attests ONLY already-published immutable 0.6.2-experimental.1.
+      # Never repack a changing main/PR working tree with an already-published version.
+      # Candidate builds are tested separately by CI and require a separately
+      # authorized next-version release workflow before npm publication.
       - uses: actions/checkout@v4
         with:
+          repository: agorail-labs/subscription-change-quote
+          ref: 80b7b7bb70d98695b0d4976ae790de0a56af2960
           path: scq
+          persist-credentials: false
       - uses: actions/checkout@v4
         with:
           repository: agorail-labs/mutation-safety-envelope
@@ -56,7 +63,8 @@ jobs:
               echo "::error::Disallowed file in $file"; exit 1
             fi
           done
-          echo "SCQ source: $GITHUB_SHA" > build-environment.txt
+          echo "SCQ published 0.6.2-experimental.1 source: 80b7b7bb70d98695b0d4976ae790de0a56af2960" > build-environment.txt
+          echo "Workflow triggering commit (not the published package source): $GITHUB_SHA" >> build-environment.txt
           echo "MSE source: 7703f27b4fd1477d8ee614d11b6507f3c37650ee" >> build-environment.txt
           node -v >> build-environment.txt
           npm -v >> build-environment.txt
