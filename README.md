@@ -102,9 +102,10 @@ are live-confirmed versus simulated, is in [`research/EVIDENCE.md`](research/EVI
 ## Current status and known limitations (v0.6.2)
 
 SCQ v0.6.2 is published as an **experimental** normative specification (ratified by the
-maintainer, PR #21). Publication asserts the specification's semantics only. It is **not** a
-conformance certification for any implementation, **not** a release of the reference package,
-and **not** an authorization to execute subscription changes against any provider.
+maintainer, PR #21). Specification publication asserts its semantics only; the experimental
+reference npm package was released separately. Neither publication is a conformance
+certification for a live-provider implementation or an authorization to execute subscription
+changes against any provider.
 
 - **Three conformance rows are PARTIAL** (of 75 rules; see
   [`conformance/v0.6.2-traceability.md`](conformance/v0.6.2-traceability.md)): snapshot
@@ -120,9 +121,10 @@ and **not** an authorization to execute subscription changes against any provide
 - **G-20:** the research suite stands at 11 pass / 7 fail **by design** — seven harnesses
   are refused pre-dispatch by the authorization-preservation gate. Their intended properties
   are accounted for by converted regression evidence (test47, test49, test50, test55).
-- **G-21 remains open:** durable-recovery limitations include INDETERMINATE-attempt
-  resolution evidence not being persisted (issue #43, P0) and dispatch exclusion not scoped
-  by provider/site (issue #45); issues #44 and #46 track further residuals.
+- **G-21 residual:** independently reviewed INDETERMINATE-attempt resolution evidence is
+  now persisted in the experimental reference implementation (issue #43, closed); durable
+  dispatch exclusion still needs provider/site scoping (issue #45, open). The separate
+  residual investigations in issues #44 and #46 are closed.
 - **G-17:** the Chargebee live adapter's only update mechanism is full-list replacement
   (`FULL_REPLACEMENT_ONLY`), so OPERATION-authorized updates are **refused before dispatch**
   (`AUTHORIZATION_PRESERVATION_UNENFORCEABLE`). The G-17 mechanism research and prototype
@@ -133,9 +135,9 @@ and **not** an authorization to execute subscription changes against any provide
   tests, provider documentation, historical live read/quote observations) remain distinct.
 - **No production certification, no provider endorsement, and no blanket
   implementation-conformance claim** is made by this publication.
-- **The reference package is not published to npm.** `reference/package.json` remains
-  `private: true` with v0.6.1-asserting metadata, unchanged; package release is a separate
-  gated decision (currently NO-GO).
+- **The simulator-backed reference package is published experimentally on npm** as
+  `@agorail-labs/scq-reference@0.6.2-experimental.1` (install with `@experimental`).
+  This is not a production billing SDK or a validation of live-provider commit safety.
 
 Full disclosures are in the [v0.6.2 release notes](research/v0.6.2-release-notes.md) and the
 [gap register](research/v0.6.2-release-gaps.md).
@@ -191,12 +193,16 @@ ACP has adopted or will adopt SCQ.
 
 For v0.6.2's scope and known limitations, see the [release notes](research/v0.6.2-release-notes.md). (The v0.6.1-era [preview notes](docs/EXPERIMENTAL-PREVIEW.md) are retained as a superseded historical record.) For responsible vulnerability reporting, see [Security](SECURITY.md).
 
-Start with the [simulator-only seat-expansion walkthrough](docs/QUICKSTART.md). It shows quote inspection, separate business spending caps, a default no-mutation path, and an explicitly simulated commit. The reference project is **not yet published as an npm package** and its adapters are not production billing SDK integrations.
+Start with the [simulator-only seat-expansion walkthrough](docs/QUICKSTART.md). It shows quote inspection, separate business spending caps, a default no-mutation path, and an explicitly simulated commit. The reference package is **published experimentally on npm**, but its adapters are not production billing SDK integrations.
+
+For the published experimental npm package (`npm install @agorail-labs/scq-reference@experimental`), start with the [developer onboarding guide](docs/ONBOARDING.md) — install, runnable consumer examples, outcome semantics, and the guarantees the package does and does not provide.
 
 
 ## Experimental reference package
 
-The simulator-backed TypeScript reference package includes ESM exports, TypeScript declarations, and an external-consumer smoke test. It is not a production billing integration and is not published to npm.
+The simulator-backed TypeScript reference package is published on npm as
+`@agorail-labs/scq-reference@0.6.2-experimental.1` with ESM exports, TypeScript
+declarations, and an external-consumer smoke test. It is **not** a production billing integration.
 
 ```bash
 cd reference
@@ -212,7 +218,7 @@ npm install
 npm test
 ```
 
-Compiles with `tsc` and runs the full suite (803 tests) via Node's built-in test runner. No
+Compiles with `tsc` and runs the automated suite via Node's built-in test runner. No
 external test framework dependency.
 
 ## Community and feedback
