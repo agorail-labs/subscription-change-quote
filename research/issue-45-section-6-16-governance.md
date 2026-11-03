@@ -1,6 +1,6 @@
 # Issue #45 — §6.16 governance note: namespace-aware dispatch exclusion
 
-Status: **proposal for maintainer decision**. This note does not amend
+Status: **maintainer decision — Option A approved 2026-11-02 for v0.7**. This note does not amend
 `spec/scq-v0.6.2-spec.md`, which remains frozen. It records what the
 current specification requires, why the reference implementation's
 exclusion keying was over-broad, what the Issue #45 implementation PR
@@ -78,9 +78,7 @@ Branch `fix/issue-45-namespace-exclusion`; evidence suite test64
 
 ## 4. Proposed specification revision (for decision)
 
-Two options; the implementation is compatible with both readings of
-the normative MUST, so this is a text-governance decision, not a
-behavior gate:
+Maintainer decision: **Option A** for the next normative version. The alternatives below remain documented for provenance. The implementation is compatible with both readings of the normative MUST, but the specification change is deferred to v0.7:
 
 **Option A — v0.7 clause revision (recommended).** In the next
 specification version, (i) replace the §6.16 reconciliation note with
