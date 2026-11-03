@@ -819,7 +819,7 @@ test("Test 58.14a: a legacy RESOLVED flag with NO resolution record still blocks
   b.close();
 });
 
-test("Test 58.14b: a hand-built v1 database migrates to schema v4 in place — attempts intact and blocking, resolutions table empty", () => {
+test("Test 58.14b: a hand-built v1 database migrates to schema v5 in place — attempts intact and blocking, resolutions table empty", () => {
   const path = tmpDb();
   // Minimal v1 schema, copied from the baseline (schema v1)
   // SCHEMA_STATEMENTS in durable-store.ts.
@@ -863,7 +863,7 @@ test("Test 58.14b: a hand-built v1 database migrates to schema v4 in place — a
 
   const check = rawDb(path);
   const version = check.prepare(`SELECT value FROM meta WHERE key='schema_version'`).get() as { value: string };
-  assert.equal(version.value, "4", "the database was migrated to schema v4");
+  assert.equal(version.value, "5", "the database was migrated to schema v5 (Issue #51 added the v5 landing-reconciliation rebuild; the v1 migration now lands at v5)");
   const table = check.prepare(`SELECT name FROM sqlite_master WHERE type='table' AND name='attempt_resolutions'`).get();
   assert.ok(table, "attempt_resolutions exists after migration");
   const count = check.prepare(`SELECT COUNT(*) AS n FROM attempt_resolutions`).get() as { n: number };
@@ -871,7 +871,7 @@ test("Test 58.14b: a hand-built v1 database migrates to schema v4 in place — a
   check.close();
 });
 
-test("Test 58.14c: a v2-era terminal resolution row migrates to v4 preserved but NON-LIFTING (no provider finality on record; trust backfilled ASSERTED)", () => {
+test("Test 58.14c: a v2-era terminal resolution row migrates to v5 preserved but NON-LIFTING (no provider finality on record; trust backfilled ASSERTED)", () => {
   const path = tmpDb();
   // Hand-built v2 database: base schema + the v2 attempt_resolutions
   // table (schema as of head d0f35c8, before the v3 finality
@@ -954,7 +954,7 @@ test("Test 58.14c: a v2-era terminal resolution row migrates to v4 preserved but
   const store = openStore(path);
   const check = rawDb(path);
   const version = check.prepare(`SELECT value FROM meta WHERE key='schema_version'`).get() as { value: string };
-  assert.equal(version.value, "4", "the v2 database was migrated to schema v4");
+  assert.equal(version.value, "5", "the v2 database was migrated to schema v5 (Issue #51 added the v5 landing-reconciliation rebuild; the v2 migration now lands at v5)");
   const logFinal = check.prepare(`SELECT log_final FROM attempt_resolutions WHERE resolution_id='res_v2_legacy'`).get() as { log_final: unknown };
   assert.equal(logFinal.log_final, null, "migration does not backfill provider finality for a v2-era record");
   const tier = check.prepare(`SELECT trust_tier FROM attempt_resolutions WHERE resolution_id='res_v2_legacy'`).get() as { trust_tier: unknown };
