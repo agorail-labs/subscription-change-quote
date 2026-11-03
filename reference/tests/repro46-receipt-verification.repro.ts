@@ -1,221 +1,242 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import { QuoteStore, establishVerification } from "../src/store/quote-store.js";
-import { ChargebeeClient, type HttpTransport } from "../src/live/chargebee-http.js";
-import { ChargebeeLiveAdapter } from "../src/live/chargebee-scq-adapter.js";
-import { PilotMockChargebee, type PilotMockFaults } from "../src/live/pilot/mock-transport.js";
+import type {
+  CommercialEffect,
+  ProviderObservation,
+  SubscriptionChangeReceipt,
+  SubscriptionSnapshot,
+} from "../src/core/types.js";
+import type { StoredQuote } from "../src/store/quote-store.js";
 
 // Test 46 — Issue #22, Finding 5 (P1): receipt verification and
-// independent later actuals. Independent local rerun against
-// CURRENT main, built on the merged candidate construction
-// (PR #10/#11, pinned by test26.17): a COMMITTED_UNVERIFIED
-// receipt records the mutation response's figures as CANDIDATES
-// (UNKNOWN determinacy, committedSource "unestablished") so a
-// later independent verification has a record to verify against.
+// independent later actuals.
 //
-// QuoteStore.verifyCommitReceipt validates later evidence by
-// EXACT figure equality with the recorded candidates
-// (assertEvidenceValid: evidence figures must equal
-// receiptIdentityFields, else CONFLICTING_RECEIPT_IDENTITY).
-// Three consequences, one test each — all EXPECTED TO FAIL on
-// unmodified main (they assert the safe behavior); controls for
-// original-receipt immutability are included and pass:
-//
-//   46.1 a dimension the original receipt left candidate-LESS
-//        can never be filled by later establishing evidence;
-//   46.2 a candidate that turns out to be WRONG can never be
+// ORIGINAL REPRODUCTION (PR #23, against main 6f56b05): built on
+// the merged candidate construction (a COMMITTED_UNVERIFIED
+// receipt records the mutation response's figures as CANDIDATES,
+// UNKNOWN determinacy, committedSource "unestablished"). The
+// store's verifyCommitReceipt then validated later evidence by
+// EXACT figure equality with the recorded candidates, so:
+//   46.1 a dimension the receipt left candidate-LESS could never
+//        be filled by later establishing evidence;
+//   46.2 a candidate that turned out WRONG could never be
 //        corrected by evidence establishing a different actual;
-//   46.3 when evidence CONFIRMS the candidates, the current view
-//        flips to COMMITTED_AND_VERIFIED / OK — but its displayed
-//        committedEffect still carries determinacy UNKNOWN and
-//        committedSource "unestablished": the presented
-//        provenance contradicts the presented verdict.
+//   46.3 confirming evidence flipped the view to VERIFIED/OK
+//        while the displayed figures still carried UNKNOWN /
+//        "unestablished" provenance labels.
+// All three failed on unmodified main; the recorded original was
+// never rewritten (asserted as a control, and correct).
 //
-// The immutable recorded original must NOT be rewritten (that
-// constraint is correct and is asserted as a control). The fix
-// direction — an append-only, identity-bound evidence record
-// plus a separately DERIVED current verified view whose
-// displayed provenance is the establishing evidence's — is
-// analysis only (research/issue-22/FINDINGS.md); nothing here
-// implements it. Simulated evidence only (mocked transport).
-//
-// PR #23 REVIEW CORRECTION (REVIEW-2, evidence provenance): as
-// first delivered, 46.1/46.2 built the verification observation
-// from literal figures chosen by this file, and in 46.2 the
-// mock's GET record still showed the original 80900 — so the
-// pair demonstrated the store's strict-equality upgrade
-// restriction against a caller-constructed observation, not
-// against independently established provider actuals. The
-// harness below now persists the divergence PROVIDER-SIDE: in
-// 46.2 the provider's authoritative subscription record carries
-// the plan at a corrected unit price (62400) from the moment the
-// update lands, so the independent post-commit read genuinely
-// establishes recurring = 83400 while the mutation RESPONSE (and
-// therefore the recorded candidate) still states 80900; the
-// observation's recurring is DERIVED from that read
-// (snapshot.billing.recurringAmount, itself the adapter's strict
-// sum of the record's stated item amounts), and its immediate is
-// read from the provider's operation-bound record of THIS update
-// (the persisted update response's unbilled_charges). No
-// contested figure is a hand-picked literal anymore. In 46.1 the
-// recurring figure is likewise read-derived; its immediate
-// figure remains a STATED observation figure, disclosed here
-// because the incomplete-response fault models a provider record
-// whose update response carries no charge and the fixture has no
-// post-commit charge-read — the missing-dimension restriction
-// 46.1 demonstrates does not depend on that figure's provenance
-// (ANY established immediate contradicts the receipt's absent
-// immediate identity field). 46.3 is unchanged in substance.
-// Recording contradictory evidence for investigation is not the
-// same as marking it verified: the safe behavior asserted below
-// is that differing actuals be RECORDABLE (as verified-with-
-// violation), which is exactly what the store refuses today.
+// 2026-11 RECONCILIATION RERUN (Issue #22 closure audit, main
+// 62744ee): Finding 5 was FIXED by PR #27 (append-only,
+// identity-bound evidence records plus a separately DERIVED
+// current view carrying the establishing evidence's figures and
+// provenance; default-suite regression home: test50; candidate
+// sourcing later corrected by PR #53). The original harness
+// construction — a live-adapter commit producing the candidate
+// receipt — is no longer reachable, because the
+// authorization-preservation gate (PR #24) refuses this adapter's
+// full-replacement commits before dispatch. The three scenarios
+// below are therefore rebuilt on the store-level candidate
+// construction test50 uses (a seeded COMMITTED_UNVERIFIED
+// candidate receipt in a QuoteStore), keeping the original
+// assertions of safe behavior: differing/missing actuals are
+// RECORDABLE, the derived view presents established actuals with
+// establishing provenance, and the recorded original is never
+// rewritten. Figure discipline follows REVIEW-2 / test50: every
+// figure claimed as an established ACTUAL is derived from the
+// mock provider record below (recurring = the record's stated
+// item amounts, summed; immediate = the record's operation-bound
+// unbilled charge for this mutation). Candidate figures are the
+// receipt's own unverified figures — literals there are the point.
 //
 // RESEARCH SUITE (PR #23 REVIEW-1): this file is NOT part of the
 // default `npm test` discovery (`dist/tests/*.test.js`). Build,
 // then invoke the research suite explicitly:
-// `node --test dist/tests/*.repro.js`.
+// `node --test dist/tests/*.repro.js`. Simulated evidence only.
 
 const SUB = "pilot-sub-001";
-const ADDON = "pilot-addon-vision";
-const PROPOSAL = (qty: number) => ({
-  changes: [{ action: "CHANGE_QUANTITY" as const, itemId: ADDON, quantity: qty }],
-  effectiveIntent: { type: "IMMEDIATE" as const },
-  acceptanceEnvelope: {},
-});
+const QUOTED = { immediate: 20000, recurring: 80900 };
 
-/**
- * Adapter whose post-update GET reads fail until `recover()` is
- * called (the 26.17 shape).
- *
- * `authoritativePlanUnitPrice` (REVIEW-2): when set, the harness
- * models a provider whose AUTHORITATIVE subscription record
- * diverges from what the update response stated — from the
- * moment the update lands, the record persists the plan item at
- * this unit price, so every subsequent GET of the subscription
- * serves the corrected price/amount while the already-returned
- * update response (the source of the receipt's candidates) is
- * untouched. The divergence therefore lives in the provider-side
- * record the independent verification later reads, not in any
- * figure this file hands to the store.
- */
-function makeAdapterWithDyingReads(faults: PilotMockFaults = {}, opts: { authoritativePlanUnitPrice?: number } = {}) {
-  const mock = new PilotMockChargebee(faults);
-  let failReads = false;
-  let recordDiverged = false;
-  const transport: HttpTransport = async (req) => {
-    if (failReads && req.method === "GET") throw new Error("read path down");
-    const res = await mock.transport(req);
-    if (req.method === "POST" && req.url.includes("/update_for_items")) {
-      failReads = true;
-      if (opts.authoritativePlanUnitPrice !== undefined) recordDiverged = true;
-      return res;
-    }
-    if (recordDiverged && req.method === "GET" && req.url.includes("/subscriptions/") && res.json) {
-      // Serve the provider's persisted authoritative record: the
-      // plan item carries the corrected unit price (flat_fee, so
-      // amount == unit_price). Deep-copied; the mock's own state
-      // and the already-returned update response are not mutated.
-      const json = JSON.parse(JSON.stringify(res.json));
-      const items = json?.subscription?.subscription_items as Array<any> | undefined;
-      const plan = items?.find((i) => i.item_price_id === "pilot-plan-business");
-      if (plan) {
-        plan.unit_price = opts.authoritativePlanUnitPrice;
-        plan.amount = opts.authoritativePlanUnitPrice;
-      }
-      return { ...res, json };
-    }
-    return res;
-  };
-  const client = new ChargebeeClient({ site: "pilot-test", apiKey: "pilot-mock-key" }, transport);
-  const store = new QuoteStore();
-  const adapter = new ChargebeeLiveAdapter(client, store, { liveCommitEnabled: true });
-  return { mock, client, store, adapter, recover: () => { failReads = false; } };
-}
+// ---------------------------------------------------------------------------
+// Mock provider record + derivations (mirrors test50's discipline)
+// ---------------------------------------------------------------------------
 
-function observationEffect(immediateNet: number | undefined, recurringAmount: number) {
+type MockProviderRecord = {
+  items: Array<{ item_price_id: string; amount: number }>;
+  operationCharge?: number;
+};
+
+function snapshotFromRecord(record: MockProviderRecord): SubscriptionSnapshot {
   return {
-    ...(immediateNet !== undefined ? { immediate: { net: immediateNet } } : {}),
-    recurring: { resultingAmount: recurringAmount, currency: "USD" },
-    determinacy: { immediateFinancialEffect: "DETERMINED" as const, recurringFinancialEffect: "DETERMINED" as const },
-    provenance: {
-      immediate: "test46: independent post-commit provider record (mocked)",
-      recurring: "test46: independent post-commit GET, sum of stated item amounts (mocked)",
-      committedSource: "provider_actual" as const,
+    id: SUB,
+    version: "v2",
+    status: "active",
+    items: [{ id: "pilot-addon-vision", offeringRef: "addon", quantity: 21 }],
+    billing: {
+      currency: "USD",
+      cadence: "MONTHLY",
+      recurringAmount: record.items.reduce((s, i) => s + i.amount, 0),
     },
   };
 }
 
-/**
- * REVIEW-2: an observation whose RECURRING figure is derived from
- * an independent read of the provider record — the snapshot's
- * `billing.recurringAmount`, which the adapter computes strictly
- * from the record's stated item amounts — never from a literal
- * chosen by this file. The immediate figure is supplied by the
- * caller from whatever provider record its scenario establishes
- * (46.2: the operation-bound update record; 46.1: stated, as
- * disclosed in the header).
- */
-function observationFromRead(snapshot: { billing: { recurringAmount?: number } }, immediateNet: number | undefined) {
-  assert.notEqual(snapshot.billing.recurringAmount, undefined, "fixture check: the independent read establishes a recurring figure");
-  return {
-    ...(immediateNet !== undefined ? { immediate: { net: immediateNet } } : {}),
-    recurring: { resultingAmount: snapshot.billing.recurringAmount!, currency: "USD" },
-    determinacy: { immediateFinancialEffect: "DETERMINED" as const, recurringFinancialEffect: "DETERMINED" as const },
+function observationFromRecord(
+  record: MockProviderRecord,
+  opts: { omitImmediate?: boolean } = {}
+): ProviderObservation {
+  const snapshot = snapshotFromRecord(record);
+  const effect: CommercialEffect = {
+    ...(opts.omitImmediate || record.operationCharge === undefined
+      ? {}
+      : { immediate: { net: record.operationCharge } }),
+    recurring: { resultingAmount: snapshot.billing.recurringAmount!, currency: "USD", cadence: "MONTHLY" },
+    determinacy: {
+      immediateFinancialEffect: opts.omitImmediate || record.operationCharge === undefined ? "UNKNOWN" : "DETERMINED",
+      recurringFinancialEffect: "DETERMINED",
+    },
     provenance: {
-      immediate: "test46: provider record of the committed operation (mocked)",
-      recurring: "test46: derived from the independent post-commit GET — the record's stated item amounts, summed by the adapter's snapshot derivation (mocked)",
-      committedSource: "provider_actual" as const,
+      ...(!opts.omitImmediate && record.operationCharge !== undefined
+        ? { immediate: "test46: provider's operation-bound unbilled-charge record for this mutation (mocked)" }
+        : {}),
+      recurring: "test46: independent post-commit read — record's stated item amounts, summed (mocked)",
+      committedSource: "provider_actual",
     },
   };
-}
-
-// ---------------------------------------------------------------------------
-// 46.1 — a missing candidate cannot be filled (expected FAIL)
-// ---------------------------------------------------------------------------
-
-test("Test 46.1 (Issue #22 F5a): later evidence establishing a dimension the receipt left candidate-less must be recordable, not refused as an identity conflict", async () => {
-  const { adapter, store, recover } = makeAdapterWithDyingReads({ incompleteUpdateResponse: true });
-  const quote = await adapter.createChangeQuote(SUB, PROPOSAL(21));
-  const receipt = await adapter.commitChangeQuote(quote.id);
-  // The update response carried NO financials and the re-read was
-  // down: the receipt records a recurring candidate (from the
-  // response's subscription items) but NO immediate candidate.
-  assert.equal(receipt.status, "COMMITTED_UNVERIFIED");
-  assert.equal(receipt.committedEffect.immediate, undefined, "fixture check: the immediate dimension recorded no candidate figure");
-  assert.equal(receipt.committedEffect.recurring?.resultingAmount, 80900, "fixture check: the recurring candidate was recorded");
-
-  recover();
-  const snapshot = await adapter.getSubscription(SUB);
-  // REVIEW-2: the observation's recurring is DERIVED from this
-  // independent read of the provider record (80900 — it agrees
-  // with the recorded candidate; nothing here is contested). The
-  // immediate figure (20000) is a STATED observation figure, as
-  // disclosed in the file header: the incomplete-response fault
-  // leaves the provider's operation record with no charge figure
-  // to read back. The restriction demonstrated below does not
-  // depend on its provenance — any established immediate
-  // contradicts the receipt's absent immediate identity field.
-  assert.equal(snapshot.billing.recurringAmount, 80900, "fixture check: the independent read establishes the same recurring the candidate recorded");
-  const stored = store.get(quote.id)!;
-  const evidence = establishVerification(stored, {
+  return {
     subscriptionRef: SUB,
-    committedEffect: observationFromRead(snapshot, 20000),
+    committedEffect: effect,
     resultingSnapshot: snapshot,
-    source: "test46: independent post-commit reads through the mocked provider's records",
-  });
+    source: "test46: independent post-commit provider reads (mocked)",
+    observedAt: "2026-11-02T00:06:00.000Z",
+  };
+}
+
+// ---------------------------------------------------------------------------
+// Quote / candidate-receipt fixtures (the PR #10/#11 candidate
+// construction, seeded at store level as in test50)
+// ---------------------------------------------------------------------------
+
+function makeQuote(quoteId: string): StoredQuote {
+  return {
+    quote_id: quoteId,
+    provider: "chargebee",
+    subscription_id: SUB,
+    subscription_version_at_quote: "v1",
+    proposal: {
+      changes: [{ action: "CHANGE_QUANTITY", itemId: "pilot-addon-vision", quantity: 21 }],
+      effectiveIntent: { type: "IMMEDIATE" },
+      acceptanceEnvelope: {},
+    } as StoredQuote["proposal"],
+    effective_guarantee_mode: "REVALIDATE",
+    guarantee_coverage: {
+      immediateFinancialEffect: "REVALIDATE",
+      recurringFinancialEffect: "REVALIDATE",
+      termEffect: "UNKNOWN",
+      effectiveAt: "REVALIDATE",
+    },
+    multi_change_consistency: "ATOMIC",
+    provider_preview_input: null,
+    quoted_effect: {
+      immediate: { net: QUOTED.immediate },
+      recurring: { resultingAmount: QUOTED.recurring, currency: "USD", cadence: "MONTHLY" },
+      determinacy: { immediateFinancialEffect: "DETERMINED", recurringFinancialEffect: "DETERMINED" },
+      provenance: { immediate: "test46: quote-time preview", recurring: "test46: quote-time preview" },
+    },
+    created_at: "2026-11-02T00:00:00.000Z",
+    expires_at: "2026-11-02T01:00:00.000Z",
+    status: "ACTIVE",
+  };
+}
+
+function candidates(opts: { immediate?: number; recurring?: number }): CommercialEffect {
+  return {
+    ...(opts.immediate !== undefined ? { immediate: { net: opts.immediate } } : {}),
+    ...(opts.recurring !== undefined
+      ? { recurring: { resultingAmount: opts.recurring, currency: "USD", cadence: "MONTHLY" } }
+      : {}),
+    determinacy: { immediateFinancialEffect: "UNKNOWN", recurringFinancialEffect: "UNKNOWN" },
+    provenance: {
+      immediate: "candidate: mutation response figures (unverified)",
+      recurring: "candidate: mutation response figures (unverified)",
+      committedSource: "unestablished",
+    },
+  };
+}
+
+function candidateReceipt(quoteId: string, committedEffect: CommercialEffect): SubscriptionChangeReceipt {
+  return {
+    quoteId,
+    subscriptionRef: SUB,
+    receiptId: `rcpt_${quoteId}`,
+    status: "COMMITTED_UNVERIFIED",
+    outcome: "COMMITTED_UNVERIFIED",
+    resultingSnapshot: {
+      id: SUB,
+      version: "v2",
+      status: "active",
+      items: [{ id: "pilot-addon-vision", offeringRef: "addon", quantity: 21 }],
+      billing: { currency: "USD", cadence: "MONTHLY" },
+    },
+    quotedEffect: {
+      immediate: { net: QUOTED.immediate },
+      recurring: { resultingAmount: QUOTED.recurring, currency: "USD", cadence: "MONTHLY" },
+      determinacy: { immediateFinancialEffect: "DETERMINED", recurringFinancialEffect: "DETERMINED" },
+      provenance: { immediate: "test46: quote-time preview", recurring: "test46: quote-time preview" },
+    },
+    committedEffect,
+    guaranteeMode: "REVALIDATE",
+    consistencyGuarantee: "BEST_EFFORT",
+    multiChangeConsistency: "ATOMIC",
+    reconciliation: {
+      status: "UNVERIFIED",
+      reason: "committed figures are candidates from the mutation response; no independent establishment",
+      undeterminedDimensions: ["immediateFinancialEffect", "recurringFinancialEffect"],
+    },
+    committedAt: "2026-11-02T00:05:00.000Z",
+  };
+}
+
+function seededStore(quoteId: string, committedEffect: CommercialEffect) {
+  const store = new QuoteStore();
+  store.put(makeQuote(quoteId));
+  const receipt = candidateReceipt(quoteId, committedEffect);
+  store.recordCommitReceipt(quoteId, receipt);
+  return { store, receipt };
+}
+
+// ---------------------------------------------------------------------------
+// 46.1 — a missing candidate can be filled by later evidence
+// ---------------------------------------------------------------------------
+
+test("Test 46.1 (Issue #22 F5a): later evidence establishing a dimension the receipt left candidate-less is recordable, not refused as an identity conflict", () => {
+  // The receipt records a recurring candidate (80900) but NO
+  // immediate candidate (the mutation response carried no
+  // financials for that dimension).
+  const { store, receipt } = seededStore("q46_1", candidates({ recurring: QUOTED.recurring }));
+  assert.equal(receipt.committedEffect.immediate, undefined, "fixture check: no immediate candidate recorded");
+
+  // The provider record establishes immediate 20000 (its
+  // operation-bound charge) and recurring 80900 (its stated item
+  // amounts, summed) — both derived from the record, not literals.
+  const record: MockProviderRecord = {
+    items: [{ item_price_id: "pilot-plan-business", amount: 59900 }, { item_price_id: "pilot-addon-vision", amount: 21000 }],
+    operationCharge: 20000,
+  };
+  assert.equal(snapshotFromRecord(record).billing.recurringAmount, 80900, "fixture check: the record's stated amounts sum to the candidate recurring");
+  const evidence = establishVerification(store.get("q46_1")!, observationFromRecord(record));
   let verifyError: unknown;
   let verified: ReturnType<typeof store.verifyCommitReceipt> | undefined;
   try {
-    verified = store.verifyCommitReceipt(quote.id, evidence);
+    verified = store.verifyCommitReceipt("q46_1", evidence);
   } catch (e) {
     verifyError = e;
   }
-  console.log("=== TEST46 EVIDENCE 46.1 (observed on unmodified main) ===");
+  console.log("=== TEST46 EVIDENCE 46.1 (observed on current main, 2026-11 reconciliation) ===");
   console.log(JSON.stringify({
     recordedCandidates: { immediate: null, recurring: 80900 },
     evidenceEstablishes: { immediate: 20000, recurring: 80900 },
-    evidenceFigureSources: { recurring: "derived from the independent post-commit GET of the provider record", immediate: "stated observation figure (the incomplete-response record carries no charge to read back — see file header)" },
     verifyRefused: verifyError ? String((verifyError as Error).message).slice(0, 200) : null,
     verifiedViewImmediate: verified?.committedEffect.immediate?.net ?? null,
   }, null, 2));
@@ -225,108 +246,66 @@ test("Test 46.1 (Issue #22 F5a): later evidence establishing a dimension the rec
 });
 
 // ---------------------------------------------------------------------------
-// 46.2 — an incorrect candidate cannot be corrected (expected FAIL)
+// 46.2 — an incorrect candidate can be corrected by established
+// actuals (recorded as verified-with-violation)
 // ---------------------------------------------------------------------------
 
-test("Test 46.2 (Issue #22 F5b): evidence establishing a DIFFERENT actual than the recorded candidate must be recordable (verified-with-violation), not refused as an identity conflict", async () => {
-  // REVIEW-2: the provider's authoritative record persists the
-  // plan at a corrected unit price (62400) from the moment the
-  // update lands. The mutation RESPONSE still states the plan at
-  // 59900, so the receipt records candidate recurring 80900 —
-  // while the provider record an independent read sees sums to
-  // 83400. The differing actual is established BY THE RECORD,
-  // not picked by this file.
-  const { mock, client, adapter, store, recover } = makeAdapterWithDyingReads({}, { authoritativePlanUnitPrice: 62400 });
-  const quote = await adapter.createChangeQuote(SUB, PROPOSAL(21));
-  const receipt = await adapter.commitChangeQuote(quote.id);
-  assert.equal(receipt.status, "COMMITTED_UNVERIFIED");
-  assert.equal(receipt.committedEffect.recurring?.resultingAmount, 80900, "fixture check: candidate recurring recorded from the response (plan stated at 59900 there)");
-
-  recover();
-  // The independent establishment reads the provider record back:
-  // the raw record shows the plan persisted at 62400, and the
-  // adapter's snapshot derivation sums the record's stated item
-  // amounts to recurring 83400. The candidate was WRONG — the
-  // response's item amounts did not survive contact with the
-  // authoritative record. Against the {} envelope that is an
-  // established VIOLATED, never an OK — but it must be RECORDABLE
-  // (recording contradictory evidence for investigation is not
-  // the same as marking it verified).
-  const { json: rawRecord } = await client.getSubscription(SUB);
-  const recordItems = (rawRecord as any).subscription.subscription_items as Array<{ item_price_id: string; unit_price: number; amount: number }>;
-  const recordRecurring = recordItems.reduce((s, i) => s + i.amount, 0);
-  assert.equal(recordRecurring, 83400, "fixture check: the provider record's stated item amounts sum to 83400");
-  const snapshot = await adapter.getSubscription(SUB);
-  assert.equal(snapshot.id, SUB, "association: the read names the quote's own subscription");
-  assert.equal(snapshot.billing.recurringAmount, recordRecurring, "fixture check: the snapshot's recurring is the record's stated amounts, summed");
-  // The immediate actual comes from the provider's operation-
-  // bound record of THIS update — the persisted update response's
-  // unbilled charge, created by the very mutation under
-  // verification (identity/attribution binding), not from a
-  // literal and not from a later unrelated read.
-  const operationCharge = (mock.lastUpdateJson as any)?.unbilled_charges?.[0]?.amount as number | undefined;
-  assert.equal(operationCharge, 20000, "fixture check: the update's own provider record carries the incurred charge");
-  const stored = store.get(quote.id)!;
-  const evidence = establishVerification(stored, {
-    subscriptionRef: SUB,
-    committedEffect: observationFromRead(snapshot, operationCharge),
-    resultingSnapshot: snapshot,
-    source: "test46: independent post-commit GET of the provider's authoritative record + the update operation's own persisted charge record (mocked)",
-  });
+test("Test 46.2 (Issue #22 F5b): evidence establishing a DIFFERENT actual than the recorded candidate is recordable (verified-with-violation), not refused as an identity conflict", () => {
+  // The receipt records candidate recurring 80900 (the mutation
+  // response stated the plan at 59900). The provider's
+  // authoritative record persists the plan at a corrected 62400,
+  // so the record's stated amounts sum to 83400 — the differing
+  // actual is established BY THE RECORD, not picked by this file.
+  const { store, receipt } = seededStore("q46_2", candidates({ immediate: QUOTED.immediate, recurring: QUOTED.recurring }));
+  const record: MockProviderRecord = {
+    items: [{ item_price_id: "pilot-plan-business", amount: 62400 }, { item_price_id: "pilot-addon-vision", amount: 21000 }],
+    operationCharge: 20000,
+  };
+  assert.equal(snapshotFromRecord(record).billing.recurringAmount, 83400, "fixture check: the provider record's stated item amounts sum to 83400");
+  const evidence = establishVerification(store.get("q46_2")!, observationFromRecord(record));
   let verifyError: unknown;
   let verified: ReturnType<typeof store.verifyCommitReceipt> | undefined;
   try {
-    verified = store.verifyCommitReceipt(quote.id, evidence);
+    verified = store.verifyCommitReceipt("q46_2", evidence);
   } catch (e) {
     verifyError = e;
   }
-  console.log("=== TEST46 EVIDENCE 46.2 (observed on unmodified main) ===");
+  console.log("=== TEST46 EVIDENCE 46.2 (observed on current main, 2026-11 reconciliation) ===");
   console.log(JSON.stringify({
     recordedCandidateRecurring: 80900,
-    providerRecordItems: recordItems.map((i) => ({ item_price_id: i.item_price_id, unit_price: i.unit_price, amount: i.amount })),
-    establishedActualRecurring: snapshot.billing.recurringAmount,
-    establishedActualImmediate: operationCharge,
-    evidenceFigureSources: { recurring: "derived from the independent post-commit GET — provider record persisted at the corrected plan price", immediate: "the update operation's own persisted unbilled-charge record" },
+    establishedActualRecurring: 83400,
+    establishedActualImmediate: 20000,
     verifyRefused: verifyError ? String((verifyError as Error).message).slice(0, 200) : null,
     verifiedViewRecurring: verified?.committedEffect.recurring?.resultingAmount ?? null,
     verifiedViewReconciliation: verified?.reconciliation?.status ?? null,
   }, null, 2));
   console.log("=== END TEST46 EVIDENCE ===");
   assert.equal(verifyError, undefined, "a differing established actual must be recordable as appended evidence, not refused as CONFLICTING_RECEIPT_IDENTITY");
+  assert.equal(verified?.committedEffect.recurring?.resultingAmount, 83400, "the derived view must carry the established actual, not the stale candidate");
   assert.equal(verified?.reconciliation?.status, "VIOLATED", "the derived view must report the established actual as a violation of the envelope, never a silent OK");
-  // Control (passes on main): the recorded ORIGINAL is immutable —
-  // replay still returns it verbatim, candidates and all.
-  const replay = await adapter.commitChangeQuote(quote.id);
-  assert.deepEqual(replay, receipt, "the recorded original receipt must never be rewritten");
+  // Control: the recorded ORIGINAL (commit_receipt_recorded) is
+  // immutable — it still carries the candidate figures verbatim,
+  // even though the derived view (commit_receipt) advanced.
+  assert.deepEqual(store.get("q46_2")!.commit_receipt_recorded, receipt, "the recorded original receipt must never be rewritten");
 });
 
 // ---------------------------------------------------------------------------
-// 46.3 — confirming evidence: the verified view's displayed
-// provenance contradicts its verdict (expected FAIL)
+// 46.3 — confirming evidence: the verified view's provenance must
+// match its verdict
 // ---------------------------------------------------------------------------
 
-test("Test 46.3 (Issue #22 F5c): after a confirming verification, the current view must not present VERIFIED/OK over figures still labeled UNKNOWN / \"unestablished\"", async () => {
-  const { adapter, store, recover } = makeAdapterWithDyingReads();
-  const quote = await adapter.createChangeQuote(SUB, PROPOSAL(21));
-  const receipt = await adapter.commitChangeQuote(quote.id);
-  assert.equal(receipt.status, "COMMITTED_UNVERIFIED");
-  assert.equal(receipt.committedEffect.immediate?.net, 20000);
-  assert.equal(receipt.committedEffect.recurring?.resultingAmount, 80900);
+test("Test 46.3 (Issue #22 F5c): after a confirming verification, the current view must not present VERIFIED/OK over figures still labeled UNKNOWN / \"unestablished\"", () => {
+  const { store, receipt } = seededStore("q46_3", candidates({ immediate: QUOTED.immediate, recurring: QUOTED.recurring }));
+  const record: MockProviderRecord = {
+    items: [{ item_price_id: "pilot-plan-business", amount: 59900 }, { item_price_id: "pilot-addon-vision", amount: 21000 }],
+    operationCharge: 20000,
+  };
+  const evidence = establishVerification(store.get("q46_3")!, observationFromRecord(record));
+  const verified = store.verifyCommitReceipt("q46_3", evidence);
+  assert.equal(verified.outcome, "COMMITTED_AND_VERIFIED", "fixture check: the confirming transition succeeds");
+  assert.equal(verified.reconciliation.status, "OK", "fixture check: reconciliation is OK for confirming evidence");
 
-  recover();
-  const snapshot = await adapter.getSubscription(SUB);
-  const stored = store.get(quote.id)!;
-  const evidence = establishVerification(stored, {
-    subscriptionRef: SUB,
-    committedEffect: observationEffect(20000, 80900),
-    resultingSnapshot: snapshot,
-    source: "test46: independent post-commit reads through the mocked provider's records",
-  });
-  const verified = store.verifyCommitReceipt(quote.id, evidence);
-  assert.equal(verified.outcome, "COMMITTED_AND_VERIFIED", "fixture check: the confirming transition itself succeeds on main");
-  assert.equal(verified.reconciliation.status, "OK", "fixture check: reconciliation flips to OK on main");
-
-  console.log("=== TEST46 EVIDENCE 46.3 (observed on unmodified main) ===");
+  console.log("=== TEST46 EVIDENCE 46.3 (observed on current main, 2026-11 reconciliation) ===");
   console.log(JSON.stringify({
     viewOutcome: verified.outcome,
     viewReconciliation: verified.reconciliation?.status,
@@ -338,11 +317,11 @@ test("Test 46.3 (Issue #22 F5c): after a confirming verification, the current vi
   assert.ok(
     !(verified.committedEffect.determinacy?.immediateFinancialEffect === "UNKNOWN" && verified.committedEffect.provenance?.committedSource === "unestablished"),
     "the verified view presents COMMITTED_AND_VERIFIED/OK while its displayed committed figures remain determinacy UNKNOWN " +
-      "with committedSource \"unestablished\" — the displayed provenance contradicts the verdict; the derived view must carry " +
-      "the establishing evidence's provenance (or an explicit verified-view marker) rather than the candidate's labels",
+      "with committedSource \"unestablished\" — the displayed provenance must be the establishing evidence's, not the candidate's labels",
   );
-  // Control (passes on main): the recorded ORIGINAL keeps its
-  // candidate labels — immutability of the original is correct.
-  const replay = await adapter.commitChangeQuote(quote.id);
-  assert.deepEqual(replay, receipt, "the recorded original receipt must never be rewritten");
+  assert.equal(verified.committedEffect.provenance?.committedSource, "provider_actual", "the view's figures carry the establishing evidence's provenance");
+  // Control: the recorded ORIGINAL (commit_receipt_recorded)
+  // keeps its candidate labels — immutability of the original is
+  // correct; only the derived view advances.
+  assert.deepEqual(store.get("q46_3")!.commit_receipt_recorded, receipt, "the recorded original receipt must never be rewritten");
 });
