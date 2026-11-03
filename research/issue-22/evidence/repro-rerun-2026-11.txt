@@ -1,0 +1,208 @@
+TAP version 13
+# === TEST43.1 EVIDENCE (observed on current main, 2026-11 reconciliation) ===
+# {
+#   "authorizedChange": "CHANGE_QUANTITY pilot-addon-vision 1 -> 21 (only)",
+#   "commitError": {
+#     "code": "AUTHORIZATION_PRESERVATION_UNENFORCEABLE",
+#     "blocked": "AUTHORIZATION_PRESERVATION_UNENFORCEABLE",
+#     "outcome": "CONFIRMED_NON_EXECUTION"
+#   },
+#   "concurrentAddLanded": true,
+#   "stateAfterAdd": [
+#     "pilot-plan-business x1",
+#     "pilot-addon-vision x1",
+#     "pilot-addon-concurrent x1"
+#   ],
+#   "mutatingDispatches": 0,
+#   "subscriptionStateAfterCommitAttempt": [
+#     "pilot-plan-business",
+#     "pilot-addon-vision",
+#     "pilot-addon-concurrent"
+#   ],
+#   "unauthorizedItemDeletedByScq": false
+# }
+# === END TEST43.1 EVIDENCE ===
+# Subtest: Test 43.1 (Issue \#22 F1): a concurrent unauthorized addition can no longer be deleted by the full-list replacement — the commit refuses before dispatch
+ok 1 - Test 43.1 (Issue \#22 F1): a concurrent unauthorized addition can no longer be deleted by the full-list replacement — the commit refuses before dispatch
+  ---
+  duration_ms: 67.302353
+  ...
+# Subtest: Test 43.2 (Issue \#22 F1 control): the same quote+commit with NO concurrent write is likewise refused before dispatch — the gate is capability-based, not race-dependent
+ok 2 - Test 43.2 (Issue \#22 F1 control): the same quote+commit with NO concurrent write is likewise refused before dispatch — the gate is capability-based, not race-dependent
+  ---
+  duration_ms: 2.579112
+  ...
+# Subtest: Test 43.3 (Issue \#22 F1 control): a concurrent addition landing BEFORE the commit-phase read refuses QUOTE_STALE with zero dispatches
+ok 3 - Test 43.3 (Issue \#22 F1 control): a concurrent addition landing BEFORE the commit-phase read refuses QUOTE_STALE with zero dispatches
+  ---
+  duration_ms: 2.660324
+  ...
+# === TEST44 EVIDENCE 44.1 typo mode, no envelope (observed on unmodified main) ===
+# {
+#   "quoteRefused": "Invalid proposal: guaranteeMode \\"REVALDIATE\\" is not a recognized guarantee mode — the only values are \\"EXACT\\" and \\"REVALIDATE\\" (omit the field for the REVALIDAT",
+#   "quoteCreated": false,
+#   "commitRefused": null
+# }
+# === END TEST44 EVIDENCE ===
+# === TEST44 EVIDENCE 44.2 NaN bound (observed on unmodified main) ===
+# {
+#   "quoteRefused": "Invalid acceptance envelope: acceptance envelope bound maxImmediateNetIncrease must be a finite, nonnegative number (minor units); got null — a malformed bound ",
+#   "quoteCreated": false,
+#   "commitRefused": null
+# }
+# === END TEST44 EVIDENCE ===
+# === TEST44 EVIDENCE 44.3 negative bound (observed on unmodified main) ===
+# {
+#   "quoteRefused": "Invalid acceptance envelope: acceptance envelope bound maxRecurringIncrease must be a finite, nonnegative number (minor units); got -5 — a malformed bound is ne",
+#   "quoteCreated": false,
+#   "commitRefused": null
+# }
+# === END TEST44 EVIDENCE ===
+# === TEST44 EVIDENCE 44.4 string bound (observed on unmodified main) ===
+# {
+#   "quoteRefused": "Invalid acceptance envelope: acceptance envelope bound maxImmediateNetIncrease must be a finite, nonnegative number (minor units); got \\"abc\\" — a malformed bound",
+#   "quoteCreated": false,
+#   "commitRefused": null
+# }
+# === END TEST44 EVIDENCE ===
+# === TEST44 EVIDENCE 44.5 (observed on unmodified main) ===
+# {"drift":"+5000 immediate.net","bound":"NaN","violationReturned":null,"threw":true}
+# === END TEST44 EVIDENCE ===
+# Subtest: Test 44.1 (Issue \#22 F2): guaranteeMode "REVALDIATE" (typo) with NO acceptanceEnvelope must be refused at quote creation
+ok 4 - Test 44.1 (Issue \#22 F2): guaranteeMode "REVALDIATE" (typo) with NO acceptanceEnvelope must be refused at quote creation
+  ---
+  duration_ms: 2.807765
+  ...
+# Subtest: Test 44.2 (Issue \#22 F2): a NaN envelope bound must be refused at quote creation
+ok 5 - Test 44.2 (Issue \#22 F2): a NaN envelope bound must be refused at quote creation
+  ---
+  duration_ms: 0.549474
+  ...
+# Subtest: Test 44.3 (Issue \#22 F2): a negative envelope bound must be refused at quote creation
+ok 6 - Test 44.3 (Issue \#22 F2): a negative envelope bound must be refused at quote creation
+  ---
+  duration_ms: 0.738389
+  ...
+# Subtest: Test 44.4 (Issue \#22 F2): a string-typed envelope bound must be refused at quote creation
+ok 7 - Test 44.4 (Issue \#22 F2): a string-typed envelope bound must be refused at quote creation
+  ---
+  duration_ms: 0.4395
+  ...
+# Subtest: Test 44.5 (Issue \#22 F2): checkAcceptanceEnvelope with a NaN bound must not silently pass a drifted revalidation
+ok 8 - Test 44.5 (Issue \#22 F2): checkAcceptanceEnvelope with a NaN bound must not silently pass a drifted revalidation
+  ---
+  duration_ms: 0.460781
+  ...
+# Subtest: Test 44.6 (Issue \#22 F2 control): well-formed REVALIDATE proposal with finite nonnegative bounds works
+ok 9 - Test 44.6 (Issue \#22 F2 control): well-formed REVALIDATE proposal with finite nonnegative bounds works
+  ---
+  duration_ms: 61.177548
+  ...
+# === TEST45 EVIDENCE 45.1 (observed on current main, 2026-11 reconciliation) ===
+# {
+#   "quotedSubscriptionRef": "pilot-sub-001",
+#   "commitPhaseReadNamed": "pilot-sub-999",
+#   "commitRefused": true,
+#   "blocked": "SUBSCRIPTION_IDENTITY_MISMATCH",
+#   "outcome": "CONFIRMED_NON_EXECUTION",
+#   "mutatingDispatches": 0
+# }
+# === END TEST45 EVIDENCE ===
+# === TEST45 EVIDENCE 45.3 (observed on unmodified main) ===
+# {"quotedCurrency":"USD","committedCurrency":"EUR","amounts":"identical numbers","reconciliation":"VIOLATED"}
+# === END TEST45 EVIDENCE ===
+# === TEST45 EVIDENCE 45.4 (observed on unmodified main) ===
+# {"violationReturned":"unit comparability precondition failed: the quoted recurring amount is denominated in USD but the compared recurring amount is denominated in EUR — amounts in different currencies are not comparable, so numeric equality between them establishes nothing","threw":false}
+# === END TEST45 EVIDENCE ===
+# === TEST45 EVIDENCE 45.5 (observed on unmodified main) ===
+# {"quotedCadence":"MONTHLY","committedCadence":"ANNUAL","amounts":"identical numbers","reconciliation":"VIOLATED"}
+# === END TEST45 EVIDENCE ===
+# Subtest: Test 45.1 (Issue \#22 F3): a commit-phase validation read naming a different subscription.id refuses before dispatch
+ok 10 - Test 45.1 (Issue \#22 F3): a commit-phase validation read naming a different subscription.id refuses before dispatch
+  ---
+  duration_ms: 61.163687
+  ...
+# Subtest: Test 45.2 (Issue \#22 F3 control): the identical flow with every read naming the SAME subscription passes the identity boundary (and is then refused by the authorization-preservation gate)
+ok 11 - Test 45.2 (Issue \#22 F3 control): the identical flow with every read naming the SAME subscription passes the identity boundary (and is then refused by the authorization-preservation gate)
+  ---
+  duration_ms: 3.155627
+  ...
+# Subtest: Test 45.3 (Issue \#22 F4): quoted USD vs committed EUR at the same numeric value must NOT reconcile OK
+ok 12 - Test 45.3 (Issue \#22 F4): quoted USD vs committed EUR at the same numeric value must NOT reconcile OK
+  ---
+  duration_ms: 1.135856
+  ...
+# Subtest: Test 45.4 (Issue \#22 F4): the pre-mutation envelope gate likewise refuses a cross-currency revalidation
+ok 13 - Test 45.4 (Issue \#22 F4): the pre-mutation envelope gate likewise refuses a cross-currency revalidation
+  ---
+  duration_ms: 0.585279
+  ...
+# Subtest: Test 45.5 (Issue \#22 F4): quoted MONTHLY vs committed ANNUAL cadence at the same amount must NOT reconcile OK
+ok 14 - Test 45.5 (Issue \#22 F4): quoted MONTHLY vs committed ANNUAL cadence at the same amount must NOT reconcile OK
+  ---
+  duration_ms: 0.46653
+  ...
+# Subtest: Test 45.6 (Issue \#22 F4 control): same currency, same cadence, same amounts reconcile OK
+ok 15 - Test 45.6 (Issue \#22 F4 control): same currency, same cadence, same amounts reconcile OK
+  ---
+  duration_ms: 0.181032
+  ...
+# === TEST46 EVIDENCE 46.1 (observed on current main, 2026-11 reconciliation) ===
+# {
+#   "recordedCandidates": {
+#     "immediate": null,
+#     "recurring": 80900
+#   },
+#   "evidenceEstablishes": {
+#     "immediate": 20000,
+#     "recurring": 80900
+#   },
+#   "verifyRefused": null,
+#   "verifiedViewImmediate": 20000
+# }
+# === END TEST46 EVIDENCE ===
+# === TEST46 EVIDENCE 46.2 (observed on current main, 2026-11 reconciliation) ===
+# {
+#   "recordedCandidateRecurring": 80900,
+#   "establishedActualRecurring": 83400,
+#   "establishedActualImmediate": 20000,
+#   "verifyRefused": null,
+#   "verifiedViewRecurring": 83400,
+#   "verifiedViewReconciliation": "VIOLATED"
+# }
+# === END TEST46 EVIDENCE ===
+# === TEST46 EVIDENCE 46.3 (observed on current main, 2026-11 reconciliation) ===
+# {
+#   "viewOutcome": "COMMITTED_AND_VERIFIED",
+#   "viewReconciliation": "OK",
+#   "viewCommittedDeterminacy": {
+#     "immediateFinancialEffect": "DETERMINED",
+#     "recurringFinancialEffect": "DETERMINED"
+#   },
+#   "viewCommittedSource": "provider_actual"
+# }
+# === END TEST46 EVIDENCE ===
+# Subtest: Test 46.1 (Issue \#22 F5a): later evidence establishing a dimension the receipt left candidate-less is recordable, not refused as an identity conflict
+ok 16 - Test 46.1 (Issue \#22 F5a): later evidence establishing a dimension the receipt left candidate-less is recordable, not refused as an identity conflict
+  ---
+  duration_ms: 8.324298
+  ...
+# Subtest: Test 46.2 (Issue \#22 F5b): evidence establishing a DIFFERENT actual than the recorded candidate is recordable (verified-with-violation), not refused as an identity conflict
+ok 17 - Test 46.2 (Issue \#22 F5b): evidence establishing a DIFFERENT actual than the recorded candidate is recordable (verified-with-violation), not refused as an identity conflict
+  ---
+  duration_ms: 2.399773
+  ...
+# Subtest: Test 46.3 (Issue \#22 F5c): after a confirming verification, the current view must not present VERIFIED/OK over figures still labeled UNKNOWN / "unestablished"
+ok 18 - Test 46.3 (Issue \#22 F5c): after a confirming verification, the current view must not present VERIFIED/OK over figures still labeled UNKNOWN / "unestablished"
+  ---
+  duration_ms: 2.616018
+  ...
+1..18
+# tests 18
+# suites 0
+# pass 18
+# fail 0
+# cancelled 0
+# skipped 0
+# todo 0
+# duration_ms 278.917838

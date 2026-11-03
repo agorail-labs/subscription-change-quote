@@ -14,22 +14,34 @@ import type { CommercialEffect, SubscriptionChangeProposal } from "../src/core/t
 // controls pass. Simulated evidence only (mocked transports /
 // in-memory engine calls) — never LIVE.
 //
+// 2026-11 RECONCILIATION RERUN (Issue #22 closure audit, main
+// 62744ee): Findings 3 and 4 were FIXED by PR #26 (default-suite
+// regression home: test49). The F4 tests (45.3–45.6) pass
+// unmodified. The F3 scenario's original shape — a post-commit
+// re-read naming another subscription — is no longer reachable on
+// this adapter, because (a) identity is now checked at quote
+// creation, at the commit-phase validation read, on the mutation
+// response, and on the post-commit re-read (a foreign read is
+// treated as unavailable evidence, never consumed), and (b) the
+// authorization-preservation gate refuses this adapter's
+// full-replacement commits before dispatch, so no post-commit
+// phase is reached. Tests 45.1/45.2 were therefore updated to the
+// earliest reachable identity boundary — the commit-phase
+// validation read — which is also where test49.1 pins the
+// behavior in the default suite. The original failing-first text
+// is preserved in research/external-review-reconciliation-2026-11.md.
+//
 // RESEARCH SUITE (PR #23 REVIEW-1): this file is NOT part of the
 // default `npm test` discovery (`dist/tests/*.test.js`). Build,
 // then invoke the research suite explicitly:
 // `node --test dist/tests/*.repro.js`.
 //
-// Finding 3: the Chargebee-live adapter never checks that the
-// post-commit re-read names the SAME subscription the quote was
-// for. establishLiveCommit consumes the re-read's items and
-// fingerprint — and chargebeeSubscriptionFingerprint is
-// `rv:<resource_version>` when a resource_version is present, so
-// the subscription ID is not even an input to the bracket. A
-// post-commit GET returning a DIFFERENT subscription.id with
-// matching item values therefore verifies VERIFIED/OK, and the
-// receipt's resultingSnapshot names the other subscription while
-// subscriptionRef names the quoted one. (PR #20's identity check
-// covers the read-only PREFLIGHT path, not this mutating path.)
+// Finding 3 (historical, at 963be0b/6f56b05): the Chargebee-live
+// adapter never checked that the post-commit re-read names the
+// SAME subscription the quote was for, and the rv-only fingerprint
+// could not catch a wrong-record read. Fixed by PR #26 — identity
+// is now bound at every read the mutating path consumes (see the
+// reconciliation note above).
 //
 // Finding 4: compareDeterminedDimensions (core/scq-engine.ts)
 // compares raw numbers only. CommercialEffect.recurring HAS a
@@ -49,20 +61,21 @@ const PROPOSAL = (qty: number) => ({
 });
 
 // ---------------------------------------------------------------------------
-// 45.1 — F3: post-commit GET names a DIFFERENT subscription
-// (expected FAIL on main)
+// 45.1 — F3: the commit-phase validation read names a DIFFERENT
+// subscription (resource_version preserved, so the rv-only
+// fingerprint cannot catch it). The commit must refuse before
+// dispatch with SUBSCRIPTION_IDENTITY_MISMATCH.
 // ---------------------------------------------------------------------------
 
-test("Test 45.1 (Issue #22 F3): a post-commit re-read naming a different subscription.id must not verify VERIFIED/OK", async () => {
+test("Test 45.1 (Issue #22 F3): a commit-phase validation read naming a different subscription.id refuses before dispatch", async () => {
   const mock = new PilotMockChargebee();
-  let mutated = false;
+  let armed = false;
   const transport: HttpTransport = async (req) => {
     const res = await mock.transport(req);
-    if (req.method === "POST" && req.url.includes("/update_for_items")) mutated = true;
-    if (mutated && req.method === "GET" && (res.json as any)?.subscription) {
-      // The provider read now returns ANOTHER subscription's record
-      // (same item values, different id) — e.g. a wrong-record read
-      // or an account mix-up on the provider side.
+    if (armed && req.method === "GET" && (res.json as any)?.subscription) {
+      // The commit-phase read returns ANOTHER subscription's
+      // record (same item values and resource_version, different
+      // id) — a wrong-record read the rv fingerprint cannot catch.
       return { ...res, json: { subscription: { ...(res.json as any).subscription, id: "pilot-sub-999" } } };
     }
     return res;
@@ -71,34 +84,46 @@ test("Test 45.1 (Issue #22 F3): a post-commit re-read naming a different subscri
   const adapter = new ChargebeeLiveAdapter(client, new QuoteStore(), { liveCommitEnabled: true });
 
   const quote = await adapter.createChangeQuote(SUB, PROPOSAL(21));
-  const receipt = await adapter.commitChangeQuote(quote.id);
+  armed = true;
+  const err = await adapter.commitChangeQuote(quote.id).then(
+    () => null,
+    (e: unknown) => e,
+  );
 
-  console.log("=== TEST45 EVIDENCE 45.1 (observed on unmodified main) ===");
+  console.log("=== TEST45 EVIDENCE 45.1 (observed on current main, 2026-11 reconciliation) ===");
   console.log(JSON.stringify({
     quotedSubscriptionRef: SUB,
-    receiptSubscriptionRef: receipt.subscriptionRef,
-    resultingSnapshotId: (receipt.resultingSnapshot as any)?.id,
-    receiptOutcome: receipt.outcome,
-    receiptReconciliation: receipt.reconciliation?.status,
+    commitPhaseReadNamed: "pilot-sub-999",
+    commitRefused: err !== null,
+    blocked: (err as any)?.details?.blocked ?? null,
+    outcome: (err as any)?.details?.outcome ?? null,
+    mutatingDispatches: mock.mutationCount,
   }, null, 2));
   console.log("=== END TEST45 EVIDENCE ===");
 
-  assert.ok(
-    !(receipt.outcome === "COMMITTED_AND_VERIFIED" && receipt.reconciliation.status === "OK"),
-    `identity mismatch silently verified: the post-commit read named subscription "pilot-sub-999" but the receipt for ` +
-      `"${SUB}" reports ${receipt.outcome}/${receipt.reconciliation.status} with resultingSnapshot.id="${(receipt.resultingSnapshot as any)?.id}"`,
-  );
+  assert.ok(err !== null, "the commit must refuse when the validation read names another subscription");
+  assert.equal((err as any)?.details?.blocked, "SUBSCRIPTION_IDENTITY_MISMATCH");
+  assert.equal((err as any)?.details?.outcome, "CONFIRMED_NON_EXECUTION");
+  assert.equal(mock.mutationCount, 0, "no mutating dispatch occurred");
 });
 
-test("Test 45.2 (Issue #22 F3 control): the identical flow with the re-read naming the SAME subscription verifies cleanly", async () => {
+test("Test 45.2 (Issue #22 F3 control): the identical flow with every read naming the SAME subscription passes the identity boundary (and is then refused by the authorization-preservation gate)", async () => {
   const mock = new PilotMockChargebee();
   const client = new ChargebeeClient({ site: "pilot-test", apiKey: "pilot-mock-key" }, mock.transport);
   const adapter = new ChargebeeLiveAdapter(client, new QuoteStore(), { liveCommitEnabled: true });
   const quote = await adapter.createChangeQuote(SUB, PROPOSAL(21));
-  const receipt = await adapter.commitChangeQuote(quote.id);
-  assert.equal(receipt.outcome, "COMMITTED_AND_VERIFIED");
-  assert.equal(receipt.reconciliation.status, "OK");
-  assert.equal((receipt.resultingSnapshot as any)?.id, SUB);
+  const err = await adapter.commitChangeQuote(quote.id).then(
+    () => null,
+    (e: unknown) => e,
+  );
+  // Identity is satisfied, so the flow proceeds to the next gate:
+  // the preservation gate refuses this FULL_REPLACEMENT_ONLY
+  // adapter's commit before dispatch (Finding 1's fix). No
+  // dispatch occurs and no receipt is produced — the adapter has
+  // no clean-commit path for item changes in this build.
+  assert.ok(err !== null, "the commit must be refused by the preservation gate");
+  assert.equal((err as any)?.details?.blocked, "AUTHORIZATION_PRESERVATION_UNENFORCEABLE");
+  assert.equal(mock.mutationCount, 0, "no mutating dispatch occurred");
 });
 
 // ---------------------------------------------------------------------------
@@ -123,7 +148,7 @@ function effect(opts: { currency: string; cadence?: string; source?: string }): 
   };
 }
 
-test("Test 45.3 (Issue #22 F4): quoted USD vs committed EUR at the same numeric value must NOT reconcile OK (expected FAIL)", () => {
+test("Test 45.3 (Issue #22 F4): quoted USD vs committed EUR at the same numeric value must NOT reconcile OK", () => {
   const quoted = effect({ currency: "USD", cadence: "MONTHLY" });
   const committed = effect({ currency: "EUR", cadence: "MONTHLY", source: "provider_actual" });
   const result = reconcileCommittedEffect(quoted, committed, {}, PROPOSAL_OBJ);
@@ -133,7 +158,7 @@ test("Test 45.3 (Issue #22 F4): quoted USD vs committed EUR at the same numeric 
   assert.notEqual(result.status, "OK", "numerically equal amounts in DIFFERENT currencies are not equal; reconciliation must not report OK");
 });
 
-test("Test 45.4 (Issue #22 F4): the pre-mutation envelope gate likewise ignores currency (expected FAIL)", () => {
+test("Test 45.4 (Issue #22 F4): the pre-mutation envelope gate likewise refuses a cross-currency revalidation", () => {
   const quoted = effect({ currency: "USD", cadence: "MONTHLY" });
   const revalidated = effect({ currency: "EUR", cadence: "MONTHLY", source: "revalidated_preview" });
   let violation: string | null = null;
@@ -149,7 +174,7 @@ test("Test 45.4 (Issue #22 F4): the pre-mutation envelope gate likewise ignores 
   assert.ok(threw || violation !== null, "a revalidated effect in a different currency than the quote must not pass the acceptance envelope silently");
 });
 
-test("Test 45.5 (Issue #22 F4): quoted MONTHLY vs committed ANNUAL cadence at the same amount must NOT reconcile OK (expected FAIL)", () => {
+test("Test 45.5 (Issue #22 F4): quoted MONTHLY vs committed ANNUAL cadence at the same amount must NOT reconcile OK", () => {
   const quoted = effect({ currency: "USD", cadence: "MONTHLY" });
   const committed = effect({ currency: "USD", cadence: "ANNUAL", source: "provider_actual" });
   const result = reconcileCommittedEffect(quoted, committed, {}, PROPOSAL_OBJ);

@@ -23,6 +23,21 @@ import { ChargebeeLiveAdapter } from "../src/live/chargebee-scq-adapter.js";
 // (`npm run build` / `npx tsc -p tsconfig.json`), then invoke the
 // research suite explicitly: `node --test dist/tests/*.repro.js`.
 //
+// 2026-11 RECONCILIATION RERUN (Issue #22 closure audit, main
+// 62744ee): Finding 1 was FIXED by the authorization-preservation
+// gate (PR #24; default-suite regression home: test47). An
+// OPERATION-authorized commit whose dispatch mechanism is a
+// full-list replacement on a FULL_REPLACEMENT_ONLY capability is
+// now REFUSED before dispatch
+// (AUTHORIZATION_PRESERVATION_UNENFORCEABLE) — the adapter has no
+// dispatch path for item changes in this build, so the deletion
+// scenario below can no longer occur. Tests 43.1/43.2 were updated
+// to assert that current safe behavior (pre-dispatch refusal, zero
+// mutating dispatches, concurrent item never deleted by SCQ); the
+// scenario fixture and wire capture are unchanged. The original
+// failing-first text is preserved in
+// research/external-review-reconciliation-2026-11.md.
+//
 // Scenario (43.1): the subscription holds plan + pilot-addon-vision
 // qty 1. The authorized proposal is pilot-addon-vision 1 -> 21 ONLY.
 // After the adapter's final pre-commit read + fingerprint validation
@@ -226,10 +241,12 @@ function makeAdapter(mock: ConcurrentAddMockChargebee) {
 }
 
 // ---------------------------------------------------------------------------
-// 43.1 — THE DEFECT (expected to FAIL on unmodified main)
+// 43.1 — THE DEFECT SCENARIO, as it behaves on current main:
+// the commit is refused before dispatch by the authorization-
+// preservation gate; the concurrent item is never deleted.
 // ---------------------------------------------------------------------------
 
-test("Test 43.1 (Issue #22 F1): a concurrent unauthorized addition deleted by the full-list replacement must NOT be reported COMMITTED_AND_VERIFIED / OK", async () => {
+test("Test 43.1 (Issue #22 F1): a concurrent unauthorized addition can no longer be deleted by the full-list replacement — the commit refuses before dispatch", async () => {
   const mock = new ConcurrentAddMockChargebee();
   const { adapter } = makeAdapter(mock);
 
@@ -238,71 +255,38 @@ test("Test 43.1 (Issue #22 F1): a concurrent unauthorized addition deleted by th
   assert.equal(quote.commercialEffect.recurring?.resultingAmount, 80900);
   assert.equal(quote.commercialEffect.immediate?.net, 20000);
 
-  // Third-party write lands after the adapter's final pre-commit
-  // read + fingerprint validation, before dispatch.
+  // Third-party write armed to land after the adapter's final
+  // pre-commit read + fingerprint validation, before dispatch —
+  // exactly the window the original defect exploited.
   mock.armConcurrentAddOnNextEstimate();
-  const receipt = await adapter.commitChangeQuote(quote.id);
-
-  // ---- Scenario mechanics (these describe what was dispatched and
-  // ---- what it did; they PASS on main and pin the repro's shape).
-  const dispatch = mock.updateDispatches[0];
-  assert.ok(dispatch, "exactly the update_for_items dispatch is captured");
-  assert.equal(mock.updateDispatches.length, 1, "one mutating dispatch");
-  assert.equal(dispatch.params["replace_items_list"], "true", "the dispatch is a full-list replacement");
-  const sentIds = Object.keys(dispatch.params)
-    .filter((k) => k.startsWith("subscription_items[item_price_id]"))
-    .sort()
-    .map((k) => dispatch.params[k]);
-  assert.deepEqual(sentIds, [PLAN, ADDON], "the dispatched list is exactly the quote-time authorized set — the concurrent item is not in it");
-  assert.ok(mock.concurrentAddAt, "the concurrent add landed");
-  const subGetSeqs = mock.calls.filter((c) => c.method === "GET" && c.path.startsWith("/subscriptions/")).map((c) => c.seq);
-  assert.ok(subGetSeqs.length >= 2, "wire log shows the quote-time read and the commit-phase read");
-  assert.ok(
-    mock.concurrentAddAt!.afterCallSeq > subGetSeqs[1],
-    "the add landed AFTER the commit-phase (final pre-commit) subscription read — inside the validate->dispatch window",
+  const err = await adapter.commitChangeQuote(quote.id).then(
+    () => null,
+    (e: unknown) => e,
   );
-  assert.deepEqual(mock.concurrentAddAt!.stateAfterAdd, [`${PLAN} x1`, `${ADDON} x1`, `${CONCURRENT} x1`], "before dispatch, the subscription held the concurrent item");
-  assert.deepEqual(mock.itemIds(), [PLAN, ADDON], "after the commit, the concurrently added item is GONE from the subscription");
 
-  // ---- Verbatim evidence (printed before the failing assertion so
-  // ---- the failing run preserves it; also in research/issue-22/FINDINGS.md).
-  console.log("=== TEST43.1 EVIDENCE (observed on unmodified main) ===");
+  console.log("=== TEST43.1 EVIDENCE (observed on current main, 2026-11 reconciliation) ===");
   console.log(JSON.stringify({
     authorizedChange: "CHANGE_QUANTITY pilot-addon-vision 1 -> 21 (only)",
-    concurrentMutation: "third party adds pilot-addon-concurrent x1 (an ordinary unrelated addon) after the adapter's final pre-commit read/validation, before dispatch",
-    dispatchedRequest: {
-      operation: "POST /subscriptions/{subscriptionId}/update_for_items",
-      replace_items_list: dispatch.params["replace_items_list"],
-      items: sentIds.map((id, i) => ({ item_price_id: id, quantity: dispatch.params[`subscription_items[quantity][${i}]`] })),
-      prorate: dispatch.params["prorate"],
-      invoice_immediately: dispatch.params["invoice_immediately"],
-      change_option: dispatch.params["change_option"],
-      rawBody: dispatch.rawBody,
-    },
-    subscriptionStateAfterCommit: mock.itemIds(),
-    unauthorizedItemDeleted: !mock.itemIds().includes(CONCURRENT),
-    receipt: {
-      status: receipt.status,
-      outcome: receipt.outcome,
-      reconciliation: receipt.reconciliation,
-      committedImmediateNet: receipt.committedEffect.immediate?.net,
-      committedRecurring: receipt.committedEffect.recurring?.resultingAmount,
-      resultingSnapshotItems: receipt.resultingSnapshot?.items?.map((i: any) => i.id),
-    },
+    commitError: err instanceof SCQError ? { code: err.code, blocked: (err.details as any)?.blocked, outcome: (err.details as any)?.outcome } : String(err),
+    concurrentAddLanded: mock.concurrentAddAt !== undefined,
+    stateAfterAdd: mock.concurrentAddAt?.stateAfterAdd ?? null,
+    mutatingDispatches: mock.updateDispatches.length,
+    subscriptionStateAfterCommitAttempt: mock.itemIds(),
+    unauthorizedItemDeletedByScq: false,
   }, null, 2));
   console.log("=== END TEST43.1 EVIDENCE ===");
 
-  // ---- THE SAFE BEHAVIOR (fails on unmodified main = the defect).
-  // An execution whose full-list replacement deleted an item that
-  // was never part of the authorized change must not be classified
-  // as a verified, in-envelope success: the receipt must surface
-  // the loss (MISMATCH / UNVERIFIED / VIOLATED) or the commit must
-  // have refused. Target-state equality with the STALE intended
-  // set is not authorization preservation.
+  // THE SAFE BEHAVIOR on current main: the preservation gate
+  // refuses the commit before any mutating dispatch, because a
+  // full-list replacement cannot atomically preserve unrelated
+  // state that changes after validation.
+  assert.ok(err instanceof SCQError, `commit must refuse, got ${String(err)}`);
+  assert.equal((err.details as any)?.blocked, "AUTHORIZATION_PRESERVATION_UNENFORCEABLE");
+  assert.equal((err.details as any)?.outcome, "CONFIRMED_NON_EXECUTION");
+  assert.equal(mock.updateDispatches.length, 0, "no mutating dispatch occurred — nothing was replaced");
   assert.ok(
-    !(receipt.outcome === "COMMITTED_AND_VERIFIED" && receipt.reconciliation.status === "OK"),
-    `authorization-preservation violation reported as success: outcome=${receipt.outcome}, reconciliation=${receipt.reconciliation.status} ` +
-      `although the dispatch deleted ${CONCURRENT}, which was never part of the authorized change`,
+    mock.concurrentAddAt === undefined || mock.itemIds().includes(CONCURRENT),
+    "the concurrent item was never deleted by an SCQ dispatch",
   );
 });
 
@@ -310,15 +294,18 @@ test("Test 43.1 (Issue #22 F1): a concurrent unauthorized addition deleted by th
 // 43.2 — CONTROL: no concurrent write (passes on main)
 // ---------------------------------------------------------------------------
 
-test("Test 43.2 (Issue #22 F1 control): the same quote+commit with NO concurrent write verifies cleanly", async () => {
+test("Test 43.2 (Issue #22 F1 control): the same quote+commit with NO concurrent write is likewise refused before dispatch — the gate is capability-based, not race-dependent", async () => {
   const mock = new ConcurrentAddMockChargebee();
   const { adapter } = makeAdapter(mock);
   const quote = await adapter.createChangeQuote(SUB, PROPOSAL(21));
-  const receipt = await adapter.commitChangeQuote(quote.id);
-  assert.equal(receipt.outcome, "COMMITTED_AND_VERIFIED");
-  assert.equal(receipt.reconciliation.status, "OK");
-  assert.deepEqual(mock.itemIds(), [PLAN, ADDON]);
-  assert.equal(receipt.committedEffect.recurring?.resultingAmount, 80900);
+  const err = await adapter.commitChangeQuote(quote.id).then(
+    () => null,
+    (e: unknown) => e,
+  );
+  assert.ok(err instanceof SCQError, `commit must refuse, got ${String(err)}`);
+  assert.equal((err.details as any)?.blocked, "AUTHORIZATION_PRESERVATION_UNENFORCEABLE");
+  assert.equal(mock.updateDispatches.length, 0, "no mutating dispatch occurred");
+  assert.deepEqual(mock.itemIds(), [PLAN, ADDON], "subscription state is untouched");
 });
 
 // ---------------------------------------------------------------------------
