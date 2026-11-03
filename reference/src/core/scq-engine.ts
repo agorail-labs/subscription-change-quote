@@ -185,7 +185,38 @@ export function validateCommit(
 const CHANGE_ACTION_VALUES: ReadonlySet<string> = new Set(["CHANGE_QUANTITY", "CHANGE_PLAN", "CHANGE_CADENCE", "CANCEL"]);
 const EFFECTIVE_INTENT_TYPE_VALUES: ReadonlySet<string> = new Set(["IMMEDIATE", "TERM_END", "DATE"]);
 const CADENCE_VALUES: ReadonlySet<string> = new Set(["MONTHLY", "ANNUAL"]);
-const ENVELOPE_FIELD_NAMES = ["maxImmediateNetIncrease", "maxImmediateCreditDecrease", "maxRecurringIncrease"] as const;
+const ENVELOPE_FIELD_NAMES = ["maxImmediateNetIncrease", "maxImmediateNetDecrease", "maxImmediateCreditDecrease", "maxRecurringIncrease"] as const;
+
+/**
+ * Issue #64 (v0.7): the negative-delta immediate bound has TWO
+ * supported spellings — the canonical `maxImmediateNetDecrease`
+ * (v0.7) and its legacy alias `maxImmediateCreditDecrease` (v0.6.2,
+ * whose "credit magnitude" wording described the signed-quantity
+ * arithmetic incorrectly). Both name the SAME bound over the signed
+ * immediate.net quantity. An envelope carrying both spellings with
+ * values is ambiguous and refused (envelopeShapeProblem): there is
+ * no precedence rule and no silent choice, because either reading
+ * could widen a financial tolerance the caller did not clearly
+ * state. See spec/scq-v0.7-envelope-naming-proposal.md.
+ */
+const ENVELOPE_NET_DECREASE_FIELDS = ["maxImmediateNetDecrease", "maxImmediateCreditDecrease"] as const;
+
+/**
+ * Resolves the immediate net-decrease bound from a record whose
+ * shape has already been validated (or projected): the canonical
+ * spelling first, the legacy alias second. Post-validation at most
+ * one spelling can carry a value, so the order never chooses
+ * between two stated bounds — it only finds the one that was
+ * stated. Returns the value and the spelling that supplied it (the
+ * violation message names the supplying spelling).
+ */
+function decreaseBoundOf(record: Record<string, unknown>): { value: number; field: string } | undefined {
+  for (const field of ENVELOPE_NET_DECREASE_FIELDS) {
+    const value = ownEnvelopeBound(record, field);
+    if (value !== undefined) return { value: value as number, field };
+  }
+  return undefined;
+}
 
 /** Renders an arbitrary runtime value for an error message, safely (never throws). */
 function runtimeValueForMessage(raw: unknown): string {
@@ -222,6 +253,17 @@ export function envelopeShapeProblem(envelope: unknown): string | null {
     if (!(ENVELOPE_FIELD_NAMES as readonly string[]).includes(key)) {
       return `the acceptance envelope carries unsupported field "${key}" (supported fields: ${ENVELOPE_FIELD_NAMES.join(", ")}) — an unknown field is never silently ignored, because it may be a misspelled bound whose tolerance would otherwise be dropped`;
     }
+  }
+  // Issue #64 (v0.7): both spellings of the net-decrease bound with
+  // values is an ambiguity, refused rather than resolved — either
+  // silent choice could widen the caller's tolerance. A spelling
+  // present with value undefined is omission (the standing
+  // doctrine), not coexistence.
+  if (
+    ownEnvelopeBound(record, "maxImmediateNetDecrease") !== undefined &&
+    ownEnvelopeBound(record, "maxImmediateCreditDecrease") !== undefined
+  ) {
+    return `the acceptance envelope carries both maxImmediateNetDecrease and maxImmediateCreditDecrease — the two spellings name the same bound (maxImmediateCreditDecrease is the legacy alias of maxImmediateNetDecrease), and supplying both is ambiguous: state the bound once, under either spelling`;
   }
   for (const field of ENVELOPE_FIELD_NAMES) {
     const value = ownEnvelopeBound(record, field);
@@ -741,14 +783,19 @@ function compareDeterminedDimensions(
         return `immediate.net increased by ${netIncrease} (quoted ${quotedNet} -> revalidated ${revalidatedNet}), exceeding maxImmediateNetIncrease=${allowed}`;
       }
     } else if (netIncrease < 0) {
-      // Net moved in the caller's favor (smaller charge / bigger credit) —
-      // treat as a credit-side change, bounded separately since a caller may
-      // reasonably want a tighter or looser tolerance on "I got charged less
-      // than expected" than on being charged more.
-      const creditDecrease = -netIncrease;
-      const allowed = (ownEnvelopeBound(boundsRecord, "maxImmediateCreditDecrease") as number | undefined) ?? 0;
-      if (creditDecrease > allowed) {
-        return `immediate.net moved in the caller's favor by ${creditDecrease} (quoted ${quotedNet} -> revalidated ${revalidatedNet}), exceeding maxImmediateCreditDecrease=${allowed}`;
+      // immediate.net DECREASED: the signed quantity fell — a smaller
+      // charge, a bigger credit, or a move across zero are the same
+      // arithmetic. Bounded separately from increases since a caller
+      // may reasonably want a tighter or looser tolerance on "the net
+      // fell" than on "the net rose". The bound may be stated under
+      // the canonical spelling or its legacy alias (Issue #64);
+      // shape validation has already refused an envelope carrying
+      // both, so resolution here never chooses between stated bounds.
+      const netDecrease = -netIncrease;
+      const bound = decreaseBoundOf(boundsRecord);
+      const allowed = bound?.value ?? 0;
+      if (netDecrease > allowed) {
+        return `immediate.net decreased by ${netDecrease} (quoted ${quotedNet} -> revalidated ${revalidatedNet}), exceeding ${bound?.field ?? "maxImmediateNetDecrease"}=${allowed}`;
       }
     }
   }
@@ -937,20 +984,33 @@ function fireableEnvelopeProjection(envelope: unknown): AcceptanceEnvelope {
   if (typeof envelope !== "object" || envelope === null || Array.isArray(envelope)) {
     const none = Object.create(null) as AcceptanceEnvelope;
     none.maxImmediateNetIncrease = NEVER;
+    none.maxImmediateNetDecrease = NEVER;
     none.maxImmediateCreditDecrease = NEVER;
     none.maxRecurringIncrease = NEVER;
     return none;
   }
   const record = envelope as Record<string, unknown>;
   const out = Object.create(null) as AcceptanceEnvelope;
+  // Issue #64 (v0.7): a RECORDED envelope carrying both spellings of
+  // the net-decrease bound is ambiguous recorded input — intake
+  // validation refuses it pre-dispatch, but a record discovered
+  // post-commit must classify, never throw and never silently pick
+  // a spelling. The ambiguous bound projects as NEVER (it cannot
+  // fire), exactly like a malformed bound; the consuming
+  // classification is never OK on its account.
+  const ambiguousDecrease =
+    ownEnvelopeBound(record, "maxImmediateNetDecrease") !== undefined &&
+    ownEnvelopeBound(record, "maxImmediateCreditDecrease") !== undefined;
   for (const field of ENVELOPE_FIELD_NAMES) {
     // Own properties only (P15-2): an inherited bound is not part
     // of the recorded envelope, so it neither fires nor is
     // projected — it is absent, exactly as in validation.
+    if (ambiguousDecrease && (field === "maxImmediateNetDecrease" || field === "maxImmediateCreditDecrease")) continue;
     const value = ownEnvelopeBound(record, field);
     if (value === undefined) continue;
     out[field] = typeof value === "number" && Number.isFinite(value) && value >= 0 ? value : NEVER;
   }
+  if (ambiguousDecrease) out.maxImmediateNetDecrease = NEVER;
   return out;
 }
 
