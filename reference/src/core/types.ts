@@ -238,7 +238,23 @@ export type SubscriptionSnapshot = {
 export type AcceptanceEnvelope = {
   /** Max increase in immediate.net the caller will accept without reconfirming, minor units. */
   maxImmediateNetIncrease?: number;
-  /** Max decrease in an immediate credit magnitude the caller will accept, minor units. */
+  /**
+   * Max decrease in immediate.net the caller will accept without
+   * reconfirming, minor units. immediate.net is SIGNED (positive =
+   * net charge, negative = net credit), so this bounds any negative
+   * delta of immediate.net — a smaller charge, a larger credit, or a
+   * move across zero alike. (v0.7 canonical spelling; see
+   * spec/scq-v0.7-envelope-naming-proposal.md.)
+   */
+  maxImmediateNetDecrease?: number;
+  /**
+   * @deprecated Legacy alias of `maxImmediateNetDecrease` (the
+   * v0.6.2 spelling, whose "credit magnitude" wording described the
+   * bound incorrectly). Identical bound, identical semantics;
+   * v0.6.2 payloads keep their established meaning. Supplying BOTH
+   * spellings with values in one envelope is a validation error —
+   * the ambiguity is refused, never silently resolved.
+   */
   maxImmediateCreditDecrease?: number;
   /** Max increase in recurring.resultingAmount the caller will accept, minor units. */
   maxRecurringIncrease?: number;
