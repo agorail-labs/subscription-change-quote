@@ -66,7 +66,12 @@ function argValue(args: string[], flag: string): string | undefined {
   return i >= 0 ? args[i + 1] : undefined;
 }
 
-export async function main(argv: string[] = process.argv.slice(2)): Promise<number> {
+/** OFFLINE-only fault injection; absent in normal CLI invocation. */
+export type MockFixtureTestHooks = {
+  onFixtureCreatedForTest?: (directory: string) => void;
+  failAfterFixtureOpenForTest?: boolean;
+};
+export async function main(argv: string[] = process.argv.slice(2), testHooks: MockFixtureTestHooks = {}): Promise<number> {
   const live = argv.includes("--live");
   const dbPath = argValue(argv, "--db");
   const quoteIdArg = argValue(argv, "--quote");
@@ -123,6 +128,8 @@ export async function main(argv: string[] = process.argv.slice(2)): Promise<numb
       const path = join(dir, "scq.db");
       store = new DurableQuoteStore(path, { recoveryGraceMs: 0 });
       ownedMockFixture.store = store;
+      testHooks.onFixtureCreatedForTest?.(dir);
+      if (testHooks.failAfterFixtureOpenForTest) throw Error("simulated mock fixture interruption for cleanup test");
       const client = new ChargebeeClient({ site, apiKey }, transport);
       const adapter = new ChargebeeLiveAdapter(client, store, {
         liveCommitEnabled: false, // quote creation only; the preflight never enables commit
