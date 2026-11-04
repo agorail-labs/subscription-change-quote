@@ -43,7 +43,7 @@
  * environment refuses the run outright.
  */
 
-import { mkdtempSync, writeFileSync } from "node:fs";
+import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -90,6 +90,10 @@ export async function main(argv: string[] = process.argv.slice(2)): Promise<numb
   const manifestFor = (db: string): QuoteOriginManifest =>
     QuoteOriginManifest.load(argValue(argv, "--origin-manifest") ?? `${db}.origins.jsonl`);
 
+  // Only the automatic MOCK fixture is owned by this CLI invocation.
+  // Existing --db paths (mock or --live) are NEVER cleaned by this code.
+  let ownedMockFixture: { dir: string; store?: DurableQuoteStore } | undefined;
+  try {
   if (live) {
     site = process.env.CHARGEBEE_SITE ?? "";
     apiKey = process.env.CHARGEBEE_API_KEY;
@@ -115,8 +119,10 @@ export async function main(argv: string[] = process.argv.slice(2)): Promise<numb
       quoteId = quoteIdArg;
     } else {
       const dir = mkdtempSync(join(tmpdir(), "scq-pr11-cli-"));
+      ownedMockFixture = { dir };
       const path = join(dir, "scq.db");
       store = new DurableQuoteStore(path, { recoveryGraceMs: 0 });
+      ownedMockFixture.store = store;
       const client = new ChargebeeClient({ site, apiKey }, transport);
       const adapter = new ChargebeeLiveAdapter(client, store, {
         liveCommitEnabled: false, // quote creation only; the preflight never enables commit
@@ -172,6 +178,17 @@ export async function main(argv: string[] = process.argv.slice(2)): Promise<numb
   console.log(md);
   console.log(`\noverall: ${report.overall} · blockers: ${report.blockers.length} · observed calls: ${report.transport.totalCalls} (mutating ${report.transport.mutatingCalls})`);
   return 0;
+  } finally {
+    if (ownedMockFixture) {
+      // Complete report construction/output before disposing the fixture.
+      // DurableQuoteStore.close() tolerates already closed handles.
+      try {
+        ownedMockFixture.store?.close();
+      } finally {
+        rmSync(ownedMockFixture.dir, { recursive: true, force: true });
+      }
+    }
+  }
 }
 
 if (process.argv[1] === fileURLToPath(import.meta.url)) {
