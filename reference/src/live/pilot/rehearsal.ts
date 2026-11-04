@@ -40,7 +40,8 @@
  * and in the simulator and store suites.
  */
 
-import { mkdtempSync } from "node:fs";
+import { mkdtempSync, rmSync } from "node:fs";
+import { AsyncLocalStorage } from "node:async_hooks";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { createRequire } from "node:module";
@@ -116,8 +117,19 @@ export type RehearsalResult = {
   limits: string[];
 };
 
+type RehearsalOwnership = { directory: string; stores: Set<DurableQuoteStore> };
+
+/** Each concurrent run has its own workspace and tracks only its own
+ * SQLite handles. This deliberately does not sweep system temp prefixes.
+ * The stores in rh04/rh05 stay open until AFTER recovery evidence is read:
+ * those scenarios model an abandoned writer, not a graceful shutdown.
+ */
+const rehearsalOwnership = new AsyncLocalStorage<RehearsalOwnership>();
+
 function tmpDb(): string {
-  return join(mkdtempSync(join(tmpdir(), "scq-pr11-rh-")), "scq.db");
+  const owner = rehearsalOwnership.getStore();
+  if (!owner) throw Error("Rehearsal DB allocation outside a run-owned workspace");
+  return join(mkdtempSync(join(owner.directory, "case-")), "scq.db");
 }
 
 type Counted = { transport: HttpTransport; dispatches: () => number };
@@ -141,7 +153,9 @@ function adapterFor(store: DurableQuoteStore, transport: HttpTransport): Chargeb
 }
 
 function openStore(path: string): DurableQuoteStore {
-  return new DurableQuoteStore(path, { recoveryGraceMs: 0 });
+  const store = new DurableQuoteStore(path, { recoveryGraceMs: 0 });
+  rehearsalOwnership.getStore()?.stores.add(store);
+  return store;
 }
 
 async function quoteAndCommit(faults: PilotMockFaults = {}, wrap?: (inner: HttpTransport) => HttpTransport) {
@@ -421,27 +435,55 @@ async function rh14(): Promise<RehearsalScenarioResult> {
     `the rejecting transport was armed to answer any update dispatch with HTTP 400 param_wrong_value, but no dispatch occurred (provider mutation count ${mock.mutationCount}, zero ledger attempts): the PR-14 preservation gate (${GATE_CODE}) refused the commit first, recording CONFIRMED_NON_EXECUTION on the quote. PR-14 migration: the allowlisted pre-effect rejection classification remains implemented in the adapter's dispatch path — only that narrow, code-allowlisted shape earns CONFIRMED_NON_EXECUTION from a provider response — but through this adapter the gate now fires before it, so this scenario rehearses the gate's precedence (id retained for evidence continuity).`);
 }
 
-export async function runRehearsal(): Promise<RehearsalResult> {
-  const scenarios: RehearsalScenarioResult[] = [];
-  for (const fn of [rh01, rh02, rh03, rh04, rh05, rh06, rh07, rh08, rh09, rh10, rh11, rh12, rh13, rh14]) {
+/** Optional OFFLINE-only test hooks. No pilot/production caller supplies them. */
+export type RehearsalTestOptions = {
+  onWorkspaceCreatedForTest?: (path: string) => void;
+  abortBeforeScenarioForTest?: number;
+};
+
+export async function runRehearsal(testOptions: RehearsalTestOptions = {}): Promise<RehearsalResult> {
+  const directory = mkdtempSync(join(tmpdir(), "scq-pr11-rh-"));
+  const owned: RehearsalOwnership = { directory, stores: new Set() };
+  return rehearsalOwnership.run(owned, async () => {
     try {
-      scenarios.push(await fn());
-    } catch (e) {
-      scenarios.push(result(fn.name, fn.name, "scenario completion", "error", false, `scenario threw: ${e instanceof Error ? e.message : String(e)}`));
+      testOptions.onWorkspaceCreatedForTest?.(directory);
+      const scenarios: RehearsalScenarioResult[] = [];
+      const scenarioFns = [rh01, rh02, rh03, rh04, rh05, rh06, rh07, rh08, rh09, rh10, rh11, rh12, rh13, rh14];
+      for (const [index, fn] of scenarioFns.entries()) {
+        // Failure injection throws OUTSIDE the per-scenario catch so the
+        // outer finally's owned-resource cleanup can be tested.
+        if (index === testOptions.abortBeforeScenarioForTest) {
+          throw Error("simulated rehearsal interruption for test cleanup");
+        }
+        try {
+          scenarios.push(await fn());
+        } catch (e) {
+          scenarios.push(result(fn.name, fn.name, "scenario completion", "error", false, `scenario threw: ${e instanceof Error ? e.message : String(e)}`));
+        }
+      }
+      const scenariosPassed = scenarios.filter((scenario) => scenario.pass).length;
+      return {
+        generatedAt: new Date().toISOString(),
+        evidenceClass: scenariosPassed === scenarios.length ? "SIMULATED_PASS" : "SIMULATED_FAIL",
+        scenarios,
+        scenariosPassed,
+        scenariosTotal: scenarios.length,
+        allPassed: scenariosPassed === scenarios.length,
+        limits: [
+          "All transports are mocked and all databases are temporary: this is SIMULATED evidence, never live evidence.",
+          "The rehearsal proves the recovery machinery's behavior, not durable exactly-once provider execution; no such guarantee is claimed.",
+          "A completed rehearsal is procedural readiness only. It does not name or bind a reconciliation operator (condition 4) and grants no commit authorization (condition 5).",
+        ],
+      };
+    } finally {
+      // Close after ALL scenario observations, including the deliberately
+      // abandoned writers from rh04/rh05; never close during their recovery.
+      // DurableQuoteStore.close() is idempotent for already closed handles.
+      try {
+        for (const store of owned.stores) store.close();
+      } finally {
+        rmSync(directory, { recursive: true, force: true });
+      }
     }
-  }
-  const scenariosPassed = scenarios.filter((s) => s.pass).length;
-  return {
-    generatedAt: new Date().toISOString(),
-    evidenceClass: scenariosPassed === scenarios.length ? "SIMULATED_PASS" : "SIMULATED_FAIL",
-    scenarios,
-    scenariosPassed,
-    scenariosTotal: scenarios.length,
-    allPassed: scenariosPassed === scenarios.length,
-    limits: [
-      "All transports are mocked and all databases are temporary: this is SIMULATED evidence, never live evidence.",
-      "The rehearsal proves the recovery machinery's behavior, not durable exactly-once provider execution; no such guarantee is claimed.",
-      "A completed rehearsal is procedural readiness only. It does not name or bind a reconciliation operator (condition 4) and grants no commit authorization (condition 5).",
-    ],
-  };
+  });
 }
