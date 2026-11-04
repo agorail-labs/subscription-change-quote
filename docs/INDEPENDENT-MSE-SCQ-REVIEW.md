@@ -54,7 +54,7 @@ For independent single-package reproduction, see the respective
 ## Review route B — source-only combined-bridge counterexamples
 
 ```sh
-cd subscription-change-quote/reference
+cd ../subscription-change-quote/reference
 npm ci
 npm test
 # targeted after compilation:
@@ -70,12 +70,19 @@ those failure modes. Record the checked-out SCQ `git rev-parse HEAD`,
 test results, platform, and any divergences.
 
 To reproduce the **actual pinned MSE source** + SCQ bridge integration,
-follow `.github/workflows/agorail-integration.yml` as executable
-instructions. That workflow checks out MSE at commit
-`06568ed36c1471b6825ec38e67b75ac9d6ac3956`, installs/builds both
-projects, and invokes these fixtures with MSE's own `tsx`:
+use the exact MSE commit specified by
+`.github/workflows/agorail-integration.yml`. Starting from the SCQ
+`reference/` directory used above:
 
 ```sh
+cd ..
+git clone https://github.com/agorail-labs/mutation-safety-envelope.git mse-dependency
+git -C mse-dependency checkout 06568ed36c1471b6825ec38e67b75ac9d6ac3956
+cd mse-dependency
+npm ci && npm test && npm run build && npm run validate-schema
+cd ../reference
+npm ci && npm run build
+cd ..
 ./mse-dependency/node_modules/.bin/tsx reference/integration/mse-scq-cross-repo.ts
 ./mse-dependency/node_modules/.bin/tsx reference/integration/mse-multi-unit-negative.ts
 ```
