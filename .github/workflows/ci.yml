@@ -29,8 +29,17 @@ jobs:
       - name: Install
         run: npm ci
 
-      - name: Build + run full test suite (66 tests)
+      - name: Snapshot pilot-owned temp directories before suites
+        run: node scripts/pilot-residue-check.mjs snapshot
+
+      - name: Build + run full test suite
         run: npm test
+
+      - name: Second full suite run (Issue #48 repeatability)
+        run: npm test
+
+      - name: Verify zero new pilot-owned directories after both suites
+        run: node scripts/pilot-residue-check.mjs check
 
       - name: Run quote-only simulator demo
         run: npm run demo
