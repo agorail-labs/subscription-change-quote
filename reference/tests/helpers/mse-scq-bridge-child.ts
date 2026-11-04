@@ -62,7 +62,7 @@ function holdUntilKilled(stage: string): never {
 }
 async function main(): Promise<void> {
   const ledger = new BusinessIntentLedger(intentPath);
-  const store = new DurableQuoteStore(scqPath, { recoveryGraceMs: 0 });
+  const store = new DurableQuoteStore(scqPath, { recoveryGraceMs: mode === "race" ? 60_000 : 0 });
   try {
     if (mode === "kill-after-claim") {
       const claim = ledger.claim(business, admission);
