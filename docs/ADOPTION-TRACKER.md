@@ -22,6 +22,8 @@ This tracker records **verified evidence only** for
    `@experimental` or an exact version pin, on a recorded Node version.
 2. Their example run, review, or integration is captured in a form a
    third party can inspect (public issue, PR, post, or repository).
+   The *Independent evaluation* and *Integration feedback* issue
+   templates in either repository produce exactly this record.
 3. Any claimed integration is verified working against the published
    package — a mention, a star, or an expression of interest does not
    qualify.
