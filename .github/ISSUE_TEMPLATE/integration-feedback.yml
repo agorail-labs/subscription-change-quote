@@ -1,0 +1,27 @@
+name: Integration feedback
+description: Report composing SCQ (with MSE or another system) — what worked, what did not.
+title: "[Integration] "
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Integration reports help establish what the published packages actually compose with. Do not include credentials, customer details, or live billing account data.
+  - type: textarea
+    id: composition
+    attributes:
+      label: What you composed
+      description: Which packages and versions, and what your code does with them (admission gate, quote lifecycle, your own executor, a simulator, etc.).
+    validations:
+      required: true
+  - type: textarea
+    id: outcome
+    attributes:
+      label: Outcome
+      description: What worked, what was missing or awkward, and any point where the documented behavior diverged from observed behavior. Link a public repository or transcript if one exists.
+    validations:
+      required: true
+  - type: textarea
+    id: ask
+    attributes:
+      label: What would have helped
+      description: Documentation, examples, API surface, or semantics that would have made the integration easier or safer.

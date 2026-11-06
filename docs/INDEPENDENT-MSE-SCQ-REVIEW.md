@@ -143,3 +143,22 @@ counterexample is more valuable here than a positive assessment without
 reproduction. An unsolicited GitHub mention or an invitation alone is
 not adoption; any independent review will be recorded accurately in
 [the evidence tracker](../docs/ADOPTION-TRACKER.md) only after it occurs.
+
+## From finding to fix — the contributor pathway
+
+1. **Run** the published packages without billing credentials
+   (Route A above; five minutes via
+   [the quickstart](../docs/TRY-AGORAIL-IN-FIVE-MINUTES.md)).
+2. **Reproduce** a negative safety scenario — the falsification
+   questions above are the sharpest known starting points.
+3. **Report** it with a minimal test case: the *Bug report* template
+   for a defect, the *Independent evaluation* template for a run
+   report or counterexample, or the *Integration feedback* template
+   for composition experience (templates exist in both repositories).
+4. **Submit a correction or integration** as a pull request following
+   [CONTRIBUTING.md](../CONTRIBUTING.md): failing-first tests for
+   behavior changes, and no change to frozen protocol surfaces without
+   the governance process described there.
+5. **Point to public evidence** — the issue, PR, or transcript a third
+   party can inspect. That public record, and only that record, is
+   what the adoption tracker cites.
