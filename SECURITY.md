@@ -1,6 +1,15 @@
 # Security policy — SCQ experimental preview
 
-SCQ v0.6.1 is an **experimental specification and simulator-backed reference implementation**, not a production billing, payment authorization, identity, or entitlement system. No published security-support lifecycle or response SLA is offered.
+SCQ is an **experimental specification and simulator-backed reference implementation** (`@agorail-labs/scq-reference@0.6.2-experimental.1`), not a production billing, payment authorization, identity, or entitlement system. No published security-support lifecycle or response SLA is offered for the experimental line.
+
+## Supported versions
+
+| Version | Support |
+|---|---|
+| `0.6.2-experimental.1` (published) | Experimental — reports accepted and triaged; no SLA. Durable-store use is supported on Node 22/24 (see `docs/SUPPORT.md` for the Node 26 dependency caveat) |
+| Repository source (v0.7 development line) | Best-effort |
+
+A stable-line maintenance and vulnerability-fix policy takes effect only with an approved 1.0 release; the program's security audit is `docs/SECURITY-AUDIT.md`.
 
 ## Reporting a vulnerability
 
