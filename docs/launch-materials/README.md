@@ -13,6 +13,7 @@ published without the maintainer's separate approval.**
 | External evaluation invitation | Email / GitHub Discussion | [evaluation-invitation.md](evaluation-invitation.md) |
 | External evaluation kit | Shareable link / attachment | [evaluation-kit.md](evaluation-kit.md) |
 | Candidate-reviewer worksheet | Internal planning — do not share | [reviewer-worksheet.md](reviewer-worksheet.md) |
+| Outreach package | Prepared, not sent | [outreach-package.md](outreach-package.md) |
 
 ## Claims discipline for anything derived from these drafts
 
