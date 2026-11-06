@@ -1,0 +1,12 @@
+version: 2
+updates:
+  - package-ecosystem: npm
+    directory: /reference
+    schedule:
+      interval: weekly
+    # Security updates arrive regardless of this schedule via
+    # Dependabot alerts (repo admin enables them in Settings).
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly

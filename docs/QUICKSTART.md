@@ -10,7 +10,7 @@ This guide exercises the **SCQ v0.6.2 contract** with an in-memory, Stripe-shape
 ## Run the example
 
 ```bash
-git clone https://github.com/arjun2075/subscription-change-quote.git
+git clone https://github.com/agorail-labs/subscription-change-quote.git
 cd subscription-change-quote/reference
 npm ci
 npm run demo

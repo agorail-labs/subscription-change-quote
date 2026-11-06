@@ -1,5 +1,9 @@
 name: Protocol freeze guard
 
+permissions:
+  contents: read
+  pull-requests: read
+
 # SCQ v0.6.1 is a frozen protocol version under external review (see
 # CONTRIBUTING.md). This check fails any PR that touches normative
 # surface — the spec itself, or the core types/engine that implement it —

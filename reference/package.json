@@ -9,7 +9,7 @@
     "typescript": "^5.5.4"
   },
   "engines": {
-    "node": ">=20"
+    "node": ">=22"
   },
   "exports": {
     ".": {
@@ -40,7 +40,7 @@
   "main": "./dist/src/index.js",
   "name": "@agorail-labs/scq-reference",
   "optionalDependencies": {
-    "better-sqlite3": "^11.10.0"
+    "better-sqlite3": "^13.0.3"
   },
   "repository": {
     "directory": "reference",

@@ -1,0 +1,34 @@
+name: Independent evaluation report
+description: Report an independent run of the published packages — pass, fail, or counterexample.
+title: "[Evaluation] "
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Independent evaluations are recorded in the adoption tracker only when they are publicly verifiable. A report here is evidence, not endorsement, and will be characterized exactly as submitted. Do not include credentials, customer details, or live billing account data.
+  - type: input
+    id: versions
+    attributes:
+      label: Package and Node versions
+      description: "For example: @agorail-labs/mse-reference@0.4.0-experimental.1 + @agorail-labs/scq-reference@0.6.2-experimental.1, Node 22.14.0"
+    validations:
+      required: true
+  - type: textarea
+    id: what-ran
+    attributes:
+      label: What you ran
+      description: Exact commands and which route you followed (for example Review Route A — the published-package consumer example — or your own scenario).
+    validations:
+      required: true
+  - type: textarea
+    id: result
+    attributes:
+      label: Result
+      description: Paste the console transcript or link to a public record of it. Note anything unexpected, including behavior that matched the documentation.
+    validations:
+      required: true
+  - type: textarea
+    id: findings
+    attributes:
+      label: Findings or counterexamples
+      description: Any defect, limitation, or divergence you found, with the smallest reproduction you can provide. "It worked as documented" is also a useful report — say so plainly.
