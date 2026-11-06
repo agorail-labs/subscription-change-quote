@@ -17,9 +17,9 @@ jobs:
         node: [22, 24, 26]
     steps:
       - name: Checkout SCQ change
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
       - name: Checkout pinned MSE admission-only candidate
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
         with:
           repository: agorail-labs/mutation-safety-envelope
           ref: 06568ed36c1471b6825ec38e67b75ac9d6ac3956
