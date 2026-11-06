@@ -25,9 +25,25 @@ function run(command, args, cwd, capture = false) {
 }
 
 try {
-  const pack = JSON.parse(run(npm, ["pack", "--json", "--pack-destination", dir], root, true));
-  if (pack.length !== 1) throw new Error("Expected one npm tarball.");
-  const entry = pack[0];
+  // Release-workflow mode: when AGORAIL_SMOKE_TARBALL names an
+  // already-packed artifact, smoke-test THAT exact tarball and
+  // never pack a second one — the bytes tested must be the bytes
+  // that can be published. Standalone local runs keep the
+  // original self-pack behavior.
+  const prepacked = process.env.AGORAIL_SMOKE_TARBALL;
+  let entry;
+  let prepackedPath = null;
+  if (prepacked) {
+    prepackedPath = resolve(prepacked);
+    const listing = run("tar", ["-tzf", prepackedPath], root, true);
+    const files = listing.split("\n").filter(Boolean)
+      .map((p) => p.replace(/^package\//, "")).map((path) => ({ path }));
+    entry = { filename: prepackedPath.split("/").pop(), files };
+  } else {
+    const pack = JSON.parse(run(npm, ["pack", "--json", "--pack-destination", dir], root, true));
+    if (pack.length !== 1) throw new Error("Expected one npm tarball.");
+    entry = pack[0];
+  }
   const packedFiles = new Set(entry.files.map((file) => file.path));
   for (const expected of [
     "dist/src/index.js",
@@ -54,7 +70,7 @@ try {
   }
   mkdirSync(consumerDir);
   writeFileSync(join(consumerDir, "package.json"), JSON.stringify({ name: "scq-external-smoke", private: true, type: "module" }));
-  const tarball = resolve(dir, entry.filename);
+  const tarball = prepackedPath ?? resolve(dir, entry.filename);
   const archive = readFileSync(tarball);
   const sha256 = createHash("sha256").update(archive).digest("hex");
   console.log(`Packed artifact: ${entry.filename} | files=${entry.files.length} | bytes=${archive.length} | sha256=${sha256}`);
