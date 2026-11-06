@@ -15,7 +15,7 @@ of the Agorail Stable Release Engineering Program (November 2026).
 |---|---|---|
 | Specification | SCQ v0.6.2 (`spec/scq-v0.6.2-spec.md`) | Current experimental normative spec; frozen surface under the protocol freeze guard |
 | Published package tracks | `@agorail-labs/scq-reference@experimental` and `@agorail-labs/scq-reference@next` | Historical experimental snapshot and publicly installable 1.0 RC; refer to npm for their exact versions |
-| Repository source | v0.7 development line on `main` | Contains merged changes **not in the published package**: the Issue #64 envelope-naming canonicalization (Issue #64 is closed; the naming shipped in #66/#67) (`maxImmediateNetDecrease`; `maxImmediateCreditDecrease` retained as a deprecated alias), the durable-store verified-recovery work (#51/#45), and the source-only MSE–SCQ bridge (#69) |
+| Repository source | v0.7 development line on `main` | RC packages deliberately package a reviewed stable-core subset; source-only MSE–SCQ bridge (#69) and live-provider commit code are excluded. Consult the API snapshot for what ships. |
 
 **Reconciliation rule for 1.0:** the stable scope must be reconciled
 against the published experimental baseline and exact RC package behavior. Each v0.7 source change
