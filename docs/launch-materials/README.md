@@ -11,6 +11,8 @@ published without the maintainer's separate approval.**
 | Show HN post | Hacker News | [show-hn.md](show-hn.md) |
 | LinkedIn announcement | LinkedIn | [linkedin-announcement.md](linkedin-announcement.md) |
 | External evaluation invitation | Email / GitHub Discussion | [evaluation-invitation.md](evaluation-invitation.md) |
+| External evaluation kit | Shareable link / attachment | [evaluation-kit.md](evaluation-kit.md) |
+| Candidate-reviewer worksheet | Internal planning — do not share | [reviewer-worksheet.md](reviewer-worksheet.md) |
 
 ## Claims discipline for anything derived from these drafts
 
