@@ -108,7 +108,7 @@ jobs:
             echo "::error::This workflow is restricted to the next dist-tag for the release candidate (got $DIST_TAG)"; exit 1
           fi
           echo "Release inputs validated: $EXPECTED_VERSION under tag $DIST_TAG"
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
         with:
           persist-credentials: false
           ref: ${{ github.sha }}
