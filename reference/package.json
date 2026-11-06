@@ -5,7 +5,7 @@
   "description": "Release candidate: simulator-backed subscription change quotes, bounded acceptance, durable receipt replay and outcome reconciliation; not a live billing SDK",
   "devDependencies": {
     "@types/better-sqlite3": "^9.6.0",
-    "@types/node": "^20.14.0",
+    "@types/node": "^26.6.6",
     "typescript": "^5.5.4"
   },
   "engines": {
