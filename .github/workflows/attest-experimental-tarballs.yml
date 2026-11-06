@@ -68,7 +68,7 @@ jobs:
           echo "MSE source: 7703f27b4fd1477d8ee614d11b6507f3c37650ee" >> build-environment.txt
           node -v >> build-environment.txt
           npm -v >> build-environment.txt
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: agorail-experimental-node-${{ matrix.node }}
           path: audited/
