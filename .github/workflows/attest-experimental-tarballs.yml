@@ -31,7 +31,7 @@ jobs:
           ref: 7703f27b4fd1477d8ee614d11b6507f3c37650ee
           path: mse
           persist-credentials: false
-      - uses: actions/setup-node@v4
+      - uses: actions/setup-node@v7
         with:
           node-version: ${{ matrix.node }}
       - run: mkdir -p audited
