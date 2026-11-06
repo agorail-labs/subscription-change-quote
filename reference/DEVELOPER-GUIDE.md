@@ -1,14 +1,14 @@
-# SCQ Developer Guide — @agorail-labs/scq-reference (experimental)
+# SCQ Developer Guide — @agorail-labs/scq-reference (release candidate)
 
-This guide ships with the experimental package. It explains what SCQ
+This guide ships with the experimental, simulator-backed release candidate. It explains what SCQ
 does, how to install the locally built artifact, and how to read what
 it tells you. It is deliberately precise about limits: several things
 SCQ does **not** do are listed in section 13, and they matter.
 
 **Status:** experimental and simulator-only. Not a replacement billing
 API, not a production-certified payment SDK, and not certified provider
-conformance of any kind. Publication is separately authorized; do not
-interpret this guide as an instruction to enable live billing.
+conformance of any kind. This reference package has no live-provider commit implementation;
+do not interpret this guide as permission to enable live billing.
 
 ## 1. What SCQ solves
 
@@ -22,7 +22,7 @@ three disciplines around that mutation:
    quote: the proposed commercial effect, the state it was computed
    from, an expiry, and an explicit record of what is and is not
    guaranteed.
-2. **Bounded authorization.** The quote carries an acceptance
+2. **Bounded approval-drift validation.** A separate approver authorizes the change; the quote carries an acceptance
    envelope: how much drift between the quoted figures and the
    refreshed commit-time figures the *approver* tolerates. Commit
    revalidates against current state and refuses or reclassifies
@@ -51,30 +51,28 @@ or relying on any figure this package produces for accounting.
 
 ## 3. Installation
 
-When the experimental version has been published to npm, install that
-specific prerelease version (not the default dist-tag):
+Install the release-candidate channel explicitly (not npm's default `latest` tag):
 
 ```bash
-npm install @agorail-labs/scq-reference@0.6.2-experimental.1
+npm install @agorail-labs/scq-reference@next
 ```
 
-Before registry publication, or for a reproducible local artifact,
-build a tarball from a repository checkout:
+For local development of this release-candidate source, build a separate tarball (it is not automatically identical to the CI-attested published artifact):
 
 ```bash
 cd reference
 npm ci
 npm pack
-# agorail-labs-scq-reference-0.6.2-experimental.1.tgz
+# agorail-labs-scq-reference-1.0.0-rc.2.tgz
 ```
 
 In your own (separate) project:
 
 ```bash
-npm install /path/to/agorail-labs-scq-reference-0.6.2-experimental.1.tgz
+npm install /path/to/agorail-labs-scq-reference-1.0.0-rc.2.tgz
 ```
 
-Node.js >= 20. The only runtime dependency is the optional
+Node.js >= 22. The only runtime dependency is the optional
 `better-sqlite3`, used solely by the durable store (section 11); npm
 installs it automatically, and the package works without its native
 binding for everything except durable persistence.

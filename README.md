@@ -61,15 +61,14 @@ what was quoted from what actually happened.
 
 ## Get the package
 
-Published experimentally on npm:
+Published release candidates and experimental snapshots on npm:
 [**`@agorail-labs/scq-reference`**](https://www.npmjs.com/package/@agorail-labs/scq-reference)
 
 ```bash
-npm install @agorail-labs/scq-reference@0.6.2-experimental.1
+npm install @agorail-labs/scq-reference@next
 ```
 
-Node 20 or 22, ESM. The package is a simulator-backed reference implementation — not a
-production billing SDK.
+Node.js 22+, ESM. The package remains simulator-backed and is not a production billing SDK.
 
 ## Try Agorail in five minutes
 
@@ -80,12 +79,12 @@ and MSE packages together in a clean project — no billing credentials, no real
 git clone https://github.com/agorail-labs/subscription-change-quote.git
 mkdir agorail-quickstart && cd agorail-quickstart
 npm init -y
-npm install --save-exact @agorail-labs/mse-reference@0.4.0-experimental.1 @agorail-labs/scq-reference@0.6.2-experimental.1
+npm install --save-exact @agorail-labs/mse-reference@next @agorail-labs/scq-reference@next
 cp ../subscription-change-quote/examples/consumer/mse-plus-scq.mjs .
 node mse-plus-scq.mjs
 ```
 
-Expected output (verified against the published packages on Node 20.19.5 and 22.14.0; the
+Expected simulator output (run the current RCs locally to verify; the
 quote ID differs on every run):
 
 ```text
@@ -220,9 +219,7 @@ changes against any provider.
   tests, provider documentation, historical live read/quote observations) remain distinct.
 - **No production certification, no provider endorsement, and no blanket
   implementation-conformance claim** is made by this publication.
-- **The simulator-backed reference package is published experimentally on npm** as
-  `@agorail-labs/scq-reference@0.6.2-experimental.1` (install with `@experimental`).
-  This is not a production billing SDK or a validation of live-provider commit safety.
+- **Published npm channels:** `@agorail-labs/scq-reference@next` selects the newest experimental release candidate; the earlier `0.6.2-experimental.1` snapshot remains on `@experimental`. Neither package is a production billing SDK or evidence of live-provider commit safety.
 
 Full disclosures are in the [v0.6.2 release notes](research/v0.6.2-release-notes.md) and the
 [gap register](research/v0.6.2-release-gaps.md).
@@ -278,15 +275,15 @@ ACP has adopted or will adopt SCQ.
 
 For v0.6.2's scope and known limitations, see the [release notes](research/v0.6.2-release-notes.md). (The v0.6.1-era [preview notes](docs/EXPERIMENTAL-PREVIEW.md) are retained as a superseded historical record.) For responsible vulnerability reporting, see [Security](SECURITY.md).
 
-New to Agorail? Start with [Try Agorail in Five Minutes](docs/TRY-AGORAIL-IN-FIVE-MINUTES.md) — the published MSE and SCQ packages composed in one clean consumer project. For SCQ alone from this repository's sources, see the [simulator-only seat-expansion walkthrough](docs/QUICKSTART.md): quote inspection, separate business spending caps, a default no-mutation path, and an explicitly simulated commit. The reference package is **published experimentally on npm**, but its adapters are not production billing SDK integrations.
+New to Agorail? Start with [Try Agorail in Five Minutes](docs/TRY-AGORAIL-IN-FIVE-MINUTES.md) — the published MSE and SCQ packages composed in one clean consumer project. For SCQ alone from this repository's sources, see the [simulator-only seat-expansion walkthrough](docs/QUICKSTART.md): quote inspection, separate business spending caps, a default no-mutation path, and an explicitly simulated commit. The reference package is available as an **experimental npm release candidate** under `@next`, but its adapters are not production billing SDK integrations.
 
-For the published experimental npm package (`npm install @agorail-labs/scq-reference@experimental`), see the [developer onboarding guide](docs/ONBOARDING.md) — install, runnable consumer examples, outcome semantics, and the guarantees the package does and does not provide.
+For the published npm release candidate (`npm install @agorail-labs/scq-reference@next`), see the [developer onboarding guide](docs/ONBOARDING.md) — install, runnable consumer examples, outcome semantics, and the guarantees the package does and does not provide.
 
 
 ## Experimental reference package
 
-The simulator-backed TypeScript reference package is published on npm as
-`@agorail-labs/scq-reference@0.6.2-experimental.1` with ESM exports, TypeScript
+The simulator-backed TypeScript reference package is available on npm via
+`@agorail-labs/scq-reference@next` with ESM exports, TypeScript
 declarations, and an external-consumer smoke test. It is **not** a production billing integration.
 
 ```bash

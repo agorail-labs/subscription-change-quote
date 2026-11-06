@@ -1,6 +1,6 @@
 name: Release (prepared — CI-attested, trusted publishing)
 
-# PREPARED, NOT YET ACTIVATED. This workflow generalizes the route
+# Controlled RC release: manual dispatch and protected npm-release environment required. This workflow generalizes the route
 # that produced the published experimental artifacts
 # (attest-experimental-tarballs.yml): the released bytes must be
 # built HERE, from an identified commit, and the recorded SHA-256
@@ -27,7 +27,7 @@ name: Release (prepared — CI-attested, trusted publishing)
 #     scripts. They reach steps only through environment
 #     variables and are strictly validated (semver and dist-tag
 #     formats, then an allowlist: this workflow is restricted to
-#     the 1.0.0-rc.1 release candidate under the `next` tag; a
+#     the 1.0.0-rc.2 release candidate under the `next` tag; a
 #     future release amends the allowlist in its release commit).
 #   * npm CLI: trusted publishing requires npm >= 11.5.1. The
 #     Node 22 toolchain's bundled npm is older, so both jobs
@@ -101,8 +101,8 @@ jobs:
           if ! printf '%s' "$DIST_TAG" | grep -Eq '^[A-Za-z][A-Za-z0-9._-]*$'; then
             echo "::error::dist_tag is not a well-formed npm dist-tag: $DIST_TAG"; exit 1
           fi
-          if [ "$EXPECTED_VERSION" != "1.0.0-rc.1" ]; then
-            echo "::error::This workflow is restricted to the 1.0.0-rc.1 release candidate (got $EXPECTED_VERSION)"; exit 1
+          if [ "$EXPECTED_VERSION" != "1.0.0-rc.2" ]; then
+            echo "::error::This workflow is restricted to the 1.0.0-rc.2 release candidate (got $EXPECTED_VERSION)"; exit 1
           fi
           if [ "$DIST_TAG" != "next" ]; then
             echo "::error::This workflow is restricted to the next dist-tag for the release candidate (got $DIST_TAG)"; exit 1
@@ -196,8 +196,8 @@ jobs:
           if ! printf '%s' "$DIST_TAG" | grep -Eq '^[A-Za-z][A-Za-z0-9._-]*$'; then
             echo "::error::dist_tag is not a well-formed npm dist-tag: $DIST_TAG"; exit 1
           fi
-          if [ "$EXPECTED_VERSION" != "1.0.0-rc.1" ]; then
-            echo "::error::This workflow is restricted to the 1.0.0-rc.1 release candidate (got $EXPECTED_VERSION)"; exit 1
+          if [ "$EXPECTED_VERSION" != "1.0.0-rc.2" ]; then
+            echo "::error::This workflow is restricted to the 1.0.0-rc.2 release candidate (got $EXPECTED_VERSION)"; exit 1
           fi
           if [ "$DIST_TAG" != "next" ]; then
             echo "::error::This workflow is restricted to the next dist-tag for the release candidate (got $DIST_TAG)"; exit 1
@@ -241,14 +241,32 @@ jobs:
           EXPECTED_VERSION: ${{ inputs.expected_version }}
           DIST_TAG: ${{ inputs.dist_tag }}
         run: |
-          TAGS=$(npm view @agorail-labs/scq-reference dist-tags --json)
-          echo "$TAGS"
-          node -e "const tags=JSON.parse(process.argv[1]); const v=process.env.EXPECTED_VERSION; const tag=process.env.DIST_TAG; if (tags[tag] !== v) { console.error('dist-tag '+tag+' does not point at '+v); process.exit(1); }" "$TAGS"
-          if [ "$DIST_TAG" != "latest" ]; then
-            LATEST_AFTER=$(npm view @agorail-labs/scq-reference dist-tags.latest)
-            LATEST_BEFORE=$(cat latest-before.txt)
-            if [ "$LATEST_AFTER" != "$LATEST_BEFORE" ]; then
-              echo "::error::latest moved during publication (before: $LATEST_BEFORE, after: $LATEST_AFTER); this workflow must never move latest"; exit 1
-            fi
-            echo "latest unchanged: $LATEST_AFTER"
-          fi
+          LATEST_BEFORE=$(cat latest-before.txt)
+          for attempt in $(seq 1 60); do
+            TAGS=$(npm view @agorail-labs/scq-reference dist-tags --json 2>/dev/null || true)
+            STATUS=$(node -e '
+              const [raw, before, expected, tag] = process.argv.slice(1);
+              let tags;
+              try { tags = JSON.parse(raw); } catch { console.log("RETRY"); process.exit(0); }
+              if (!tags || typeof tags !== "object") { console.log("RETRY"); process.exit(0); }
+              if (typeof tags.latest === "string" && tags.latest !== before) {
+                console.log("LATEST_CHANGED"); process.exit(0);
+              }
+              if (tags.latest === before && tags[tag] === expected) {
+                console.log("VERIFIED"); process.exit(0);
+              }
+              console.log("RETRY");
+            ' "$TAGS" "$LATEST_BEFORE" "$EXPECTED_VERSION" "$DIST_TAG")
+            echo "npm registry attempt $attempt/60: $STATUS"
+            case "$STATUS" in
+              VERIFIED)
+                echo "Registry confirms $DIST_TAG=$EXPECTED_VERSION and latest unchanged at $LATEST_BEFORE"
+                exit 0 ;;
+              LATEST_CHANGED)
+                echo "::error::latest changed during release; manual reconciliation required"
+                exit 1 ;;
+            esac
+            sleep 15
+          done
+          echo "::error::Registry did not confirm next=$EXPECTED_VERSION within 15 minutes. Do NOT rerun publishing; inspect npm version/tag state first."
+          exit 1

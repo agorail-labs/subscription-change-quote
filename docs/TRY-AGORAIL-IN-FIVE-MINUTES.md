@@ -33,7 +33,7 @@ API key, or credentials are needed, and no real provider is called.
 
 ## Prerequisites
 
-- Node.js **20 or 22** and npm.
+- Node.js **22 or later** and npm.
 - About five minutes.
 
 ## Run it
@@ -42,7 +42,7 @@ API key, or credentials are needed, and no real provider is called.
 git clone https://github.com/agorail-labs/subscription-change-quote.git
 mkdir agorail-quickstart && cd agorail-quickstart
 npm init -y
-npm install --save-exact @agorail-labs/mse-reference@0.4.0-experimental.1 @agorail-labs/scq-reference@0.6.2-experimental.1
+npm install --save-exact @agorail-labs/mse-reference@next @agorail-labs/scq-reference@next
 cp ../subscription-change-quote/examples/consumer/mse-plus-scq.mjs .
 node mse-plus-scq.mjs
 ```
@@ -52,8 +52,7 @@ repository-internal modules and no repository-relative imports.
 
 ## Expected output
 
-Verified against the published packages on Node 22.14.0 and
-Node 20.19.5 (identical output; the quote ID differs on every run):
+Expected simulator output (verify against your installed release candidates; the quote ID differs on every run):
 
 ```text
 MSE gate, incomplete change: ADMISSION_REFUSED

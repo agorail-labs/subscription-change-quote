@@ -1,74 +1,59 @@
-# @agorail-labs/scq-reference — experimental reference package
+<p align="center">
+  <a href="https://github.com/agorail-labs"><img src="https://raw.githubusercontent.com/agorail-labs/.github/main/assets/agorail-mark.svg" width="76" alt="Agorail Labs logo"></a>
+</p>
 
-> **Experimental — simulator-only; not for production billing.**
-> This is a reference implementation of the Subscription Change Quote
-> (SCQ) protocol for evaluation from a released npm artifact or a locally
-> built tarball. Nothing in it is certified provider conformance, and it
-> is not a replacement billing API or a production payment SDK.
+# Subscription Change Quote (SCQ)
 
-This package implements the **published SCQ v0.6.2 experimental
-specification** (`spec/scq-v0.6.2-spec.md` in the repository). The
-specification and this package are separate artifacts: the spec's
-publication did not approve this package for release, and this
-package's version (`0.6.2-experimental.1`) tracks the spec version it
-implements plus an experimental build suffix — it is not a stability
-promise.
+**Quote a subscription change. Apply a separate approval policy. Execute through a durable coordinator. Reconcile what actually happened.**
 
-## What it does
+[![Release candidate](https://img.shields.io/badge/release-1.0.0--rc.2-orange)](https://www.npmjs.com/package/@agorail-labs/scq-reference/v/1.0.0-rc.2) [![CI](https://github.com/agorail-labs/subscription-change-quote/actions/workflows/ci.yml/badge.svg)](https://github.com/agorail-labs/subscription-change-quote/actions/workflows/ci.yml) [![Node.js 22+](https://img.shields.io/badge/Node.js-22%2B-43853d)](https://github.com/agorail-labs/subscription-change-quote) [![Apache-2.0](https://img.shields.io/badge/license-Apache--2.0-blue)](https://github.com/agorail-labs/subscription-change-quote/blob/main/LICENSE)
 
-SCQ models a subscription change as a **quote** (a priced, bounded,
-expiring proposal), an explicit **approval** decision by the
-integrator, and a **commit** whose result is a **receipt** that
-reports — from operation-bound evidence — whether the landed change
-matches what was authorized:
+Part of **[Agorail Labs](https://github.com/agorail-labs)** · [MSE companion package](https://www.npmjs.com/package/@agorail-labs/mse-reference) · [Five-minute walkthrough](https://github.com/agorail-labs/subscription-change-quote/blob/main/docs/TRY-AGORAIL-IN-FIVE-MINUTES.md)
 
-- `VERIFIED` / reconciliation `OK` — the committed effect is
-  established and agrees with the quote.
-- `VIOLATED` — the landed effect is established, attributable, and
-  **wrong** (outside the authorized envelope or state).
-- `UNVERIFIED` — the effect cannot be attributed to this operation
-  (for example, a third-party change broke the validation bracket);
-  figures may be retained only as non-establishing candidates.
-- `INDETERMINATE` — the mutation's outcome is unknown (for example,
-  its response was lost). Retrying is refused; reconciliation must be
-  by independent observation.
+> **Experimental, simulator-backed release candidate — not for production billing.** No live-provider commit is included. This is not an authorization system, a payment SDK, provider certification, or an exactly-once provider execution guarantee.
 
-Financial figures carry explicit **determinacy**: `DETERMINED` (an
-established value, possibly a verified zero), `NOT_APPLICABLE`
-(licensed by the spec's applicability table), or `UNKNOWN` (no
-established value — never a synonym for zero).
+## See it in 92 seconds
 
-## Install
+<a href="https://github.com/agorail-labs/.github/blob/main/assets/demo/agorail-demo-90s.mp4"><img src="https://raw.githubusercontent.com/agorail-labs/.github/main/assets/demo/poster.png" width="680" alt="Agorail demo: an AI agent requests a subscription change, MSE checks dependencies, SCQ quotes and reconciles the simulated outcome"></a>
 
-After the experimental package is published to npm under its
-`experimental` dist-tag, install the exact version in your project:
+[Watch the narrated demo](https://github.com/agorail-labs/.github/blob/main/assets/demo/agorail-demo-90s.mp4) · [Captions and transcript](https://github.com/agorail-labs/.github/blob/main/assets/demo/TRANSCRIPT.md)
 
-```bash
-npm install @agorail-labs/scq-reference@0.6.2-experimental.1
+All demonstrated billing-provider behavior is simulated. The approval decision is made by separate caller code, not by SCQ or MSE.
+
+## What problem does SCQ solve?
+
+A request such as **"increase this subscription from 100 to 120 seats"** can create a charge or credit now, change the recurring amount, race with another update, or leave an unknown outcome if a response is lost.
+
+SCQ gives an integrator a structured lifecycle:
+
+```text
+Read subscription → Quote change → Independent business approval
+                                          |
+                                Pre-dispatch envelope check
+                                          |
+                              Durable attempt + one dispatch
+                                          |
+                                Receipt + reconciliation
 ```
 
-Before registry publication, or to reproduce the candidate artifact,
-build and install a local tarball from the repository:
+| Reported outcome | How an integrator should read it |
+| :-- | :-- |
+| `COMMITTED_AND_VERIFIED` + reconciliation `OK` | The **simulated** committed effect has attributable evidence and agrees with the accepted quote |
+| `VIOLATED` | The established, attributable result differs from the authorized envelope |
+| `UNVERIFIED` | Evidence is insufficient or attribution is broken; apparent values do not establish compliance |
+| `INDETERMINATE` | Dispatch may have executed but the result is unknown; **do not blindly retry** |
+
+Money uses integer minor units, explicit currency/cadence when established, and distinct `DETERMINED`, `UNKNOWN`, and `NOT_APPLICABLE` states. **UNKNOWN is never zero.**
+
+## Install and run
+
+**Node.js 22+, ESM.** Install the release candidate from `next`:
 
 ```bash
-git clone https://github.com/agorail-labs/subscription-change-quote
-cd subscription-change-quote/reference
-npm ci
-npm pack            # produces agorail-labs-scq-reference-0.6.2-experimental.1.tgz
-
-cd /path/to/your/project
-npm install /path/to/agorail-labs-scq-reference-0.6.2-experimental.1.tgz
+npm install --save-exact @agorail-labs/scq-reference@next
 ```
 
-Requires Node.js 20 or newer. The optional `better-sqlite3`
-dependency is needed only for the durable (SQLite) store; the
-in-memory simulator paths never load it, and if its native binding is
-unavailable the durable store fails with an explicit message rather
-than degrading silently.
-
-## Quick start
-
-Three runnable scenarios ship in `examples/` (simulator only):
+Run the three simulator scenarios included in the npm package:
 
 ```bash
 node node_modules/@agorail-labs/scq-reference/examples/scenario-a-verified.mjs
@@ -76,101 +61,36 @@ node node_modules/@agorail-labs/scq-reference/examples/scenario-b-divergence.mjs
 node node_modules/@agorail-labs/scq-reference/examples/scenario-c-indeterminate.mjs
 ```
 
-- **A** — an authorized change that commits and verifies.
-- **B** — divergence: a provably wrong landing (`VIOLATED`) versus an
-  unattributable one (`UNVERIFIED`), and why the difference matters.
-- **C** — a lost mutation response (`INDETERMINATE`): no blind retry,
-  reconciliation by observation, and durable receipt replay after a
-  restart.
+| Scenario | What to expect |
+| :-- | :-- |
+| A: verified | A simulated authorized change commits and reconciles as `OK` |
+| B: divergence | A demonstrably wrong result is `VIOLATED`; unattributable data remains `UNVERIFIED` |
+| C: lost response | `INDETERMINATE` is fail-closed; later observation and durable replay do not blindly redispatch |
 
-See `DEVELOPER-GUIDE.md` (included in this package) for concepts,
-JavaScript and TypeScript examples, receipt interpretation, and the
-limits below in full.
+The `better-sqlite3` optional dependency supports the local durable SQLite store. If its native binding is unavailable, durable storage fails explicitly instead of silently becoming in-memory storage.
 
-## Hard limits
+**For annotated integration guidance:** [Developer guide](https://github.com/agorail-labs/subscription-change-quote/blob/main/reference/DEVELOPER-GUIDE.md) · [Five-minute MSE + SCQ example](https://github.com/agorail-labs/subscription-change-quote/blob/main/docs/TRY-AGORAIL-IN-FIVE-MINUTES.md).
 
-- **Simulator only.** The exported adapters run against in-memory
-  Stripe-, Paddle-, Zuora-, and Chargebee-shaped simulators. They do
-  not connect to any real provider. The env-gated live Chargebee
-  pilot code is **excluded from this artifact** and remains
-  repository-only; live commit functionality is disabled by design
-  and no real-provider guarantee of any kind is offered or implied.
-- **Best-effort concurrency.** All simulated adapters report
-  best-effort precondition/commit consistency; no atomic provider
-  compare-and-swap guarantee is implied.
-- **The acceptance envelope is not authorization.** An SCQ
-  `acceptanceEnvelope` permits quote-relative drift; it is not a
-  total spending limit or an authorization grant. Real integrations
-  must independently perform identity, approval, absolute-budget, and
-  contractual/entitlement checks.
-- **Determinacy is only as strong as its provenance.** Established
-  figures rest on adapter-produced evidence; the core trusts the
-  adapter's classification and does not independently authenticate
-  provider events (spec section 6.15, register item G-01). Candidate
-  figures come only from the mutating call's own response (spec
-  section 3.10) and establish nothing by themselves.
-- **Durability has preconditions.** The section 6.10 rule that a
-  repeated commit returns the original receipt without a second
-  mutation presumes durable persistence (use `DurableQuoteStore`)
-  plus reconciliation of provider state after an indeterminate
-  outcome. The in-memory `QuoteStore` cannot establish that guarantee
-  across process crashes; after a restart it can only fail closed.
-  Provider-native idempotency is not indefinite either — Chargebee's
-  documented native idempotency window is 30 minutes (see
-  `spec/ERRATA-v0.6.1.md` ER-4 in the repository).
+## Two complementary contracts
 
-## Conformance status and limitations
+| MSE · pre-dispatch admission | SCQ · subscription lifecycle |
+| :-- | :-- |
+| Is the **whole proposed set** complete, including required dependent units? | What will the change cost, how strong is the quote, and what do later observations establish? |
+| Returns an admission pass or refusal witness | Returns structured quotes, receipts, reconciliation, and durable replay |
+| Neither checks permission nor dispatches a live provider mutation | Does not grant permission or guarantee provider-side exactly-once execution |
 
-This package is a reference implementation of the published SCQ
-v0.6.2 experimental specification. A consolidated conformance audit
-of the merged repository (PR #54, issue #29) assessed the 75 rules
-of spec Appendix B at **72 IMPLEMENTED / 3 PARTIAL / 0 BLOCKED**,
-entirely from simulator-level evidence — no live provider commit has
-ever been executed, and no provider has reviewed or endorsed SCQ.
-This package is **not** fully v0.6.2-conformant, and no certification
-claim is made. The three PARTIAL rules are:
+The combined MSE–SCQ business-intent bridge remains experimental **source-only** and is not exported by either npm package.
 
-- **V62-DET-08** — snapshot determinacy is informative metadata:
-  adapters emit it honestly, but there is no enforcement consumer of
-  the field. Effect determinacy is established independently when
-  the committed effect is constructed.
-- **V62-EVD-01 (G-01)** — evidence provenance is trusted-adapter
-  provenance, not authenticated provider-origin proof: the core
-  trusts adapter-established classification and does not
-  independently authenticate provider events.
-- **V62-SV-02 (G-08)** — shared-hook consumption for post-commit
-  state verification is not universal: three adapter-owned
-  specializations remain (Chargebee-sim CANCEL, Paddle CANCEL, and
-  Zuora). Equivalence rests on per-adapter pinning tests, disclosed
-  in the audit.
+## Safety boundaries
 
-Two further disclosed limitations, both fail-closed and neither
-fixed in this release:
+- **Authorization is external.** An `acceptanceEnvelope` bounds *relative* drift from a quote; it is neither permission to act nor an absolute spending cap. Identity, entitlements, contractual rights, approval and spending limits must be checked separately.
+- **Simulator-backed evidence, not live-provider certification.** Stripe-, Chargebee-, Paddle- and Zuora-shaped adapters/simulators in this package do not execute real provider commits. No Chargebee or other production provider commit was validated by this package.
+- **Durability is narrower than exactly once.** `DurableQuoteStore` / `DurableMutationCoordinator` fence local attempts and replay settled receipts. They do not establish provider-side idempotency, authorization-preserving full-list writes or cross-ledger atomicity.
+- **Evidence provenance matters.** The core trusts adapter classifications; it does not authenticate every provider-origin event. A state that merely looks correct does not prove that the authorized operation happened.
+- **Specification and package are separate.** This package candidate implements the experimental **SCQ v0.6.2** protocol surface with enumerated source hardening. The npm version `1.0.0-rc.2` does not rename the specification or imply complete conformance. Three conformance rules remain partial in the [audit](https://github.com/agorail-labs/subscription-change-quote/blob/main/conformance/v0.6.2-traceability.md).
 
-- **Issue #45** — the durable store's unresolved-attempt exclusion
-  is keyed by subscription identity alone, so it over-blocks: the
-  same subscription ID is refused across provider/site boundaries
-  even where the attempts are unrelated. This is an availability
-  limitation — multi-site use of one subscription ID is not fully
-  supported — and the behavior fails closed (refusal), never open.
-- **Issue #51** — in a store migrated from a pre-v4 schema, an
-  ASSERTED migrated landing reconciliation cannot be superseded by
-  a new VERIFIED barrier, so the affected attempt stays blocked;
-  migrated-store recovery for such attempts is not fully supported.
-  The behavior fails closed. No affected population is known outside
-  this repository's fixtures.
+## Learn more / contribute
 
-Both are **accepted Class B limitations for this simulator-only
-experimental release** under maintainer decisions D-3 and D-4; neither
-issue is closed or fixed. The full conformance decision and conditions
-are recorded in `research/v0.6.2-release-readiness.md` section G and
-Issue #31 in the repository. This is not an approval for live billing,
-production or multi-site deployment.
+[Protocol specification](https://github.com/agorail-labs/subscription-change-quote/blob/main/spec/scq-v0.6.2-spec.md) · [API reference](https://github.com/agorail-labs/subscription-change-quote/blob/main/docs/API-REFERENCE.md) · [Security policy](https://github.com/agorail-labs/subscription-change-quote/blob/main/SECURITY.md) · [Independent evaluation package](https://github.com/agorail-labs/subscription-change-quote/blob/main/docs/STABLE-CANDIDATE-REVIEW.md) · [Report an issue](https://github.com/agorail-labs/subscription-change-quote/issues)
 
-## Support and security
-
-This is an experimental artifact maintained on a best-effort basis.
-Report issues at
-https://github.com/agorail-labs/subscription-change-quote/issues and
-see the repository's `SECURITY.md` and `SUPPORT.md`. Apache-2.0
-licensed.
+Independent, reproducible counterexamples are welcome. Agorail Labs is not affiliated with or endorsed by any billing provider, employer, or standards body.
