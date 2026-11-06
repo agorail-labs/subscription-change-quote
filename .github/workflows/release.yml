@@ -296,7 +296,7 @@ jobs:
           npm --version
       - name: Promote the existing RC.2 and verify all three tags
         env:
-          PACKAGE_NAME: @agorail-labs/scq-reference
+          PACKAGE_NAME: "@agorail-labs/scq-reference"
           TARGET_VERSION: 1.0.0-rc.2
           EXPERIMENTAL_VERSION: 0.6.2-experimental.1
         run: |
