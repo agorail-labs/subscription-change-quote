@@ -2,7 +2,7 @@
   "bugs": {
     "url": "https://github.com/agorail-labs/subscription-change-quote/issues"
   },
-  "description": "Experimental simulator-backed reference implementation of the SCQ v0.6.2 subscription change quote protocol; not a production billing SDK and not certified for live billing use",
+  "description": "Release candidate: simulator-backed subscription change quotes, bounded acceptance, durable receipt replay and outcome reconciliation; not a live billing SDK",
   "devDependencies": {
     "@types/better-sqlite3": "^9.6.0",
     "@types/node": "^20.14.0",
@@ -28,13 +28,14 @@
   ],
   "homepage": "https://github.com/agorail-labs/subscription-change-quote#readme",
   "keywords": [
-    "subscriptions",
-    "billing",
-    "quote",
-    "authorization",
-    "idempotency",
-    "reconciliation",
-    "experimental"
+    "agentic-commerce",
+    "subscription-change",
+    "billing-quotes",
+    "durable-replay",
+    "financial-reconciliation",
+    "ai-agents",
+    "simulator",
+    "reference-implementation"
   ],
   "license": "Apache-2.0",
   "main": "./dist/src/index.js",
@@ -59,7 +60,7 @@
   },
   "type": "module",
   "types": "./dist/src/index.d.ts",
-  "version": "1.0.0-rc.1",
+  "version": "1.0.0-rc.2",
   "publishConfig": {
     "access": "public",
     "tag": "next"
