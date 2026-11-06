@@ -1,0 +1,87 @@
+name: Release (prepared — CI-attested, trusted publishing)
+
+# PREPARED, NOT YET ACTIVATED. This workflow generalizes the route
+# that produced the published experimental artifacts
+# (attest-experimental-tarballs.yml): the released bytes must be
+# built HERE, from an identified commit, and the recorded SHA-256
+# must come from this workflow's output — local `npm pack` output
+# has historically differed from the published pins for reasons not
+# yet explained, so local packs are never release inputs.
+#
+# Publishing requires, in order:
+#   1. A maintainer decision to cut a release from an identified commit.
+#   2. A version bump commit for reference/package.json.
+#   3. npm trusted-publisher configuration for this repository and
+#      workflow on the @agorail-labs/scq-reference package page.
+# workflow_dispatch-only with a typed confirmation; never runs on
+# push, tag, or schedule. No long-lived npm token: the publish job
+# uses npm trusted publishing (OIDC) with provenance.
+on:
+  workflow_dispatch:
+    inputs:
+      confirm:
+        description: "Type PUBLISH to confirm a real registry publish"
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+jobs:
+  verify-and-pack:
+    name: Verify, pack, and record the artifact
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: reference/package-lock.json
+      - name: Full test suite
+        working-directory: reference
+        run: |
+          npm ci
+          npm test
+      - name: Pack the exact artifact and record its SHA-256
+        working-directory: reference
+        run: |
+          npm pack --json --pack-destination ../audited > ../audited/pack.json
+          cd ../audited
+          sha256sum *.tgz | tee release-manifest.txt
+          tar -tzf *.tgz | tee -a release-manifest.txt
+          if tar -tzf *.tgz | grep -E '(^package/dist/src/live/|^package/dist/src/integration/|^package/scripts/|(^|/)\.npmrc$|(^|/)\.env$)'; then
+            echo "::error::Disallowed file in release tarball"; exit 1
+          fi
+      - name: Install the exact tarball in a clean external consumer
+        working-directory: reference
+        run: npm run smoke:pack
+      - uses: actions/upload-artifact@v4
+        with:
+          name: release-artifact
+          path: audited/
+
+  publish:
+    name: Publish via npm trusted publishing (OIDC)
+    needs: verify-and-pack
+    if: inputs.confirm == 'PUBLISH'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write # OIDC for npm trusted publishing + provenance
+    steps:
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          registry-url: https://registry.npmjs.org
+      - uses: actions/download-artifact@v4
+        with:
+          name: release-artifact
+          path: audited
+      - name: Publish the verified tarball (exact bytes from the verify job)
+        working-directory: audited
+        run: npm publish *.tgz --provenance --access public
