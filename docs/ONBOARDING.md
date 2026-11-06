@@ -1,5 +1,10 @@
 # SCQ developer onboarding
 
+> **New to Agorail?** Start with
+> [Try Agorail in Five Minutes](TRY-AGORAIL-IN-FIVE-MINUTES.md) — the
+> published MSE and SCQ packages composed in one clean consumer
+> project. This guide is the SCQ-only deep dive.
+
 Subscription Change Quote (SCQ) is a protocol-neutral contract for changing an
 **existing subscription** — quantity, plan, cadence, or cancellation — safely
 enough for autonomous agents and careful integrators to reason about across

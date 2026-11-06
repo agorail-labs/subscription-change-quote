@@ -5,6 +5,14 @@ Status: Experimental protocol
 Version: SCQ v0.6.2 (experimental specification)
 ```
 
+**Part of [Agorail](https://github.com/agorail-labs) — safety contracts for AI-driven commerce changes.**
+
+An AI agent is asked to increase a SaaS subscription from 100 to 120 seats. Depending on the
+billing provider, that one request can mean a charge or credit now, a different future
+recurring amount, a contractual consequence, a race between preview and mutation, or a
+multi-change request that silently applies only part of what was asked — and if the provider
+call times out after executing, the agent cannot tell whether the change happened at all.
+
 SCQ is a protocol-neutral contract for making changes to an **existing subscription** —
 quantity, plan, cadence, or cancellation — safely enough for autonomous agents to reason about
 and execute across heterogeneous billing systems (Stripe-, Paddle-, Zuora-, and
@@ -23,22 +31,98 @@ price certainty, term consequences, effective timing, batching, and concurrency
 an explicit tolerance envelope, commit it, and receive a receipt that honestly distinguishes
 what was quoted from what actually happened.
 
+## What SCQ does and does not do
+
+**Does**
+
+- Quotes a subscription change before mutation: immediate and recurring financial effects,
+  guarantee strength per dimension, and an explicit `UNKNOWN` where an effect cannot be
+  established — never an invented answer.
+- Checks committed outcomes against the acceptance envelope the caller approved (drift
+  relative to the quote) and reconciles receipts against independently established actuals;
+  the historical receipt is immutable and later evidence is append-only.
+- Provides durable replay: re-executing the same mutation intent returns the recorded receipt
+  instead of dispatching the change again.
+
+**Does not**
+
+- **Grant authorization.** Whether a change may happen is the caller's decision; an approval
+  policy lives outside the protocol (the quickstart below shows one, deliberately separate
+  from SCQ's drift envelope).
+- Provide exactly-once provider execution, atomic cross-provider updates, or
+  production-certified billing safety.
+- Cover subscription creation, payments/refunds, payment authorization, identity, delegation,
+  negotiation, procurement, or usage billing.
+
 > **Disclaimer:** SCQ is an independent research proposal and is not an official specification
 > of Stripe, Paddle, Zuora, Chargebee, ACP, UCP, or any other organization.
 
 ---
 
-## Why this exists
+## Get the package
 
-A request as simple as "increase this workspace from 100 to 120 seats" can have materially
-different consequences depending on the billing provider: a charge or credit now, a different
-future recurring amount, a contractual consequence, a race between preview and mutation, or a
-multi-change request that silently applies only part of what was asked. SCQ gives a caller a
-single, honest vocabulary for asking, before mutation: *what will this do, how strongly is that
-guaranteed, and did the committed outcome actually stay within what I approved?*
+Published experimentally on npm:
+[**`@agorail-labs/scq-reference`**](https://www.npmjs.com/package/@agorail-labs/scq-reference)
 
-SCQ is explicitly **not** a protocol for subscription creation, payments/refunds, payment
-authorization, identity, delegation, negotiation, procurement, or usage billing.
+```bash
+npm install @agorail-labs/scq-reference@0.6.2-experimental.1
+```
+
+Node 20 or 22, ESM. The package is a simulator-backed reference implementation — not a
+production billing SDK.
+
+## Try Agorail in five minutes
+
+[**Try Agorail in Five Minutes**](docs/TRY-AGORAIL-IN-FIVE-MINUTES.md) runs the published SCQ
+and MSE packages together in a clean project — no billing credentials, no real provider:
+
+```bash
+git clone https://github.com/agorail-labs/subscription-change-quote.git
+mkdir agorail-quickstart && cd agorail-quickstart
+npm init -y
+npm install --save-exact @agorail-labs/mse-reference@0.4.0-experimental.1 @agorail-labs/scq-reference@0.6.2-experimental.1
+cp ../subscription-change-quote/examples/consumer/mse-plus-scq.mjs .
+node mse-plus-scq.mjs
+```
+
+Expected output (verified against the published packages on Node 20.19.5 and 22.14.0; the
+quote ID differs on every run):
+
+```text
+MSE gate, incomplete change: ADMISSION_REFUSED
+  witness names the missing unit: addon-analytics
+MSE gate, complete change: ADMISSION_PASSED
+SCQ quote: scq_chargebee_af32a638dc8f757d
+Quoted immediate net (minor units): 20000
+Quoted recurring amount (minor units): 120000
+Accepted under the example approval policy (separate from SCQ's drift envelope).
+Receipt status: COMMITTED | reconciliation: OK
+Provider dispatches after commit: 1
+Second dispatch of the same intent: replay
+Dispatch callback invocations: 0
+Done: MSE admitted the complete change; SCQ committed it once; the duplicate intent replayed, not re-executed.
+```
+
+## How SCQ and MSE complement each other
+
+[**MSE (Mutation Safety Envelope)**](https://github.com/agorail-labs/mutation-safety-envelope)
+answers the question *before* SCQ: is this set of changes admissible as a whole — are all
+required dependent units present? SCQ then answers the financial question: what will this
+subscription change cost, how strongly is that guaranteed, and did the committed outcome stay
+within what was approved? The quickstart composes the two published packages in user code;
+neither package's API depends on the other, and each can be adopted independently.
+MSE on npm: [`@agorail-labs/mse-reference`](https://www.npmjs.com/package/@agorail-labs/mse-reference).
+
+## Documentation
+
+- [Developer onboarding](docs/ONBOARDING.md) — single-package examples and outcome semantics.
+- [Normative specification](spec/scq-v0.6.2-spec.md) — the SCQ v0.6.2 contract.
+- [Current status and known limitations](#current-status-and-known-limitations-v062) — read
+  before relying on any capability claim, together with the
+  [evidence register](research/EVIDENCE.md).
+- [Independent review package](docs/INDEPENDENT-MSE-SCQ-REVIEW.md) — reproduce, falsify, and
+  report findings.
+- [Contributing](CONTRIBUTING.md) · [Security policy](SECURITY.md)
 
 ## Frozen scope (v0.6.1)
 
@@ -123,7 +207,8 @@ changes against any provider.
   are accounted for by converted regression evidence (test47, test49, test50, test55).
 - **G-21 residual:** independently reviewed INDETERMINATE-attempt resolution evidence is
   now persisted in the experimental reference implementation (issue #43, closed); durable
-  dispatch exclusion still needs provider/site scoping (issue #45, open). The separate
+  dispatch exclusion is scoped by provider/site/subscription, failing closed whenever a
+  row's namespace cannot be established (issue #45, closed). The separate
   residual investigations in issues #44 and #46 are closed.
 - **G-17:** the Chargebee live adapter's only update mechanism is full-list replacement
   (`FULL_REPLACEMENT_ONLY`), so OPERATION-authorized updates are **refused before dispatch**
@@ -150,7 +235,7 @@ examples/                   Concrete normalized proposal/quote/receipt/failure e
 conformance/                Draft conformance suite — maps tests to normative rules
 research/                   Evidence register and full multi-cycle research findings
 standards/                  Fit analysis against ACP and UCP, and a discussion-draft pre-SEP
-reference/                  TypeScript reference implementation and full test suite (803 tests)
+reference/                  TypeScript reference implementation and full test suite
 ```
 
 - [`spec/scq-v0.6.2-spec.md`](spec/scq-v0.6.2-spec.md) — **current standard:** the normative
@@ -193,9 +278,9 @@ ACP has adopted or will adopt SCQ.
 
 For v0.6.2's scope and known limitations, see the [release notes](research/v0.6.2-release-notes.md). (The v0.6.1-era [preview notes](docs/EXPERIMENTAL-PREVIEW.md) are retained as a superseded historical record.) For responsible vulnerability reporting, see [Security](SECURITY.md).
 
-Start with the [simulator-only seat-expansion walkthrough](docs/QUICKSTART.md). It shows quote inspection, separate business spending caps, a default no-mutation path, and an explicitly simulated commit. The reference package is **published experimentally on npm**, but its adapters are not production billing SDK integrations.
+New to Agorail? Start with [Try Agorail in Five Minutes](docs/TRY-AGORAIL-IN-FIVE-MINUTES.md) — the published MSE and SCQ packages composed in one clean consumer project. For SCQ alone from this repository's sources, see the [simulator-only seat-expansion walkthrough](docs/QUICKSTART.md): quote inspection, separate business spending caps, a default no-mutation path, and an explicitly simulated commit. The reference package is **published experimentally on npm**, but its adapters are not production billing SDK integrations.
 
-For the published experimental npm package (`npm install @agorail-labs/scq-reference@experimental`), start with the [developer onboarding guide](docs/ONBOARDING.md) — install, runnable consumer examples, outcome semantics, and the guarantees the package does and does not provide.
+For the published experimental npm package (`npm install @agorail-labs/scq-reference@experimental`), see the [developer onboarding guide](docs/ONBOARDING.md) — install, runnable consumer examples, outcome semantics, and the guarantees the package does and does not provide.
 
 
 ## Experimental reference package
