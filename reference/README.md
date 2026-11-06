@@ -6,7 +6,7 @@
 
 **Quote a subscription change. Apply a separate approval policy. Execute through a durable coordinator. Reconcile what actually happened.**
 
-[![Release candidate](https://img.shields.io/badge/release-1.0.0--rc.2-orange)](https://www.npmjs.com/package/@agorail-labs/scq-reference) [![CI](https://github.com/agorail-labs/subscription-change-quote/actions/workflows/ci.yml/badge.svg)](https://github.com/agorail-labs/subscription-change-quote/actions/workflows/ci.yml) [![Node.js 22+](https://img.shields.io/badge/Node.js-22%2B-43853d)](https://github.com/agorail-labs/subscription-change-quote) [![Apache-2.0](https://img.shields.io/badge/license-Apache--2.0-blue)](https://github.com/agorail-labs/subscription-change-quote/blob/main/LICENSE)
+[![Release candidate](https://img.shields.io/badge/release-1.0.0--rc.2-orange)](https://www.npmjs.com/package/@agorail-labs/scq-reference/v/1.0.0-rc.2) [![CI](https://github.com/agorail-labs/subscription-change-quote/actions/workflows/ci.yml/badge.svg)](https://github.com/agorail-labs/subscription-change-quote/actions/workflows/ci.yml) [![Node.js 22+](https://img.shields.io/badge/Node.js-22%2B-43853d)](https://github.com/agorail-labs/subscription-change-quote) [![Apache-2.0](https://img.shields.io/badge/license-Apache--2.0-blue)](https://github.com/agorail-labs/subscription-change-quote/blob/main/LICENSE)
 
 Part of **[Agorail Labs](https://github.com/agorail-labs)** · [MSE companion package](https://www.npmjs.com/package/@agorail-labs/mse-reference) · [Five-minute walkthrough](https://github.com/agorail-labs/subscription-change-quote/blob/main/docs/TRY-AGORAIL-IN-FIVE-MINUTES.md)
 
