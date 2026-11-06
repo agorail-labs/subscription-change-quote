@@ -1,8 +1,8 @@
 # Candidate-reviewer worksheet — Agorail external evaluation
 
-**Status: planning worksheet. Nobody listed here has been contacted
-about Agorail evaluation, and nobody here uses or endorses Agorail,
-MSE, or SCQ.** Every entry is grounded in a documented public
+**Status: planning worksheet. Fabio has received a follow-up review invitation
+(2026-11-06 UTC); no acceptance, completed RC evaluation, new adoption,
+or endorsement has been recorded. Other candidates have not been contacted.** Every entry is grounded in a documented public
 interaction with the maintainer's prior open-source work (UCP, AP2,
 or the SCQ repository). Details that could not be verified from the
 public record are marked **to confirm** rather than asserted. Existing
@@ -12,7 +12,7 @@ reason.
 
 | # | Name / public GitHub identity | Relevant expertise | Public project or contribution establishing relevance | Appropriate public contact channel | Reason for requesting their review | Invitation status | Independent evaluation evidence |
 | --- | --- | --- | --- | --- | --- | --- | --- |
-| 1 | Fabio (GitHub handle **to confirm** from the thread) | Adversarial protocol review with runnable counterexamples | Author of the external review on SCQ Discussion #2 (2026-10-30), tracked as Issue #22; findings F1–F5 confirmed and drove merged PRs #23–#27 | The Discussion #2 / Issue #22 thread itself | He has already done this exact job against the pre-publication codebase; ask whether the v0.6.2 dispositions of F1–F7 hold in the published package | Not contacted | None |
+| 1 | Fabio Marcello Salvadori (`madeinplutofabio`) | Adversarial protocol review with runnable counterexamples | Author of the external review on SCQ Discussion #2 (2026-10-30), tracked as Issue #22; findings F1–F5 confirmed and drove merged PRs #23–#27 | The Discussion #2 / Issue #22 thread itself | He has already done this exact job against the pre-publication codebase; ask whether the v0.6.2 dispositions of F1–F7 hold in the published package | [Invited 2026-11-06](https://github.com/agorail-labs/subscription-change-quote/issues/22#issuecomment-6679757815); awaiting response | None (candidate review pending) |
 | 2 | Weston (`westonale`) | Admission/dependency semantics for agent-driven commerce changes | UCP contributor; defined the MSE mapping cases on UCP #799 (cross-unit dependencies, repair witnesses, re-quoting), validated the v0.3.0 gates, counter-proposal reshaped the admission contract; reviewer on #812/#805 | GitHub (UCP / Agorail repositories) | Knows the MSE admission model from the design side; most likely to catch divergence between the reviewed semantics and the published package | Not contacted | None |
 | 3 | Sanj (`sanj-directbooker`) | Price accuracy (ex-Google Hotels, per his public participation) | Practitioner engagement on UCP Discussion #812: provisional discovery vs. authoritative booking, observation-over-identifiers position | GitHub (Agorail repositories) | SCQ's determinacy and quoted-vs-landed reconciliation claims are price-accuracy claims — his professional domain | Not contacted | None |
 | 4 | juanferrub | B2B commerce quote flows and pricing state | Shopware practitioner; quote-flow detail on UCP #812; pricing-state proposal on UCP #877 that the maintainer's catalog work builds on | GitHub (Agorail repositories) | Closest practitioner analog to SCQ's quote → acceptance → commit lifecycle in a real B2B platform | Not contacted | None |
