@@ -48,7 +48,7 @@ Export *names* match; contents do not. Enumerated deltas in
 
 | Source change | Effect on consumers |
 |---|---|
-| #67 (Issue #64): envelope naming — `maxImmediateNetDecrease` canonical, `maxImmediateCreditDecrease` deprecated alias | **Published types contain only `maxImmediateCreditDecrease`.** Candidate accepts both spellings; both-in-one-envelope refused as ambiguous; stored records never rewritten. Migration note required — see the migration guide (Phase 6). |
+| #67 (Issue #64, closed): envelope naming — `maxImmediateNetDecrease` canonical, `maxImmediateCreditDecrease` deprecated alias | **Published types contain only `maxImmediateCreditDecrease`.** Candidate accepts both spellings; both-in-one-envelope refused as ambiguous; stored records never rewritten. Migration note required — see the migration guide (Phase 6). |
 | #51: append-only verified recovery (durable-store schema v5) | Candidate store migrates legacy evidence append-only; recovery cannot fabricate verification |
 | #45: namespaced durable dispatch exclusion | Cross-namespace attempts cannot claim another namespace's intent |
 | #70: test hygiene | No consumer-visible effect |
