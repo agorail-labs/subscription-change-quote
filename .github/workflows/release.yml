@@ -18,11 +18,17 @@ name: Release (prepared — CI-attested, trusted publishing)
 #     manifest and fails closed on any mismatch or missing file.
 #   * Dist-tag: the publish step passes `--tag` EXPLICITLY (input
 #     `dist_tag`, default `next`). This matters here: this package
-#     has no publishConfig, so a bare `npm publish` would move
-#     `latest`. A prerelease version may never take `latest` from
-#     this workflow, and a post-publish step verifies the registry
-#     dist-tag state and fails loudly if `latest` moved when it
-#     should not have.
+#     has no publishConfig default in the published line, so a
+#     bare `npm publish` would move `latest`. A prerelease version
+#     may never take `latest` from this workflow, and the publish
+#     job captures the exact `latest` value BEFORE publishing and
+#     fails loudly unless it is byte-identical AFTER.
+#   * Inputs: workflow inputs are NEVER interpolated into shell
+#     scripts. They reach steps only through environment
+#     variables and are strictly validated (semver and dist-tag
+#     formats, then an allowlist: this workflow is restricted to
+#     the 1.0.0-rc.1 release candidate under the `next` tag; a
+#     future release amends the allowlist in its release commit).
 #   * npm CLI: trusted publishing requires npm >= 11.5.1. The
 #     Node 22 toolchain's bundled npm is older, so both jobs
 #     install npm@11 explicitly and assert the version floor
@@ -76,11 +82,32 @@ jobs:
       contents: read
     steps:
       - name: Reject unauthorized source refs
+        env:
+          RELEASE_REF: ${{ github.ref }}
+          RELEASE_SHA: ${{ github.sha }}
         run: |
-          if [ "${{ github.ref }}" != "refs/heads/main" ]; then
-            echo "::error::Releases may only be cut from main (got ${{ github.ref }})."; exit 1
+          if [ "$RELEASE_REF" != "refs/heads/main" ]; then
+            echo "::error::Releases may only be cut from main (got $RELEASE_REF)."; exit 1
           fi
-          echo "Release source: ${{ github.sha }} on main"
+          echo "Release source: $RELEASE_SHA on main"
+      - name: Validate release inputs
+        env:
+          EXPECTED_VERSION: ${{ inputs.expected_version }}
+          DIST_TAG: ${{ inputs.dist_tag }}
+        run: |
+          if ! printf '%s' "$EXPECTED_VERSION" | grep -Eq '^[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?$'; then
+            echo "::error::expected_version is not a well-formed semver: $EXPECTED_VERSION"; exit 1
+          fi
+          if ! printf '%s' "$DIST_TAG" | grep -Eq '^[A-Za-z][A-Za-z0-9._-]*$'; then
+            echo "::error::dist_tag is not a well-formed npm dist-tag: $DIST_TAG"; exit 1
+          fi
+          if [ "$EXPECTED_VERSION" != "1.0.0-rc.1" ]; then
+            echo "::error::This workflow is restricted to the 1.0.0-rc.1 release candidate (got $EXPECTED_VERSION)"; exit 1
+          fi
+          if [ "$DIST_TAG" != "next" ]; then
+            echo "::error::This workflow is restricted to the next dist-tag for the release candidate (got $DIST_TAG)"; exit 1
+          fi
+          echo "Release inputs validated: $EXPECTED_VERSION under tag $DIST_TAG"
       - uses: actions/checkout@v4
         with:
           persist-credentials: false
@@ -96,17 +123,20 @@ jobs:
           node -e "const v=require('child_process').execSync('npm --version').toString().trim(); const [a,b,c]=v.split('.').map(Number); if (!(a>11 || (a===11 && (b>5 || (b===5 && c>=1))))) { console.error('npm >= 11.5.1 required for trusted publishing, got '+v); process.exit(1); } console.log('npm CLI verified: '+v);"
       - name: Assert the expected version and tag policy
         working-directory: reference
+        env:
+          EXPECTED_VERSION: ${{ inputs.expected_version }}
+          DIST_TAG: ${{ inputs.dist_tag }}
         run: |
           PKG_VERSION=$(node -pe "require('./package.json').version")
-          if [ "$PKG_VERSION" != "${{ inputs.expected_version }}" ]; then
-            echo "::error::package.json version $PKG_VERSION does not match expected_version ${{ inputs.expected_version }}"; exit 1
+          if [ "$PKG_VERSION" != "$EXPECTED_VERSION" ]; then
+            echo "::error::package.json version $PKG_VERSION does not match expected_version $EXPECTED_VERSION"; exit 1
           fi
           case "$PKG_VERSION" in
-            *-*) if [ "${{ inputs.dist_tag }}" = "latest" ]; then
+            *-*) if [ "$DIST_TAG" = "latest" ]; then
                    echo "::error::A prerelease version ($PKG_VERSION) must not be published to latest from this workflow"; exit 1
                  fi ;;
           esac
-          echo "Version asserted: $PKG_VERSION (dist-tag: ${{ inputs.dist_tag }})"
+          echo "Version asserted: $PKG_VERSION (dist-tag: $DIST_TAG)"
       - name: Full test suite
         working-directory: reference
         run: |
@@ -155,12 +185,32 @@ jobs:
         run: |
           npm install -g npm@11
           node -e "const v=require('child_process').execSync('npm --version').toString().trim(); const [a,b,c]=v.split('.').map(Number); if (!(a>11 || (a===11 && (b>5 || (b===5 && c>=1))))) { console.error('npm >= 11.5.1 required for trusted publishing, got '+v); process.exit(1); } console.log('npm CLI verified: '+v);"
+      - name: Validate release inputs
+        env:
+          EXPECTED_VERSION: ${{ inputs.expected_version }}
+          DIST_TAG: ${{ inputs.dist_tag }}
+        run: |
+          if ! printf '%s' "$EXPECTED_VERSION" | grep -Eq '^[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?$'; then
+            echo "::error::expected_version is not a well-formed semver: $EXPECTED_VERSION"; exit 1
+          fi
+          if ! printf '%s' "$DIST_TAG" | grep -Eq '^[A-Za-z][A-Za-z0-9._-]*$'; then
+            echo "::error::dist_tag is not a well-formed npm dist-tag: $DIST_TAG"; exit 1
+          fi
+          if [ "$EXPECTED_VERSION" != "1.0.0-rc.1" ]; then
+            echo "::error::This workflow is restricted to the 1.0.0-rc.1 release candidate (got $EXPECTED_VERSION)"; exit 1
+          fi
+          if [ "$DIST_TAG" != "next" ]; then
+            echo "::error::This workflow is restricted to the next dist-tag for the release candidate (got $DIST_TAG)"; exit 1
+          fi
+          echo "Release inputs validated: $EXPECTED_VERSION under tag $DIST_TAG"
       - uses: actions/download-artifact@v4
         with:
           name: release-artifact
           path: audited
       - name: Verify the exact artifact before publishing (fail closed)
         working-directory: audited
+        env:
+          EXPECTED_VERSION: ${{ inputs.expected_version }}
         run: |
           COUNT=$(ls -1 *.tgz 2>/dev/null | wc -l)
           if [ "$COUNT" != "1" ]; then echo "::error::Expected exactly one tarball to publish, found $COUNT"; exit 1; fi
@@ -168,21 +218,37 @@ jobs:
           sha256sum -c release-manifest.sha256
           TARBALL=$(ls *.tgz)
           TARBALL_VERSION=$(tar -xzOf "$TARBALL" package/package.json | node -e "let s='';process.stdin.on('data',d=>s+=d).on('end',()=>console.log(JSON.parse(s).version))")
-          if [ "$TARBALL_VERSION" != "${{ inputs.expected_version }}" ]; then
-            echo "::error::Tarball version $TARBALL_VERSION does not match expected_version ${{ inputs.expected_version }}"; exit 1
+          if [ "$TARBALL_VERSION" != "$EXPECTED_VERSION" ]; then
+            echo "::error::Tarball version $TARBALL_VERSION does not match expected_version $EXPECTED_VERSION"; exit 1
           fi
           tar -tzf "$TARBALL" > /tmp/publish-files.txt
           if grep -E '(^package/dist/src/live/|^package/dist/src/integration/|^package/dist/tests/|^package/scripts/|(^|/)\.npmrc$|(^|/)\.env$)' /tmp/publish-files.txt; then
             echo "::error::Disallowed file in release tarball"; exit 1
           fi
-          npm view @agorail-labs/scq-reference dist-tags.latest > latest-before.txt || true
+          npm view @agorail-labs/scq-reference dist-tags.latest > latest-before.txt
+          if [ ! -s latest-before.txt ]; then
+            echo "::error::Could not capture the current latest dist-tag; refusing to publish without a before-value to compare against"; exit 1
+          fi
           echo "Artifact verified: $TARBALL @ $TARBALL_VERSION (latest before: $(cat latest-before.txt))"
       - name: Publish the verified tarball with an explicit dist-tag
         working-directory: audited
-        run: npm publish $(ls *.tgz) --tag "${{ inputs.dist_tag }}" --provenance --access public
+        env:
+          DIST_TAG: ${{ inputs.dist_tag }}
+        run: npm publish $(ls *.tgz) --tag "$DIST_TAG" --provenance --access public
       - name: Verify registry dist-tag state after publishing
         working-directory: audited
+        env:
+          EXPECTED_VERSION: ${{ inputs.expected_version }}
+          DIST_TAG: ${{ inputs.dist_tag }}
         run: |
           TAGS=$(npm view @agorail-labs/scq-reference dist-tags --json)
           echo "$TAGS"
-          node -e "const tags=JSON.parse(process.argv[1]); const v='${{ inputs.expected_version }}'; const tag='${{ inputs.dist_tag }}'; if (tags[tag] !== v) { console.error('dist-tag '+tag+' does not point at '+v); process.exit(1); } if (tag !== 'latest' && tags.latest === v) { console.error('latest must not point at this release'); process.exit(1); }" "$TAGS"
+          node -e "const tags=JSON.parse(process.argv[1]); const v=process.env.EXPECTED_VERSION; const tag=process.env.DIST_TAG; if (tags[tag] !== v) { console.error('dist-tag '+tag+' does not point at '+v); process.exit(1); }" "$TAGS"
+          if [ "$DIST_TAG" != "latest" ]; then
+            LATEST_AFTER=$(npm view @agorail-labs/scq-reference dist-tags.latest)
+            LATEST_BEFORE=$(cat latest-before.txt)
+            if [ "$LATEST_AFTER" != "$LATEST_BEFORE" ]; then
+              echo "::error::latest moved during publication (before: $LATEST_BEFORE, after: $LATEST_AFTER); this workflow must never move latest"; exit 1
+            fi
+            echo "latest unchanged: $LATEST_AFTER"
+          fi
