@@ -1,9 +1,10 @@
 # Stable Release Readiness — Subscription Change Quote (SCQ)
 
 **Status: QUALIFICATION IN PROGRESS — nothing in this document is a
-stability claim.** The only published artifact is
-`@agorail-labs/scq-reference@0.6.2-experimental.1`, implementing the
-v0.6.2 experimental specification. This document defines the
+stability claim.** npm provides both the frozen `@experimental` package
+(`0.6.2-experimental.1`) and the independently versioned `@next`
+release-candidate package. Both are simulator-backed and neither is
+production-certified. The protocol specification remains SCQ v0.6.2. This document defines the
 proposed stable core, reconciles the three version lines, and lists
 every known blocker with an owner and a completion criterion. Part
 of the Agorail Stable Release Engineering Program (November 2026).
@@ -13,11 +14,11 @@ of the Agorail Stable Release Engineering Program (November 2026).
 | Line | Identifier | State |
 |---|---|---|
 | Specification | SCQ v0.6.2 (`spec/scq-v0.6.2-spec.md`) | Current experimental normative spec; frozen surface under the protocol freeze guard |
-| Published package | `@agorail-labs/scq-reference@0.6.2-experimental.1` | The only artifact external consumers can install; predates the v0.7 source changes below |
+| Published package tracks | `@agorail-labs/scq-reference@experimental` and `@agorail-labs/scq-reference@next` | Historical experimental snapshot and publicly installable 1.0 RC; refer to npm for their exact versions |
 | Repository source | v0.7 development line on `main` | Contains merged changes **not in the published package**: the Issue #64 envelope-naming canonicalization (Issue #64 is closed; the naming shipped in #66/#67) (`maxImmediateNetDecrease`; `maxImmediateCreditDecrease` retained as a deprecated alias), the durable-store verified-recovery work (#51/#45), and the source-only MSE–SCQ bridge (#69) |
 
-**Reconciliation rule for 1.0:** the stable scope is defined
-against the *published* package's behavior. Each v0.7 source change
+**Reconciliation rule for 1.0:** the stable scope must be reconciled
+against the published experimental baseline and exact RC package behavior. Each v0.7 source change
 enters stable scope only when it is enumerated in the API
 compatibility report, covered by compatibility tests against the
 published artifact, and given a migration note. The naming change is
