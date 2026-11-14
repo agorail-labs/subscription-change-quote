@@ -42,7 +42,7 @@ API key, or credentials are needed, and no real provider is called.
 git clone https://github.com/agorail-labs/subscription-change-quote.git
 mkdir agorail-quickstart && cd agorail-quickstart
 npm init -y
-npm install --save-exact @agorail-labs/mse-reference@next @agorail-labs/scq-reference@next
+npm install --save-exact @agorail-labs/mse-reference@1.0.0-rc.2 @agorail-labs/scq-reference@1.0.0-rc.2
 cp ../subscription-change-quote/examples/consumer/mse-plus-scq.mjs .
 node mse-plus-scq.mjs
 ```

@@ -65,7 +65,7 @@ Published release candidates and experimental snapshots on npm:
 [**`@agorail-labs/scq-reference`**](https://www.npmjs.com/package/@agorail-labs/scq-reference)
 
 ```bash
-npm install @agorail-labs/scq-reference@next
+npm install --save-exact @agorail-labs/scq-reference@1.0.0-rc.2
 ```
 
 Node.js 22+, ESM. The package remains simulator-backed and is not a production billing SDK.
@@ -79,7 +79,7 @@ and MSE packages together in a clean project — no billing credentials, no real
 git clone https://github.com/agorail-labs/subscription-change-quote.git
 mkdir agorail-quickstart && cd agorail-quickstart
 npm init -y
-npm install --save-exact @agorail-labs/mse-reference@next @agorail-labs/scq-reference@next
+npm install --save-exact @agorail-labs/mse-reference@1.0.0-rc.2 @agorail-labs/scq-reference@1.0.0-rc.2
 cp ../subscription-change-quote/examples/consumer/mse-plus-scq.mjs .
 node mse-plus-scq.mjs
 ```
@@ -277,7 +277,7 @@ For v0.6.2's scope and known limitations, see the [release notes](research/v0.6.
 
 New to Agorail? Start with [Try Agorail in Five Minutes](docs/TRY-AGORAIL-IN-FIVE-MINUTES.md) — the published MSE and SCQ packages composed in one clean consumer project. For SCQ alone from this repository's sources, see the [simulator-only seat-expansion walkthrough](docs/QUICKSTART.md): quote inspection, separate business spending caps, a default no-mutation path, and an explicitly simulated commit. The reference package is available as an **experimental npm release candidate** under `@next`, but its adapters are not production billing SDK integrations.
 
-For the published npm release candidate (`npm install @agorail-labs/scq-reference@next`), see the [developer onboarding guide](docs/ONBOARDING.md) — install, runnable consumer examples, outcome semantics, and the guarantees the package does and does not provide.
+For the published npm release candidate (`npm install --save-exact @agorail-labs/scq-reference@1.0.0-rc.2`), see the [developer onboarding guide](docs/ONBOARDING.md) — install, runnable consumer examples, outcome semantics, and the guarantees the package does and does not provide.
 
 
 ## Experimental reference package

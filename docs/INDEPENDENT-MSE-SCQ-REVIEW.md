@@ -26,7 +26,7 @@ any vendor. Findings should be attributed only with the reviewer's consent.
 
 ## Review route A — exact published-package consumer
 
-Node 20 or 22. Use a clean disposable directory, with no billing
+Node 22 or later. Use a clean disposable directory, with no billing
 credentials and **exact versions** rather than dist-tags.
 
 ```sh
@@ -34,7 +34,7 @@ git clone https://github.com/agorail-labs/subscription-change-quote.git
 mkdir -p agorail-clean-consumer
 cd agorail-clean-consumer
 npm init -y
-npm install --save-exact @agorail-labs/mse-reference@0.4.0-experimental.1 @agorail-labs/scq-reference@0.6.2-experimental.1
+npm install --save-exact @agorail-labs/mse-reference@1.0.0-rc.2 @agorail-labs/scq-reference@1.0.0-rc.2
 cp ../subscription-change-quote/examples/consumer/mse-plus-scq.mjs .
 node mse-plus-scq.mjs
 ```
