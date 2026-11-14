@@ -1,13 +1,34 @@
 # Try Agorail in Five Minutes
 
-**Agorail — safety contracts for AI-driven commerce changes.**
+**An agent changes a subscription. What did the caller accept, and what happened?**
 
-An AI agent is asked to increase a SaaS subscription from 100 to 120
-seats. The change requires an additional entitlement (an analytics
-add-on) to be included, it changes recurring billing, and the provider
-call might time out after it executes — leaving the agent unsure
-whether the change happened, and at risk of applying it twice if it
-retries.
+An AI agent is asked to increase a subscription from 100 to 120 seats.
+The calling application needs to inspect the financial effects before
+allowing the change and understand the result afterward. If the provider
+response is lost, it must preserve that uncertainty when deciding what
+to do next.
+
+Agorail is an open-source developer preview for representing the proposed
+subscription change, its financial bounds and its recorded outcome.
+These simulator examples let billing and agent engineers review that
+contract without a billing account or credentials.
+
+## Review the outcomes first
+
+| Situation | What the example exposes | Caller action |
+| --- | --- | --- |
+| A declared dependent change is missing | `ADMISSION_REFUSED`, with the missing add-on named in the supplied dependency report | Revise the proposed change set before dispatch. |
+| A seat increase is quoted | USD 200 immediate net effect and USD 1,200 resulting recurring amount; a separate example policy applies spending caps | Decide whether to approve those financial effects. |
+| A receipt was recorded before a restart | The original receipt is replayed; the replay invokes no dispatch callback | Use the recorded result without issuing another mutation. |
+| The provider response was lost and no receipt was recorded | `INDETERMINATE`; a blind repeat is refused | Investigate the unresolved operation before authorizing another attempt. |
+
+The main example below shows admission, the financial quote and recorded
+receipt replay. The lost-response example is a separate command below.
+A useful first review is one workflow this model misses, or one field or
+state a calling agent would need. You can assess the table and expected
+output before installing anything.
+
+## Run the combined example
 
 This quickstart runs the two published Agorail packages together and
 shows, in one script:
@@ -31,15 +52,19 @@ shows, in one script:
 Everything runs against an in-memory simulator. No billing account,
 API key, or credentials are needed, and no real provider is called.
 
-## Prerequisites
+### Prerequisites
 
 - Node.js **22 or later** and npm.
-- About five minutes.
+- Git, to retrieve the pinned example source.
+- About five minutes once the prerequisites are ready. The replay example
+  uses a native SQLite dependency; installing its binding may require a
+  supported prebuilt binary or local build tools.
 
-## Run it
+### Run it
 
 ```bash
 git clone https://github.com/agorail-labs/subscription-change-quote.git
+git -C subscription-change-quote checkout --detach d8cd84e0bb8fe7f001fe5e477699b410ce6f614c
 mkdir agorail-quickstart && cd agorail-quickstart
 npm init -y
 npm install --save-exact @agorail-labs/mse-reference@1.0.0-rc.2 @agorail-labs/scq-reference@1.0.0-rc.2
@@ -48,9 +73,11 @@ node mse-plus-scq.mjs
 ```
 
 The example imports only the two published packages — no
-repository-internal modules and no repository-relative imports.
+repository-internal modules and no repository-relative imports. Its source
+and both package versions are pinned so later repository changes do not
+silently change this evaluation.
 
-## Expected output
+### Expected output
 
 Expected simulator output (verify against your installed release candidates; the quote ID differs on every run):
 
@@ -77,6 +104,21 @@ Done: MSE admitted the complete change; SCQ committed it once; the duplicate int
 Amounts are minor units (for USD, cents): the seat increase costs
 200.00 immediately and raises the recurring amount to 1,200.00.
 
+## Run the lost-response example
+
+From the same `agorail-quickstart` directory:
+
+```bash
+node node_modules/@agorail-labs/scq-reference/examples/scenario-c-indeterminate.mjs
+```
+
+Expected observations: the lost-response case reports `INDETERMINATE`,
+records no receipt for that outcome, and refuses a blind retry while the
+simulator's dispatch count stays at one. A separate settled case in the
+same script reopens the durable store and replays its recorded receipt
+without another dispatch. A recorded receipt and an unresolved provider
+result are different recovery cases.
+
 ## What just happened
 
 - **Admission is not authorization.** MSE's gate decides whether the
@@ -98,6 +140,10 @@ Amounts are minor units (for USD, cents): the seat increase costs
 
 ## What this does not show
 
+- **No automatic dependency discovery or add-on execution.** The MSE gate
+  uses an example-supplied dependency relation and evaluator. SCQ then
+  simulates the seat-quantity change; the script does not execute the add-on
+  unit or demonstrate an atomic multi-unit billing update.
 - **No real provider.** The SCQ half runs against `ChargebeeSim`, an
   in-memory, provider-shaped model. Nothing here validates a live
   billing integration.
