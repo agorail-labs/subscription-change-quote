@@ -27,7 +27,7 @@ name: Release (prepared — CI-attested, trusted publishing)
 #     scripts. They reach steps only through environment
 #     variables and are strictly validated (semver and dist-tag
 #     formats, then an allowlist: this workflow is restricted to
-#     the 1.0.0-rc.2 release candidate under the `next` tag; a
+#     the 1.0.0-rc.3 release candidate under the `next` tag; a
 #     future release amends the allowlist in its release commit).
 #   * npm CLI: trusted publishing requires npm >= 11.5.1. The
 #     Node 22 toolchain's bundled npm is older, so both jobs
@@ -101,8 +101,8 @@ jobs:
           if ! printf '%s' "$DIST_TAG" | grep -Eq '^[A-Za-z][A-Za-z0-9._-]*$'; then
             echo "::error::dist_tag is not a well-formed npm dist-tag: $DIST_TAG"; exit 1
           fi
-          if [ "$EXPECTED_VERSION" != "1.0.0-rc.2" ]; then
-            echo "::error::This workflow is restricted to the 1.0.0-rc.2 release candidate (got $EXPECTED_VERSION)"; exit 1
+          if [ "$EXPECTED_VERSION" != "1.0.0-rc.3" ]; then
+            echo "::error::This workflow is restricted to the 1.0.0-rc.3 release candidate (got $EXPECTED_VERSION)"; exit 1
           fi
           if [ "$DIST_TAG" != "next" ]; then
             echo "::error::This workflow is restricted to the next dist-tag for the release candidate (got $DIST_TAG)"; exit 1
@@ -196,8 +196,8 @@ jobs:
           if ! printf '%s' "$DIST_TAG" | grep -Eq '^[A-Za-z][A-Za-z0-9._-]*$'; then
             echo "::error::dist_tag is not a well-formed npm dist-tag: $DIST_TAG"; exit 1
           fi
-          if [ "$EXPECTED_VERSION" != "1.0.0-rc.2" ]; then
-            echo "::error::This workflow is restricted to the 1.0.0-rc.2 release candidate (got $EXPECTED_VERSION)"; exit 1
+          if [ "$EXPECTED_VERSION" != "1.0.0-rc.3" ]; then
+            echo "::error::This workflow is restricted to the 1.0.0-rc.3 release candidate (got $EXPECTED_VERSION)"; exit 1
           fi
           if [ "$DIST_TAG" != "next" ]; then
             echo "::error::This workflow is restricted to the next dist-tag for the release candidate (got $DIST_TAG)"; exit 1
