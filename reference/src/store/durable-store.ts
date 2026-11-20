@@ -1807,12 +1807,19 @@ export class DurableQuoteStore extends QuoteStore {
    *    coherent per-database snapshot even if another worker
    *    commits between the two reads a naive implementation would
    *    have made.
-   *  - No receipt record row is genuine absence: `undefined`,
-   *    exactly as before. The attempt ledger — not this lookup —
-   *    decides what an absence means (a terminal committed attempt
-   *    with no receipt record stays blocked in the coordinator; an
-   *    INDETERMINATE attempt stays blocked; nothing here grants
-   *    dispatch authority).
+   *  - No receipt record row is genuine absence (`undefined`,
+   *    exactly as before) ONLY when the quote row agrees: the two
+   *    are written in ONE transaction, and the quote row's own
+   *    record carries the recorded receipt once one exists. A
+   *    quote row carrying a recorded receipt while its companion
+   *    receipt row is missing is the two halves of a single atomic
+   *    write disagreeing — inconsistent storage, reported as an
+   *    explicit DurableStoreError, never silently read as "no
+   *    receipt was ever recorded". The attempt ledger — not this
+   *    lookup — decides what a genuine absence means (a terminal
+   *    committed attempt with no receipt record stays blocked in
+   *    the coordinator; an INDETERMINATE attempt stays blocked;
+   *    nothing here grants dispatch authority).
    *  - A present record is validated with the SAME guarantees the
    *    open path enforces, before anything is served: the quote
    *    row's integrity checksum, decodability of every persisted
@@ -1870,13 +1877,35 @@ export class DurableQuoteStore extends QuoteStore {
         { quoteId },
       );
     }
-    if (!receiptRow) return undefined; // genuine absence: no receipt was ever durably recorded for this quote
     const refuse = (problem: string): never => {
       throw new DurableStoreError(
         `Durable receipt lookup refused for quote ${quoteId}: the persisted receipt record ${problem}; nothing is served and no dispatch is authorized by a failed lookup.`,
         { quoteId },
       );
     };
+    if (!receiptRow) {
+      // No companion receipt row. Genuine absence only when the
+      // quote row agrees (see the design note): no quote row at
+      // all, or a quote row whose own record carries no recorded
+      // receipt. A quote row that DOES carry one — while its
+      // atomically-written companion row is missing — is
+      // inconsistent storage and fails explicitly; a quote row too
+      // corrupt to check cannot establish absence either.
+      if (!quoteRow) return undefined;
+      if (sha256(quoteRow.record_json) !== quoteRow.record_sha) {
+        refuse("is missing, and the quote record that remains fails its integrity checksum — absence cannot be established from a corrupt record");
+      }
+      let decodedQuote: StoredQuote | undefined;
+      try {
+        decodedQuote = decodeRecordJson<StoredQuote>(quoteRow.record_json);
+      } catch (e) {
+        refuse(`is missing, and the quote record that remains is not decodable (${(e as Error).message}) — absence cannot be established`);
+      }
+      if (decodedQuote!.commit_receipt_recorded !== undefined || decodedQuote!.commit_receipt_identity_digest !== undefined) {
+        refuse("is missing while the quote record carries a recorded receipt — the record set is inconsistent (the quote row and its receipt record are written atomically)");
+      }
+      return undefined; // the quote exists and never recorded a receipt
+    }
     if (!quoteRow) refuse("exists for a quote that has no row in the quotes table — the record set is inconsistent");
     if (sha256(quoteRow!.record_json) !== quoteRow!.record_sha) {
       refuse("accompanies a quote record that fails its integrity checksum — the record set is corrupt");

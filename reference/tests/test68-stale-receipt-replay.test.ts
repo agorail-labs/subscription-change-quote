@@ -524,6 +524,44 @@ test("Test 68.12: the replay read is read-only — claim, attempt/history, recei
   a.close(); b.close();
 });
 
+test("Test 68.14: a quote row carrying a recorded receipt whose companion receipt row is missing is inconsistent storage — explicit failure, not absence", async () => {
+  const dbPath = join(tmpDir(), "scq.sqlite");
+  const a = openStore(dbPath);
+  a.put(makeStoredQuote("q1"));
+  a.put(makeStoredQuote("q2")); // control quote: stored, never committed
+  const b = openStore(dbPath);
+  await new DurableMutationCoordinator(a).execute(JOB, async () => ({ type: "receipt", receipt: makeReceipt("q1") }));
+  assert.deepEqual(b.recordedReceipt("q1"), makeReceipt("q1"), "control: the intact pair replays");
+  // The quote row and the receipt record are written in ONE
+  // transaction (persistQuote): the quote row's own record carries
+  // the recorded receipt, and receipt_records carries its companion
+  // row. Deleting only the companion row leaves the two halves of a
+  // single atomic write disagreeing — that is inconsistent storage,
+  // NOT the legitimate absence of a never-recorded receipt.
+  const db = rawDb(dbPath);
+  db.prepare(`DELETE FROM receipt_records WHERE quote_id = 'q1'`).run();
+  db.close();
+  assert.throws(
+    () => b.recordedReceipt("q1"),
+    (e: unknown) => e instanceof DurableStoreError && /inconsistent/.test((e as Error).message),
+    "a recorded receipt in the quote row with no companion receipt row must fail explicitly",
+  );
+  let dispatchCount = 0;
+  await assert.rejects(
+    () => new DurableMutationCoordinator(b).execute(JOB, async () => {
+      dispatchCount++;
+      return { type: "receipt", receipt: makeReceipt("q1") };
+    }),
+    (e: unknown) => e instanceof DurableStoreError,
+    "the failed lookup authorizes no dispatch",
+  );
+  assert.equal(dispatchCount, 0);
+  // The legitimate absence case is unchanged: a stored quote that
+  // never recorded a receipt still reads as absence.
+  assert.equal(b.recordedReceipt("q2"), undefined, "a quote with no recorded receipt anywhere is genuine absence");
+  a.close(); b.close();
+});
+
 test("Test 68.13: the durable lookup does not advance a stale instance's CAS version — stale-writer refusal is preserved", () => {
   const dbPath = join(tmpDir(), "scq.sqlite");
   const a = openStore(dbPath);
