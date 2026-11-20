@@ -5,6 +5,8 @@ import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "no
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { createRequire } from "node:module";
+import { createHash } from "node:crypto";
+import { fileURLToPath } from "node:url";
 import {
   DispatchBlockedError,
   DurableStoreError,
@@ -44,7 +46,7 @@ import { makeObservation, makeReceipt, makeStoredQuote, makeUnverifiedReceipt } 
 // All databases are real temporary SQLite files; all dispatch
 // callbacks are synthetic; no live provider is touched.
 
-const CHILD = new URL("./helpers/stale-receipt-child.js", import.meta.url).pathname;
+const CHILD = fileURLToPath(new URL("./helpers/stale-receipt-child.js", import.meta.url));
 const require = createRequire(import.meta.url);
 
 const tempDirs: string[] = [];
@@ -580,4 +582,73 @@ test("Test 68.13: the durable lookup does not advance a stale instance's CAS ver
   assert.equal(c.get("q1")?.commit_outcome, undefined, "the stale write changed nothing durable");
   assert.deepEqual(c.recordedReceipt("q1"), makeReceipt("q1"), "B's receipt stands");
   a.close(); b.close(); c.close();
+});
+
+test("Test 68.15: when both rows exist, a companion original that disagrees with the quote row's embedded original is refused — each row valid alone is not enough", async () => {
+  const dbPath = join(tmpDir(), "scq.sqlite");
+  const a = openStore(dbPath);
+  a.put(makeStoredQuote("q1"));
+  const b = openStore(dbPath);
+  await new DurableMutationCoordinator(a).execute(JOB, async () => ({ type: "receipt", receipt: makeReceipt("q1") }));
+  assert.deepEqual(b.recordedReceipt("q1"), makeReceipt("q1"), "control: the agreeing pair replays rcpt-q1");
+  // Replace ONLY the companion row with a different original
+  // receipt for the same quote (rcpt-other), recomputing its
+  // identity digest so the companion row is valid ON ITS OWN:
+  // its digest matches its content and it passes the coherence
+  // validation. The quote row still embeds rcpt-q1. Two
+  // independently-valid records that disagree about which receipt
+  // was recorded are inconsistent storage — the lookup must
+  // compare the companion original against the embedded original,
+  // not validate each in isolation and serve the companion.
+  const other = { ...makeReceipt("q1"), receiptId: "rcpt-other" };
+  const db = rawDb(dbPath);
+  db.prepare(`UPDATE receipt_records SET recorded_json = ?, current_json = ?, identity_digest = ? WHERE quote_id = 'q1'`)
+    .run(encodeRecordJson(other), encodeRecordJson(other), receiptIdentityDigest(other));
+  db.close();
+  assert.throws(
+    () => b.recordedReceipt("q1"),
+    (e: unknown) => e instanceof DurableStoreError && /inconsistent|disagree/.test((e as Error).message),
+    "a companion original that disagrees with the embedded original must fail explicitly",
+  );
+  let dispatchCount = 0;
+  await assert.rejects(
+    () => new DurableMutationCoordinator(b).execute(JOB, async () => {
+      dispatchCount++;
+      return { type: "receipt", receipt: makeReceipt("q1") };
+    }),
+    (e: unknown) => e instanceof DurableStoreError,
+    "the failed lookup authorizes no dispatch",
+  );
+  assert.equal(dispatchCount, 0);
+  a.close(); b.close();
+});
+
+test("Test 68.16: legacy tolerance — a quote row carrying NO embedded receipt is served from its validated companion row", async () => {
+  const dbPath = join(tmpDir(), "scq.sqlite");
+  const a = openStore(dbPath);
+  a.put(makeStoredQuote("q1"));
+  const b = openStore(dbPath);
+  await new DurableMutationCoordinator(a).execute(JOB, async () => ({ type: "receipt", receipt: makeReceipt("q1") }));
+  // Strip the embedded receipt fields from the quote row (the
+  // supported legacy shape: the quote record predates / omits the
+  // embedded copy) and repair its checksum, leaving the companion
+  // row intact. With nothing embedded to disagree, the companion
+  // row — validated as before — remains authoritative.
+  const db = rawDb(dbPath);
+  const row = db.prepare(`SELECT record_json FROM quotes WHERE quote_id = 'q1'`).get() as { record_json: string };
+  const quoteRecord = decodeRecordJson<Record<string, unknown>>(row.record_json);
+  delete quoteRecord.commit_receipt;
+  delete quoteRecord.commit_receipt_recorded;
+  delete quoteRecord.commit_receipt_identity_digest;
+  delete quoteRecord.commit_receipt_verifications;
+  const rewritten = encodeRecordJson(quoteRecord);
+  db.prepare(`UPDATE quotes SET record_json = ?, record_sha = ? WHERE quote_id = 'q1'`)
+    .run(rewritten, createHash("sha256").update(rewritten, "utf8").digest("hex"));
+  db.close();
+  assert.deepEqual(
+    b.recordedReceipt("q1"),
+    makeReceipt("q1"),
+    "no embedded original to disagree with: the validated companion row is served",
+  );
+  a.close(); b.close();
 });

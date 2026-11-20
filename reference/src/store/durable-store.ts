@@ -141,6 +141,21 @@ function sha256(text: string): string {
   return createHash("sha256").update(text, "utf8").digest("hex");
 }
 
+/**
+ * Key-order-insensitive canonical serialization for cross-record
+ * comparisons; mirrors the parent store's coherence canonical
+ * form (sorted keys, undefined-valued members dropped — the
+ * identity digest drops them the same way on both sides).
+ */
+function canonicalForComparison(value: unknown): string {
+  if (value === null || typeof value !== "object") return JSON.stringify(value) ?? "undefined";
+  if (Array.isArray(value)) return `[${value.map(canonicalForComparison).join(",")}]`;
+  const entries = Object.entries(value as Record<string, unknown>)
+    .filter(([, v]) => v !== undefined)
+    .sort(([a], [b]) => (a < b ? -1 : a > b ? 1 : 0));
+  return `{${entries.map(([k, v]) => `${JSON.stringify(k)}:${canonicalForComparison(v)}`).join(",")}}`;
+}
+
 /** Local structural copy/freeze (the parent store's are module-private). Preserves undefined-valued keys. */
 function deepCopyLocal<T>(value: T): T {
   if (value === null || typeof value !== "object") return value;
@@ -1828,9 +1843,16 @@ export class DurableQuoteStore extends QuoteStore {
    *    identity digest against its stored digest, and the parent
    *    store's full restore coherence validation (quote/resource
    *    association, recorded/current-view derivation from the
-   *    evidence trail) run against a scratch in-memory store. Any
-   *    failure is an explicit DurableStoreError — never absence,
-   *    never a success, never a dispatch.
+   *    evidence trail) run against a scratch in-memory store. The
+   *    two rows must also AGREE with each other: where the quote
+   *    row's record embeds its own copy of the recorded receipt,
+   *    the companion row must be that same receipt (identity
+   *    digest and full canonical content) — each row valid alone
+   *    is not enough. Where the embedded copy is absent
+   *    (supported legacy records), the companion row stands on
+   *    the validation above. Any failure is an explicit
+   *    DurableStoreError — never absence, never a success, never
+   *    a dispatch.
    *  - A database read failure (closed handle, missing table, I/O
    *    error) is likewise an explicit DurableStoreError. There is
    *    NO fallback to this instance's in-memory state: the cache
@@ -1931,6 +1953,28 @@ export class DurableQuoteStore extends QuoteStore {
     }
     if (receiptIdentityDigest(recorded!) !== receiptRow!.identity_digest) {
       refuse("does not match its recorded identity digest — the persisted history has been altered");
+    }
+    // Cross-record agreement: the quote row's own record carries
+    // an embedded copy of the recorded receipt — the two rows are
+    // written in ONE transaction from the same in-memory record.
+    // Where that embedded original is present, the companion row
+    // must BE that receipt: same identity digest (computed from
+    // the embedded copy, and the quote's stored digest field where
+    // present) and the same full canonical content. Validating
+    // each row in isolation would accept two independently-valid
+    // records that disagree about which receipt was recorded.
+    // Where the embedded copy is absent (supported legacy
+    // records), the companion row stands on the validation above.
+    const embedded = quote!.commit_receipt_recorded;
+    if (embedded !== undefined) {
+      const embeddedDigestField = quote!.commit_receipt_identity_digest;
+      if (
+        receiptIdentityDigest(embedded) !== receiptRow!.identity_digest ||
+        (embeddedDigestField !== undefined && embeddedDigestField !== receiptRow!.identity_digest) ||
+        canonicalForComparison(embedded) !== canonicalForComparison(recorded!)
+      ) {
+        refuse("disagrees with the quote record's embedded original receipt — the record set is inconsistent (the quote row and its receipt record are written atomically)");
+      }
     }
     // Full coherence validation, reusing the parent's restore path
     // against a scratch store holding only this quote (adopted
