@@ -1780,7 +1780,169 @@ export class DurableQuoteStore extends QuoteStore {
 
   override recordedReceipt(quoteId: string): SubscriptionChangeReceipt | undefined {
     this.assertHealthy();
-    return QuoteStore.prototype.recordedReceipt.call(this, quoteId);
+    return this.durableRecordedReceipt(quoteId);
+  }
+
+  /**
+   * The §6.10 replay lookup, served from DURABLE state at replay
+   * time — not from this instance's startup-loaded in-memory map.
+   *
+   * Defect corrected: two DurableQuoteStore instances may share one
+   * database (two workers, or a long-lived worker beside a
+   * short-lived one). The in-memory map is a snapshot taken at
+   * open; a receipt another instance records AFTER this instance
+   * opened was invisible to the inherited lookup, so an
+   * already-open instance read the terminal attempt from SQLite,
+   * found no receipt in memory, and refused a replay the database
+   * could have served (standalone: DispatchBlockedError naming
+   * COMMITTED_AND_VERIFIED; the intent bridge: BLOCKED /
+   * NO_RECORDED_RECEIPT). A fresh instance replayed correctly,
+   * which made the failure look like a restart requirement. It is
+   * not: the receipt record was durable all along.
+   *
+   * Design (the smallest correction at the existing entry point —
+   * the coordinator and the bridge already call this method):
+   *  - ONE read transaction fetches the quote row and the receipt
+   *    record row together, so the pair is read from a single
+   *    coherent per-database snapshot even if another worker
+   *    commits between the two reads a naive implementation would
+   *    have made.
+   *  - No receipt record row is genuine absence: `undefined`,
+   *    exactly as before. The attempt ledger — not this lookup —
+   *    decides what an absence means (a terminal committed attempt
+   *    with no receipt record stays blocked in the coordinator; an
+   *    INDETERMINATE attempt stays blocked; nothing here grants
+   *    dispatch authority).
+   *  - A present record is validated with the SAME guarantees the
+   *    open path enforces, before anything is served: the quote
+   *    row's integrity checksum, decodability of every persisted
+   *    payload (via the existing codec, which restores
+   *    undefined-valued members verbatim), the recorded receipt's
+   *    identity digest against its stored digest, and the parent
+   *    store's full restore coherence validation (quote/resource
+   *    association, recorded/current-view derivation from the
+   *    evidence trail) run against a scratch in-memory store. Any
+   *    failure is an explicit DurableStoreError — never absence,
+   *    never a success, never a dispatch.
+   *  - A database read failure (closed handle, missing table, I/O
+   *    error) is likewise an explicit DurableStoreError. There is
+   *    NO fallback to this instance's in-memory state: the cache
+   *    is exactly what cannot be trusted at replay time, in either
+   *    direction (stale-missing or stale-present).
+   *  - The lookup is READ-ONLY and adopts nothing: it runs no
+   *    migration, no loadAndRecover, no startup recovery, and it
+   *    does not write the validated record into this instance's
+   *    in-memory map or version table. Adopting it would silently
+   *    advance a stale instance's CAS version and could enable
+   *    overwriting another worker's state; the next lookup simply
+   *    reads durable state again. Claim, attempt, history, receipt,
+   *    evidence and quote rows are unchanged by a read.
+   *  - The value returned is the immutable ORIGINAL recorded
+   *    receipt (the persisted `recorded_json`), never the current
+   *    evidence-derived view (`current_json` is read only so the
+   *    coherence validation can verify the pair, exactly as at
+   *    open). A receipt recorded COMMITTED_UNVERIFIED and later
+   *    verified still replays as recorded; a verified view whose
+   *    reconciliation is VIOLATED is preserved as such in the
+   *    derived view and never relabels the original.
+   * The poison guard above is unchanged and runs first: a poisoned
+   * instance serves nothing, durable or otherwise.
+   */
+  private durableRecordedReceipt(quoteId: string): SubscriptionChangeReceipt | undefined {
+    let quoteRow: { subscription_id: string; record_json: string; record_sha: string } | undefined;
+    let receiptRow: { recorded_json: string; current_json: string; identity_digest: string; verifications_json: string } | undefined;
+    try {
+      const readTx = this.db.transaction(() => {
+        const q = this.db.prepare(`SELECT subscription_id, record_json, record_sha FROM quotes WHERE quote_id = ?`).get(quoteId) as
+          | { subscription_id: string; record_json: string; record_sha: string }
+          | undefined;
+        const r = this.db.prepare(`SELECT recorded_json, current_json, identity_digest, verifications_json FROM receipt_records WHERE quote_id = ?`).get(quoteId) as
+          | { recorded_json: string; current_json: string; identity_digest: string; verifications_json: string }
+          | undefined;
+        return { q, r };
+      });
+      const snapshot = readTx();
+      quoteRow = snapshot.q;
+      receiptRow = snapshot.r;
+    } catch (e) {
+      throw new DurableStoreError(
+        `Durable receipt lookup failed for quote ${quoteId} (${(e as Error).message}); refusing to serve this instance's in-memory state instead — it may be stale in either direction.`,
+        { quoteId },
+      );
+    }
+    if (!receiptRow) return undefined; // genuine absence: no receipt was ever durably recorded for this quote
+    const refuse = (problem: string): never => {
+      throw new DurableStoreError(
+        `Durable receipt lookup refused for quote ${quoteId}: the persisted receipt record ${problem}; nothing is served and no dispatch is authorized by a failed lookup.`,
+        { quoteId },
+      );
+    };
+    if (!quoteRow) refuse("exists for a quote that has no row in the quotes table — the record set is inconsistent");
+    if (sha256(quoteRow!.record_json) !== quoteRow!.record_sha) {
+      refuse("accompanies a quote record that fails its integrity checksum — the record set is corrupt");
+    }
+    let quote: StoredQuote;
+    try {
+      quote = decodeRecordJson<StoredQuote>(quoteRow!.record_json);
+    } catch (e) {
+      refuse(`accompanies a quote record that is not decodable (${(e as Error).message})`);
+    }
+    if (quote!.quote_id !== quoteId || quote!.subscription_id !== quoteRow!.subscription_id) {
+      refuse("accompanies a quote record whose decoded identity disagrees with its row — the record set is inconsistent");
+    }
+    let recorded: SubscriptionChangeReceipt;
+    let current: SubscriptionChangeReceipt;
+    let verifications: unknown[];
+    try {
+      recorded = decodeRecordJson<SubscriptionChangeReceipt>(receiptRow!.recorded_json);
+      current = decodeRecordJson<SubscriptionChangeReceipt>(receiptRow!.current_json);
+      verifications = decodeRecordJson<unknown[]>(receiptRow!.verifications_json);
+    } catch (e) {
+      refuse(`is not decodable (${(e as Error).message})`);
+    }
+    if (receiptIdentityDigest(recorded!) !== receiptRow!.identity_digest) {
+      refuse("does not match its recorded identity digest — the persisted history has been altered");
+    }
+    // Full coherence validation, reusing the parent's restore path
+    // against a scratch store holding only this quote (adopted
+    // WITHOUT its receipt fields, exactly as loadAndRecover stages
+    // it): quote/resource association, recorded-shape rules, every
+    // trail entry's admissibility and derived fields, and the
+    // current view equalling the view derived from the recorded
+    // receipt + trail. The scratch store is discarded; nothing is
+    // adopted into this instance. (The restore API is JSON-shaped
+    // and drops undefined-valued members; its validation is
+    // unaffected — the identity digest and the coherence canonical
+    // form drop those members deterministically — while the value
+    // SERVED below is the verbatim codec decoding, members intact.)
+    const {
+      commit_receipt: _cr,
+      commit_receipt_recorded: _crr,
+      commit_receipt_identity_digest: _crid,
+      commit_receipt_verifications: _crv,
+      ...quoteWithoutReceipt
+    } = quote! as StoredQuote & Record<string, unknown>;
+    void _cr; void _crr; void _crid; void _crv;
+    const scratch = new QuoteStore();
+    scratch.put(quoteWithoutReceipt as StoredQuote);
+    try {
+      scratch.restoreReceiptRecords(
+        JSON.stringify({
+          records: [
+            {
+              quote_id: quoteId,
+              recorded_receipt: recorded!,
+              current_receipt: current!,
+              identity_digest: receiptRow!.identity_digest,
+              verifications: verifications!,
+            },
+          ],
+        }),
+      );
+    } catch (e) {
+      refuse(`is not coherent (${(e as Error).message})`);
+    }
+    return deepCopyLocal(recorded!);
   }
 
   override receiptsWithReconciliation(status: ReconciliationResult["status"]): SubscriptionChangeReceipt[] {
